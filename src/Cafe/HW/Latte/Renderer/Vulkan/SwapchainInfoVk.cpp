@@ -382,20 +382,42 @@ VkExtent2D SwapchainInfoVk::ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& cap
 
 VkPresentModeKHR SwapchainInfoVk::ChoosePresentMode(const std::vector<VkPresentModeKHR>& modes)
 {
+	auto hasMode = [&](VkPresentModeKHR m) {
+		return std::find(modes.cbegin(), modes.cend(), m) != modes.cend();
+	};
+
 	m_maxQueued = 0;
 	const auto vsyncState = (VSync)GetConfig().vsync.GetValue();
 	if (vsyncState == VSync::MAILBOX)
 	{
-		if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.cend())
+		if (hasMode(VK_PRESENT_MODE_MAILBOX_KHR))
 			return VK_PRESENT_MODE_MAILBOX_KHR;
 
 		cemuLog_log(LogType::Force, "Vulkan: Can't find mailbox present mode");
 	}
 	else if (vsyncState == VSync::Immediate)
 	{
-		if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.cend())
+		// Prefer IMMEDIATE (no sync). When unavailable — common on Android Mali
+		// drivers — fall back to MAILBOX or FIFO_RELAXED before plain FIFO.
+		// Plain FIFO at 60 Hz with sub-refresh rendering causes visible frame
+		// pacing stutter because slow frames stall to the next vsync; MAILBOX
+		// drops queued frames to keep latency low, and FIFO_RELAXED allows
+		// tearing rather than stalling when the app misses a deadline. Either
+		// avoids the "frames flush one-at-a-time with pauses" pattern that the
+		// hard-FIFO fallback produced.
+		if (hasMode(VK_PRESENT_MODE_IMMEDIATE_KHR))
 			return VK_PRESENT_MODE_IMMEDIATE_KHR;
-
+		if (hasMode(VK_PRESENT_MODE_MAILBOX_KHR))
+		{
+			cemuLog_log(LogType::Force, "Vulkan: Immediate present mode unavailable, using mailbox");
+			return VK_PRESENT_MODE_MAILBOX_KHR;
+		}
+		if (hasMode(VK_PRESENT_MODE_FIFO_RELAXED_KHR))
+		{
+			cemuLog_log(LogType::Force, "Vulkan: Immediate present mode unavailable, using FIFO relaxed");
+			m_maxQueued = 1;
+			return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+		}
 		cemuLog_log(LogType::Force, "Vulkan: Can't find immediate present mode");
 	}
 	else if (vsyncState == VSync::SYNC_AND_LIMIT)

@@ -25,6 +25,7 @@ enum class GfxVendor
 	Nvidia,
 	Apple,
 	Mesa,
+	ARM, // ARM Mali GPUs (Pixel 9 / Tensor G4, Galaxy S2x, etc.)
 
 	MAX
 };

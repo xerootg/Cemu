@@ -422,6 +422,31 @@ void VulkanRenderer::uniformData_updateUniformVars(uint32 shaderStageIndex, Latt
 		if (shader->uniform.loc_remapped >= 0)
 		{
 			LatteBufferCache_LoadRemappedUniforms(shader, GET_UNIFORM_DATA_PTR(shader->uniform.loc_remapped));
+			// Mali workaround: detect the WW HD "two-pass color-fill" pixel-shader uniform
+			// signature that on ARM Mali GPUs paints across most of the screen because of a
+			// vertex-pipeline broadcast bug we can't work around at the application level
+			// (sequential indices + unique per-corner source data still result in flat
+			// per-quad attribute fetch — Mali driver-level issue affecting both gameplay UI
+			// red and water-fall red on Pixel 9 / Tensor G4).
+			// Output formula is `(uf[1].rgb, sample.a * uf[0].a)` whenever:
+			//   uf[0].rgb == 0  AND  uf[1].a == 0  AND  uf[1].rgb != 0
+			// Skipping these draws on ARM is equivalent to the older skip-draws workaround
+			// for shader 2802e519ac163806 draws 8..15, but also catches the in-water variant
+			// and a few other shaders that hit the same broadcast bug.
+			if (shaderStageIndex == VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT &&
+			    GetVendor() == GfxVendor::ARM)
+			{
+				const float* uf = GET_UNIFORM_DATA_PTR(shader->uniform.loc_remapped);
+				int uniformCount = (int)(shader->uniform.uniformRangeSize / 16);
+				if (uniformCount >= 2)
+				{
+					bool uf0RgbZero = (uf[0] == 0.0f && uf[1] == 0.0f && uf[2] == 0.0f);
+					bool uf1AlphaZero = (uf[7] == 0.0f);
+					bool uf1RgbNonzero = (uf[4] != 0.0f || uf[5] != 0.0f || uf[6] != 0.0f);
+					if (uf0RgbZero && uf1AlphaZero && uf1RgbNonzero)
+						m_state.drawSequenceSkip = true;
+				}
+			}
 		}
 		if (shader->uniform.loc_uniformRegister >= 0)
 		{
@@ -1336,6 +1361,15 @@ void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
 		uniformData_updateUniformVars(VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT, pixelShader);
 	if (geometryShader)
 		uniformData_updateUniformVars(VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY, geometryShader);
+
+	// The PS uniform load above may have set drawSequenceSkip for the Mali "two-pass color-fill"
+	// workaround. Bail out before binding any pipeline state.
+	if (m_state.drawSequenceSkip)
+	{
+		LatteGPUState.drawCallCounter++;
+		return;
+	}
+
 	// store where the read pointer should go after command buffer execution
 	m_cmdBufferUniformRingbufIndices[m_commandBufferIndex] = m_uniformVarBufferWriteIndex;
 

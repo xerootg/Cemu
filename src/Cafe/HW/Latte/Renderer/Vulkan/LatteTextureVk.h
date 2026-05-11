@@ -6,6 +6,9 @@
 
 #include "Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h"
 
+#include <memory>
+#include <unordered_map>
+
 class LatteTextureVk : public LatteTexture
 {
 public:
@@ -85,6 +88,25 @@ public:
 
 	uint32 m_collisionCheckIndex{}; // used to track if texture is being both sampled and output to during drawcall
 
+	// Mali BC5 workaround: per-compSel baked RGBA8 images. The Mali driver mis-handles
+	// VK_COMPONENT_SWIZZLE_G→alpha for EAC R11G11 views; we work around by decoding the BC5
+	// source CPU-side with the requested compSel baked into RGBA8 data and creating views
+	// over this image with identity VkComponentMapping. compSelKey packs 4×3 bits.
+	// See project_wwred.md.
+	struct BakedView
+	{
+		VkImage image{VK_NULL_HANDLE};
+		VkDeviceMemory memory{VK_NULL_HANDLE};
+		uint32 compSelKey{0};
+		bool uploaded{false};
+	};
+	BakedView* GetOrCreateBakedView(uint32 compSelKey, const uint8 compSel[4]);
+
+private:
+	void UploadBakedView(BakedView* baked, const uint8 compSel[4]);
+
+public:
+
 private:
 	class VulkanRenderer* m_vkr;
 
@@ -92,4 +114,5 @@ private:
 	std::vector<VkImageLayout> m_layouts;
 	uint32 m_layoutsMips;
 	uint32 m_layoutsDepth;
+	std::unordered_map<uint32, std::unique_ptr<BakedView>> m_bakedViews;
 };

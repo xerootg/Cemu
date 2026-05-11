@@ -30,6 +30,15 @@ uint32 LatteTextureVk_AdjustTextureCompSel(Latte::E_GX2SURFFMT format, uint32 co
 		if (compSel == 3)
 			compSel = 1; // read Alpha as Green
 		break;
+	case Latte::E_GX2SURFFMT::R8_G8_UNORM:
+	case Latte::E_GX2SURFFMT::R8_G8_SNORM:
+		// Same shape as BC5: 2-channel format, alpha typically intended to be the G channel
+		// (e.g. WW HD touch-overlay glyph atlases at HWFMT_8_8 with identity swizzle that
+		// expect alpha to come from G as a transparency mask). Without this adjustment, sampling
+		// returns alpha=1 always and transparent texels get rendered with full alpha.
+		if (compSel == 3)
+			compSel = 1; // read Alpha as Green
+		break;
 	case Latte::E_GX2SURFFMT::A2_B10_G10_R10_UNORM:
 		// reverse components (Wii U: ABGR, OpenGL: RGBA)
 		// used in Resident Evil Revelations
@@ -142,6 +151,29 @@ VKRObjectTextureView* LatteTextureViewVk::CreateView(uint32 gpuSamplerSwizzle)
 	viewInfo.components.g = swizzle[compSelG];
 	viewInfo.components.b = swizzle[compSelB];
 	viewInfo.components.a = swizzle[compSelA];
+
+	// Mali BC5 workaround: when the underlying VkImage uses VK_FORMAT_EAC_R11G11_*_BLOCK
+	// (Mali's compressed fallback for BC5 since the device doesn't expose BC5 natively), the
+	// driver doesn't honor VK_COMPONENT_SWIZZLE_G targeted at the alpha output — symptom in
+	// Wind Waker HD is all-red gameplay. Route the view to a per-compSel RGBA8 image whose
+	// data is already swizzle-baked CPU-side; the view then uses identity VkComponentMapping.
+	if ((format == Latte::E_GX2SURFFMT::BC5_UNORM || format == Latte::E_GX2SURFFMT::BC5_SNORM) &&
+	    (m_format == VK_FORMAT_EAC_R11G11_UNORM_BLOCK || m_format == VK_FORMAT_EAC_R11G11_SNORM_BLOCK))
+	{
+		uint32 compSelKey = compSelR | (compSelG << 3) | (compSelB << 6) | (compSelA << 9);
+		uint8 compSelArr[4] = { (uint8)compSelR, (uint8)compSelG, (uint8)compSelB, (uint8)compSelA };
+		auto* bakedTex = static_cast<LatteTextureVk*>(baseTexture);
+		auto* bv = bakedTex->GetOrCreateBakedView(compSelKey, compSelArr);
+		if (bv && bv->image != VK_NULL_HANDLE)
+		{
+			viewInfo.image = bv->image;
+			viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+			viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+			viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+			viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+			viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+		}
+	}
 
 	VkImageView view;
 	if (vkCreateImageView(m_device, &viewInfo, nullptr, &view) != VK_SUCCESS)

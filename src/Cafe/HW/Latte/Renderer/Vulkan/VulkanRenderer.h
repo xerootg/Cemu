@@ -25,6 +25,9 @@ struct VkSupportedFormatInfo_t
 	bool fmt_bc3{};
 	bool fmt_bc4{};
 	bool fmt_bc5{};
+	bool fmt_eac_r11{};   // VK_FORMAT_EAC_R11_UNORM_BLOCK + SNORM — Mali-friendly BC4 fallback
+	bool fmt_eac_r11g11{};// VK_FORMAT_EAC_R11G11_UNORM_BLOCK + SNORM — Mali-friendly BC5 fallback
+	bool fmt_a2b10g10r10_color_attachment{};
 };
 
 struct VkDescriptorSetInfo
@@ -134,6 +137,7 @@ class VulkanRenderer : public Renderer
 {
 	friend class LatteQueryObjectVk;
 	friend class LatteTextureReadbackInfoVk;
+	friend class LatteTextureVk;
 	friend class PipelineCompiler;
 
 	using VSync = SwapchainInfoVk::VSync;

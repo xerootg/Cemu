@@ -210,6 +210,9 @@ void VulkanRenderer::DetermineVendor()
 	case 0x106B:
 		m_vendor = GfxVendor::Apple;
 		break;
+	case 0x13B5: // ARM Mali (Pixel 9 / Tensor G4, Samsung Exynos, etc.)
+		m_vendor = GfxVendor::ARM;
+		break;
 	}
 
 	VkDriverId driverId = driverProperties.driverID;
@@ -1966,6 +1969,8 @@ void VulkanRenderer::QueryAvailableFormats()
 	m_supportedFormatInfo.fmt_bc3 = isFormatOptimal(VK_FORMAT_BC3_UNORM_BLOCK) && isFormatOptimal(VK_FORMAT_BC3_SRGB_BLOCK);
 	m_supportedFormatInfo.fmt_bc4 = isFormatOptimal(VK_FORMAT_BC4_UNORM_BLOCK) && isFormatOptimal(VK_FORMAT_BC4_SNORM_BLOCK);
 	m_supportedFormatInfo.fmt_bc5 = isFormatOptimal(VK_FORMAT_BC5_UNORM_BLOCK) && isFormatOptimal(VK_FORMAT_BC5_SNORM_BLOCK);
+	m_supportedFormatInfo.fmt_eac_r11 = isFormatOptimal(VK_FORMAT_EAC_R11_UNORM_BLOCK) && isFormatOptimal(VK_FORMAT_EAC_R11_SNORM_BLOCK);
+	m_supportedFormatInfo.fmt_eac_r11g11 = isFormatOptimal(VK_FORMAT_EAC_R11G11_UNORM_BLOCK) && isFormatOptimal(VK_FORMAT_EAC_R11G11_SNORM_BLOCK);
 	VkFormatProperties fmtProp{};
 	vkGetPhysicalDeviceFormatProperties(m_physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, &fmtProp);
 	// D24S8
@@ -2023,23 +2028,12 @@ void VulkanRenderer::QueryAvailableFormats()
 		{
 			cemuLog_log(LogType::Force, "{} not supported", it.name);
 		}
-		else if ((fmtProp.optimalTilingFeatures & requestedBits) != requestedBits)
-		{
-			//std::string missingStr;
-			//missingStr.assign(fmt::format("{} missing features:", it.name));
-			//if (!(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !it.isDepth && it.mustSupportAttachment)
-			//	missingStr.append(" COLOR_ATTACHMENT");
-			//if (!(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) && !it.isDepth && it.mustSupportBlending)
-			//	missingStr.append(" COLOR_ATTACHMENT_BLEND");
-			//if (!(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) && it.isDepth && it.mustSupportAttachment)
-			//	missingStr.append(" DEPTH_ATTACHMENT");
-			//if (!(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
-			//	missingStr.append(" TRANSFER_DST");
-			//if (!(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
-			//	missingStr.append(" SAMPLED_IMAGE");
-			//cemuLog_log(LogType::Force, "{}", missingStr.c_str());
-		}
 	}
+	// A2B10G10R10 color attachment support — has a software fallback, used by `GetTextureFormatInfoVK`.
+	fmtProp = {};
+	vkGetPhysicalDeviceFormatProperties(m_physicalDevice, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &fmtProp);
+	m_supportedFormatInfo.fmt_a2b10g10r10_color_attachment =
+		(fmtProp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
 }
 
 bool VulkanRenderer::ImguiBegin(bool mainWindow)
@@ -2575,10 +2569,14 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 			formatInfoOut->decoder = TextureDecoder_R16_G16_FLOAT::getInstance();
 			break;
 		case Latte::E_GX2SURFFMT::R8_G8_UNORM:
-			formatInfoOut->vkImageFormat = VK_FORMAT_R8G8_UNORM;
-			formatInfoOut->decoder = TextureDecoder_R8_G8::getInstance();
+			// Mali Vulkan workaround: drop R8G8_UNORM in favour of R8G8B8A8_UNORM with the data
+			// re-channeled to (R, R, R, G). The natural mapping to R8G8 hits the same swizzle-drop
+			// bug as R8 and BC4/BC5 fallbacks (see those decoders for full context).
+			formatInfoOut->vkImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+			formatInfoOut->decoder = TextureDecoder_R8_G8_To_R8G8B8A8::getInstance();
 			break;
 		case Latte::E_GX2SURFFMT::R8_G8_SNORM:
+			// Leave SNORM alone for now; observed bug only affects UNORM grayscale-mask use.
 			formatInfoOut->vkImageFormat = VK_FORMAT_R8G8_SNORM;
 			formatInfoOut->decoder = TextureDecoder_R8_G8::getInstance();
 			break;
@@ -2688,8 +2686,16 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 			break;
 			// special formats - R10G10B10_A2
 		case Latte::E_GX2SURFFMT::R10_G10_B10_A2_UNORM:
-			formatInfoOut->vkImageFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32; // todo - verify
-			formatInfoOut->decoder = TextureDecoder_R10_G10_B10_A2_UNORM::getInstance();
+			if (m_supportedFormatInfo.fmt_a2b10g10r10_color_attachment)
+			{
+				formatInfoOut->vkImageFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+				formatInfoOut->decoder = TextureDecoder_R10_G10_B10_A2_UNORM::getInstance();
+			}
+			else
+			{
+				formatInfoOut->vkImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+				formatInfoOut->decoder = TextureDecoder_R10_G10_B10_A2_UNORM_To_RGBA8::getInstance();
+			}
 			break;
 		case Latte::E_GX2SURFFMT::R10_G10_B10_A2_SNORM:
 			formatInfoOut->vkImageFormat = VK_FORMAT_R16G16B16A16_SNORM; // Vulkan has VK_FORMAT_A2R10G10B10_SNORM_PACK32 but it doesnt work?
@@ -2783,8 +2789,14 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 			}
 			else
 			{
-				formatInfoOut->vkImageFormat = VK_FORMAT_R8_UNORM;
-				formatInfoOut->decoder = TextureDecoder_BC4_To_R8::getInstance();
+				// Mali Vulkan workaround: the natural fallback to R8_UNORM exposes a driver
+				// bug where the texture view's component swizzle isn't honoured for R8 sampling.
+				// That breaks BC4-as-grayscale-mask use (e.g. Wind Waker HD's touch overlay
+				// outline atlases) — sample.a comes back as 1.0 instead of the broadcast value,
+				// killing transparency. Decode into RGBA8 with the value broadcast to all four
+				// channels so the result is correct regardless of what the swizzle does.
+				formatInfoOut->vkImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+				formatInfoOut->decoder = TextureDecoder_BC4_To_R8G8B8A8_Broadcast::getInstance();
 			}
 			break;
 		case Latte::E_GX2SURFFMT::BC4_SNORM:
@@ -2795,6 +2807,8 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 			}
 			else
 			{
+				// SNORM fallback keeps the existing R8_SNORM path; the Mali UI overlay bug
+				// observed only affects BC4_UNORM. Revisit if SNORM grayscale masks misbehave.
 				formatInfoOut->vkImageFormat = VK_FORMAT_R8_SNORM;
 				formatInfoOut->decoder = TextureDecoder_BC4_To_R8::getInstance();
 			}
@@ -2805,10 +2819,21 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 				formatInfoOut->vkImageFormat = VK_FORMAT_BC5_UNORM_BLOCK;
 				formatInfoOut->decoder = TextureDecoder_BC5::getInstance();
 			}
+			else if (m_supportedFormatInfo.fmt_eac_r11g11)
+			{
+				// Mali doesn't expose BC5 but does expose EAC R11G11 natively. Transcoding
+				// keeps the texture compressed so it samples through Mali's native ETC2
+				// hardware, sidestepping the swizzle-mapping quirk seen with the R8G8/RGBA8
+				// fallback that breaks Wind Waker HD's UI sprite shader.
+				formatInfoOut->vkImageFormat = VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+				formatInfoOut->decoder = TextureDecoder_BC5_To_EAC_R11G11<decodeBC5Block_UNORM, false>::getInstance();
+			}
 			else
 			{
-				formatInfoOut->vkImageFormat = VK_FORMAT_R8G8_UNORM;
-				formatInfoOut->decoder = TextureDecoder_BC5_To_R8G8<decodeBC5Block_UNORM>::getInstance();
+				// Last-resort uncompressed fallback (also broken on Mali, but kept for any
+				// platform that lacks BC5 AND EAC).
+				formatInfoOut->vkImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+				formatInfoOut->decoder = TextureDecoder_BC5_To_R8G8B8A8<decodeBC5Block_UNORM>::getInstance();
 			}
 			break;
 		case Latte::E_GX2SURFFMT::BC5_SNORM:
@@ -2816,6 +2841,11 @@ void VulkanRenderer::GetTextureFormatInfoVK(Latte::E_GX2SURFFMT format, bool isD
 			{
 				formatInfoOut->vkImageFormat = VK_FORMAT_BC5_SNORM_BLOCK;
 				formatInfoOut->decoder = TextureDecoder_BC5::getInstance();
+			}
+			else if (m_supportedFormatInfo.fmt_eac_r11g11)
+			{
+				formatInfoOut->vkImageFormat = VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+				formatInfoOut->decoder = TextureDecoder_BC5_To_EAC_R11G11<decodeBC5Block_SNORM, true>::getInstance();
 			}
 			else
 			{

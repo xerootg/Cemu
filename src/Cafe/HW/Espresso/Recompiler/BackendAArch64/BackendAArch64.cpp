@@ -871,13 +871,20 @@ void AArch64GenContext_t::conditionalJumpCycleCheck(IMLSegment* imlSegment)
 
 void* PPCRecompiler_virtualHLE(PPCInterpreter_t* ppcInterpreter, uint32 hleFuncId)
 {
+	// The trailing PPCInterpreter_getCurrentInstance() used to return the post-call
+	// TLS value in case a fiber switch had migrated us to a different per-core PPC
+	// context. In HLE mode that can't happen: PPCInterpreter_setCurrentInstance is
+	// only ever called with the per-core pointer or nullptr, and we're guaranteed to
+	// be running on the same host thread (= same core) after hleCall returns. So the
+	// TLS load is redundant and we can hand the input pointer back directly, saving
+	// a tlsdesc_resolver_dynamic call per HLE invocation.
 	void* prevRSPTemp = ppcInterpreter->rspTemp;
 	if (hleFuncId == 0xFFD0)
 	{
 		ppcInterpreter->remainingCycles -= 500; // let subtract about 500 cycles for each HLE call
 		ppcInterpreter->gpr[3] = 0;
 		PPCInterpreter_nextInstruction(ppcInterpreter);
-		return PPCInterpreter_getCurrentInstance();
+		return ppcInterpreter;
 	}
 	else
 	{
@@ -886,7 +893,8 @@ void* PPCRecompiler_virtualHLE(PPCInterpreter_t* ppcInterpreter, uint32 hleFuncI
 		hleCall(ppcInterpreter);
 	}
 	ppcInterpreter->rspTemp = prevRSPTemp;
-	return PPCInterpreter_getCurrentInstance();
+	cemu_assert_debug(PPCInterpreter_getCurrentInstance() == ppcInterpreter);
+	return ppcInterpreter;
 }
 
 bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)

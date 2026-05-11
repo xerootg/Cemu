@@ -1,7 +1,17 @@
 #include "Cafe/OS/common/OSCommon.h"
 #include "coreinit_Scheduler.h"
 
+// __OSHasSchedulerLock() is only read inside cemu_assert_debug, which is a no-op in
+// release. The TLS counter that backs it is therefore dead in release — but writes
+// to it still cost a tlsdesc_resolver_dynamic call on Android's general-dynamic TLS
+// model, which showed up at ~1.8% on core 1's hot path (most of it via the scheduler
+// lock taken from OSSend/ReceiveMessage's wake/block paths). Conditionally compile
+// it out and keep the lock funcs noinline so LTO can't propagate the simplified
+// bodies into every caller (which is what caused the earlier regression when we
+// tried this without an inline barrier).
+#ifdef CEMU_DEBUG_ASSERT
 thread_local sint32 s_schedulerLockCount = 0;
+#endif
 
 #if BOOST_OS_WINDOWS
 #include <synchapi.h>
@@ -74,23 +84,37 @@ private:
 static SchedulerSpinLock s_ptmSchedulerLock;
 #endif
 
-void __OSLockScheduler(void* obj)
+#if defined(__GNUC__) || defined(__clang__)
+#define SCHED_LOCK_NOINLINE __attribute__((noinline))
+#else
+#define SCHED_LOCK_NOINLINE
+#endif
+
+SCHED_LOCK_NOINLINE void __OSLockScheduler(void* obj)
 {
 #if BOOST_OS_WINDOWS
 	EnterCriticalSection(&s_csSchedulerLock);
 #else
 	s_ptmSchedulerLock.lock();
 #endif
+#ifdef CEMU_DEBUG_ASSERT
 	s_schedulerLockCount++;
 	cemu_assert_debug(s_schedulerLockCount <= 1); // >= 2 should not happen. Scheduler lock does not allow recursion
+#endif
 }
 
 bool __OSHasSchedulerLock()
 {
+#ifdef CEMU_DEBUG_ASSERT
 	return s_schedulerLockCount > 0;
+#else
+	// Only consulted from cemu_assert_debug call sites; those compile to no-ops in
+	// release. Return value is meaningless here.
+	return true;
+#endif
 }
 
-bool __OSTryLockScheduler(void* obj)
+SCHED_LOCK_NOINLINE bool __OSTryLockScheduler(void* obj)
 {
 	bool r;
 #if BOOST_OS_WINDOWS
@@ -98,18 +122,19 @@ bool __OSTryLockScheduler(void* obj)
 #else
 	r = s_ptmSchedulerLock.tryLock();
 #endif
+#ifdef CEMU_DEBUG_ASSERT
 	if (r)
-	{
 		s_schedulerLockCount++;
-		return true;
-	}
-	return false;
+#endif
+	return r;
 }
 
-void __OSUnlockScheduler(void* obj)
+SCHED_LOCK_NOINLINE void __OSUnlockScheduler(void* obj)
 {
+#ifdef CEMU_DEBUG_ASSERT
 	s_schedulerLockCount--;
 	cemu_assert_debug(s_schedulerLockCount >= 0);
+#endif
 #if BOOST_OS_WINDOWS
 	LeaveCriticalSection(&s_csSchedulerLock);
 #else

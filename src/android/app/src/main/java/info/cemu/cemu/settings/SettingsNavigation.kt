@@ -1,5 +1,7 @@
 package info.cemu.cemu.settings
 
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.composable
@@ -9,6 +11,7 @@ import info.cemu.cemu.settings.account.AccountSettingsScreen
 import info.cemu.cemu.settings.audio.AudioSettingsScreen
 import info.cemu.cemu.settings.customdrivers.CustomDriversScreen
 import info.cemu.cemu.settings.emulatedusbdevices.EmulatedUSBDevicesSettingsScreen
+import info.cemu.cemu.settings.gamespath.FolderBrowserScreen
 import info.cemu.cemu.settings.gamespath.GamePathsScreen
 import info.cemu.cemu.settings.general.GeneralSettingsScreen
 import info.cemu.cemu.settings.graphics.GraphicsSettingsScreen
@@ -22,6 +25,8 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 object SettingsRoute
+
+private const val SELECTED_FOLDER_KEY = "selected_folder"
 
 private object SettingsRoutes {
     @Serializable
@@ -47,6 +52,9 @@ private object SettingsRoutes {
 
     @Serializable
     object GamePathsScreenRoute
+
+    @Serializable
+    object FolderBrowserScreenRoute
 
     @Serializable
     object OverlaySettingsScreenRoute
@@ -172,9 +180,30 @@ fun NavGraphBuilder.settingsNavigation(navController: NavHostController) {
                     goToGamePathsSettings = { navController.navigate(SettingsRoutes.GamePathsScreenRoute) }
                 )
             }
-            composable<SettingsRoutes.GamePathsScreenRoute> {
+            composable<SettingsRoutes.GamePathsScreenRoute> { backStackEntry ->
+                val selectedFolder by backStackEntry
+                    .savedStateHandle
+                    .getStateFlow<String?>(SELECTED_FOLDER_KEY, null)
+                    .collectAsState()
                 GamePathsScreen(
                     navigateBack = { navController.popBackStack() },
+                    navigateToFolderBrowser = {
+                        navController.navigate(SettingsRoutes.FolderBrowserScreenRoute)
+                    },
+                    selectedFolderResult = selectedFolder,
+                    consumeSelectedFolderResult = {
+                        backStackEntry.savedStateHandle[SELECTED_FOLDER_KEY] = null
+                    },
+                )
+            }
+            composable<SettingsRoutes.FolderBrowserScreenRoute> {
+                FolderBrowserScreen(
+                    navigateBack = { navController.popBackStack() },
+                    onFolderSelected = { path ->
+                        navController.previousBackStackEntry
+                            ?.savedStateHandle
+                            ?.set(SELECTED_FOLDER_KEY, path)
+                    },
                 )
             }
         }

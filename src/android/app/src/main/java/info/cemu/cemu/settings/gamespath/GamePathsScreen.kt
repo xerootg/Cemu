@@ -15,6 +15,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -34,12 +35,33 @@ import kotlinx.coroutines.launch
 @Composable
 fun GamePathsScreen(
     navigateBack: () -> Unit,
+    navigateToFolderBrowser: () -> Unit = {},
+    selectedFolderResult: String? = null,
+    consumeSelectedFolderResult: () -> Unit = {},
     gamesPathsViewModel: GamesPathsViewModel = viewModel(),
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val gamesPaths by gamesPathsViewModel.gamesPaths.collectAsState()
+
+    fun tryAddPath(path: String) {
+        if (gamesPaths.contains(path)) {
+            coroutineScope.launch {
+                snackbarHostState.currentSnackbarData?.dismiss()
+                snackbarHostState.showSnackbar(tr("Games path already added"))
+            }
+            return
+        }
+        gamesPathsViewModel.addGamesPath(path)
+    }
+
+    LaunchedEffect(selectedFolderResult) {
+        val path = selectedFolderResult ?: return@LaunchedEffect
+        tryAddPath(path)
+        consumeSelectedFolderResult()
+    }
+
     val launcher =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             if (uri == null) return@rememberLauncherForActivityResult
@@ -49,21 +71,19 @@ fun GamePathsScreen(
             )
             val documentFile =
                 DocumentFile.fromTreeUri(context, uri) ?: return@rememberLauncherForActivityResult
-            val gamesPath = documentFile.uri.toString()
-            if (gamesPaths.contains(gamesPath)) {
-                coroutineScope.launch {
-                    snackbarHostState.currentSnackbarData?.dismiss()
-                    snackbarHostState.showSnackbar(tr("Games path already added"))
-                }
-                return@rememberLauncherForActivityResult
-            }
-            gamesPathsViewModel.addGamesPath(gamesPath)
+            tryAddPath(documentFile.uri.toString())
         }
     ScreenContentLazy(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         appBarText = tr("Game paths"),
         navigateBack = navigateBack,
         actions = {
+            IconButton(onClick = navigateToFolderBrowser) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_folder),
+                    contentDescription = tr("Browse folders"),
+                )
+            }
             IconButton(onClick = { launcher.launch(null) }) {
                 Icon(
                     painter = painterResource(R.drawable.ic_add),

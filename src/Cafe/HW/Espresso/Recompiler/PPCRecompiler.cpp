@@ -3,6 +3,7 @@
 #include "PPCRecompiler.h"
 #include "PPCRecompilerIml.h"
 #include "Cafe/OS/RPL/rpl.h"
+#include "Cafe/OS/common/OSCommon.h"
 #include "util/containers/RangeStore.h"
 #include "Cafe/OS/libs/coreinit/coreinit_CodeGen.h"
 #include "config/ActiveSettings.h"
@@ -376,29 +377,85 @@ void PPCRecompiler_maybeOpenJitMap()
 	if (g_jitMapChecked.load(std::memory_order_relaxed))
 		return;
 #ifdef __ANDROID__
-	const char* triggerPath = "/data/data/info.cemu.cemu/files/dbg_jit_map.txt";
+	// Probe a few paths so the trigger works for both the release (info.cemu.cemu)
+	// and debug (info.cemu.cemu.debug) packages, and also accepts a /data/local/tmp
+	// drop from adb shell when running as a sandboxed app.
+	const char* triggerCandidates[] = {
+		"/data/local/tmp/cemu_dbg_jit_map.txt",
+		"/data/data/info.cemu.cemu/files/dbg_jit_map.txt",
+		"/data/data/info.cemu.cemu.debug/files/dbg_jit_map.txt",
+		"/storage/emulated/0/Android/data/info.cemu.cemu/files/dbg_jit_map.txt",
+		"/storage/emulated/0/Android/data/info.cemu.cemu.debug/files/dbg_jit_map.txt",
+	};
+	FILE* trigger = nullptr;
+	for (const char* p : triggerCandidates)
+	{
+		trigger = fopen(p, "r");
+		cemuLog_log(LogType::Force, "JIT map trigger probe: {} -> {}", p, trigger ? "found" : "absent");
+		if (trigger)
+			break;
+	}
 #else
-	const char* triggerPath = "dbg_jit_map.txt";
+	FILE* trigger = fopen("dbg_jit_map.txt", "r");
 #endif
-	FILE* trigger = fopen(triggerPath, "r");
 	if (trigger)
 	{
 		fclose(trigger);
-		char path[128];
-		snprintf(path, sizeof(path), "/data/local/tmp/perf-%d.map", (int)getpid());
-		g_jitMapFile = fopen(path, "w");
-		if (!g_jitMapFile)
-		{
-			// Fall back to a writable location if /data/local/tmp denies us.
+		char path[256];
 #ifdef __ANDROID__
-			snprintf(path, sizeof(path), "/data/data/info.cemu.cemu/files/perf-%d.map", (int)getpid());
+		// Try a series of paths in order of decreasing reach. /data/local/tmp/ is
+		// the perf-tooling-standard location but a sandboxed app generally can't
+		// write there. The app's own external data dir is always writable.
+		const char* outCandidates[] = {
+			"/data/local/tmp/perf-%d.map",
+			"/storage/emulated/0/Android/data/info.cemu.cemu.debug/files/perf-%d.map",
+			"/storage/emulated/0/Android/data/info.cemu.cemu/files/perf-%d.map",
+			"/data/data/info.cemu.cemu.debug/files/perf-%d.map",
+			"/data/data/info.cemu.cemu/files/perf-%d.map",
+		};
+		for (const char* fmt : outCandidates)
+		{
+			snprintf(path, sizeof(path), fmt, (int)getpid());
 			g_jitMapFile = fopen(path, "w");
-#endif
+			cemuLog_log(LogType::Force, "JIT map output probe: {} -> {}", path, g_jitMapFile ? "ok" : "denied");
+			if (g_jitMapFile)
+				break;
 		}
+#else
+		snprintf(path, sizeof(path), "perf-%d.map", (int)getpid());
+		g_jitMapFile = fopen(path, "w");
+#endif
 		if (g_jitMapFile)
 		{
 			cemuLog_log(LogType::Force, "JIT map dump enabled: {}", path);
 			g_jitMapEnabled.store(true, std::memory_order_release);
+		}
+		// Also dump the HLE function table next to the JIT map so we can decode
+		// trampoline opcodes (each is `(1<<26) | hleIdx`) back to library/function names.
+#ifdef __ANDROID__
+		const char* hleDumpCandidates[] = {
+			"/storage/emulated/0/Android/data/info.cemu.cemu.debug/files/hle_table.txt",
+			"/storage/emulated/0/Android/data/info.cemu.cemu/files/hle_table.txt",
+			"/data/data/info.cemu.cemu.debug/files/hle_table.txt",
+			"/data/data/info.cemu.cemu/files/hle_table.txt",
+		};
+		FILE* hleOut = nullptr;
+		for (const char* p : hleDumpCandidates)
+		{
+			hleOut = fopen(p, "w");
+			if (hleOut)
+			{
+				cemuLog_log(LogType::Force, "HLE table dump: {}", p);
+				break;
+			}
+		}
+#else
+		FILE* hleOut = fopen("hle_table.txt", "w");
+#endif
+		if (hleOut)
+		{
+			osLib_dumpFunctionTable(hleOut);
+			fclose(hleOut);
 		}
 	}
 	g_jitMapChecked.store(true, std::memory_order_release);

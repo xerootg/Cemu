@@ -126,6 +126,19 @@ sint32 osLib_getFunctionIndex(const char* libraryName, const char* functionName)
 	return -1;
 }
 
+// Diagnostic: dump (index -> name) for every registered HLE function. Used by
+// profiling workflows to translate hot trampoline addresses (which encode the
+// HLE index in their opcode) back to human-readable function names. Caller is
+// responsible for opening the destination file.
+void osLib_dumpFunctionTable(std::FILE* out)
+{
+	if (!out || !s_osFunctionTable)
+		return;
+	for (auto& it : *s_osFunctionTable)
+		std::fprintf(out, "%d %s\n", (int)it.hleFunc, it.name.c_str());
+	std::fflush(out);
+}
+
 void osLib_addVirtualPointer(const char* libraryName, const char* functionName, uint32 vPtr)
 {
 	// calculate hash

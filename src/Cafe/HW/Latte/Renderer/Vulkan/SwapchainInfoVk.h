@@ -55,6 +55,23 @@ struct SwapchainInfoVk
 		return m_actualExtent;
 	}
 
+	// Logical landscape-orientation extent that callers use for viewport/aspect math.
+	// On Android this is the screen size as the user sees it (e.g. 2424x1080) even
+	// when the swapchain image is portrait-rotated. m_actualExtent is the physical
+	// swapchain extent, which is swapped when m_preRotation is 90/270.
+	VkExtent2D getLogicalExtent() const
+	{
+		if (m_preRotation == 90 || m_preRotation == 270)
+			return { m_actualExtent.height, m_actualExtent.width };
+		return m_actualExtent;
+	}
+
+	// Rotation (degrees CW) baked into the swapchain via preTransform. 0 means
+	// no rotation (preTransform == IDENTITY). Output-shader vertex math reads
+	// this to rotate the full-screen quad into the swapchain's coordinate
+	// system, and DrawBackbufferQuad uses it to remap the viewport rect.
+	uint32 m_preRotation = 0;
+
 	SwapchainInfoVk(bool mainWindow, Vector2i size);
 	SwapchainInfoVk(const SwapchainInfoVk&) = delete;
 	SwapchainInfoVk(SwapchainInfoVk&&) noexcept = default;

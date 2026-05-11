@@ -267,7 +267,7 @@ RendererOutputShader::RendererOutputShader(const std::string& vertex_source, con
 
 RendererOutputShader::OutputUniformVariables RendererOutputShader::FillUniformBlockBuffer(const LatteTextureView& texture_view, const Vector2i& output_res, const bool padView) const
 {
-	OutputUniformVariables vars;
+	OutputUniformVariables vars{};
 
 	sint32 effectiveWidth, effectiveHeight;
 	texture_view.baseTexture->GetEffectiveSize(effectiveWidth, effectiveHeight, 0);
@@ -279,6 +279,13 @@ RendererOutputShader::OutputUniformVariables RendererOutputShader::FillUniformBl
 	vars.applySRGBEncoding = padView ? LatteGPUState.drcBufferUsesSRGB : LatteGPUState.tvBufferUsesSRGB;
 	vars.targetGamma = padView ? ActiveSettings::GetDRCGamma() : ActiveSettings::GetTVGamma();
 	vars.displayGamma = GetConfig().userDisplayGamma;
+
+	// Identity rotation by default. The renderer overwrites this with a 90/180/270°
+	// rotation when its swapchain has a non-identity preTransform (Android only).
+	vars.vertexRotation[0] = 1.0f;
+	vars.vertexRotation[1] = 0.0f;
+	vars.vertexRotation[2] = 0.0f;
+	vars.vertexRotation[3] = 1.0f;
 
 	return vars;
 }
@@ -350,6 +357,16 @@ std::string RendererOutputShader::GetVulkanVertexSource(bool render_upside_down)
 			R"(#version 450
 layout(location = 0) out vec2 passUV;
 
+layout (binding = 1, std140) uniform parameters {
+	vec2 textureSrcResolution;
+	vec2 nativeResolution;
+	vec2 outputResolution;
+	bool applySRGBEncoding;
+	float targetGamma;
+	float displayGamma;
+	vec4 vertexRotation;
+};
+
 out gl_PerVertex
 {
    vec4 gl_Position;
@@ -386,7 +403,8 @@ void main(){
 
 		vertex_source <<
 			R"(	passUV = vUV;
-	gl_Position = vec4(vPos, 0.0, 1.0);
+	mat2 rot = mat2(vertexRotation.x, vertexRotation.y, vertexRotation.z, vertexRotation.w);
+	gl_Position = vec4(rot * vPos, 0.0, 1.0);
 }
 )";
 		return vertex_source.str();
@@ -449,6 +467,7 @@ uniform vec2 outputResolution;
 uniform bool applySRGBEncoding;
 uniform float targetGamma;
 uniform float displayGamma;
+uniform vec4 vertexRotation;
 };
 
 float sRGBEncode(float linear)

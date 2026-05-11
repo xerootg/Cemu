@@ -16,6 +16,14 @@ public:
 		uint32 applySRGBEncoding;
 		float targetGamma;
 		float displayGamma;
+		// Pad to the next std140 vec4 alignment boundary (offset 48). Without this the
+		// vertexRotation field would land at offset 36, but vec4's base alignment is 16.
+		float _pad0[3];
+		// Packed 2x2 rotation matrix applied to the full-screen-quad vertex positions in
+		// the vertex shader. (x,y,z,w) = (m00, m10, m01, m11) — column-major as GLSL mat2.
+		// Used on Android to compensate for a non-identity swapchain preTransform so the
+		// presentation engine doesn't pay a compositor rotation pass.
+		float vertexRotation[4];
 	};
 	enum Shader
 	{

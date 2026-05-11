@@ -69,6 +69,9 @@ void SwapchainInfoVk::Create()
 	VkSwapchainCreateInfoKHR create_info = CreateSwapchainCreateInfo(m_surface, details, m_surfaceFormat, image_count, m_actualExtent);
 	create_info.oldSwapchain = nullptr;
 	create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	// Track the physical swapchain image extent (may have been swapped by
+	// CreateSwapchainCreateInfo to handle 90/270 preTransform on Android).
+	m_actualExtent = create_info.imageExtent;
 
 	VkResult result = vkCreateSwapchainKHR(m_logicalDevice, &create_info, nullptr, &m_swapchain);
 	if (result != VK_SUCCESS)
@@ -456,8 +459,17 @@ VkSwapchainCreateInfoKHR SwapchainInfoVk::CreateSwapchainCreateInfo(VkSurfaceKHR
 	}
 	else
 		createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	// Note: on Android, matching preTransform to currentTransform avoids the SurfaceFlinger
+	// compositor rotation pass (Android flags the mismatch as falsePrerotation=1). However,
+	// on Mali-G715 / Tensor G4 this produced a perf regression — the driver appears to take
+	// a slower internal path for non-identity preTransform that outweighs the compositor
+	// rotation it eliminates. So we stay on IDENTITY and accept the compositor rotation.
+	// The output-shader vertex rotation + viewport-rect remap plumbing is still wired up
+	// (m_preRotation = 0 here makes it a no-op) so we can re-enable per-device or per-driver
+	// in the future without re-deriving the rotation math.
 #if BOOST_PLAT_ANDROID
 	createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	m_preRotation = 0;
 #else
 	createInfo.preTransform = swapchainSupport.capabilities.currentTransform;
 #endif
@@ -466,5 +478,13 @@ VkSwapchainCreateInfoKHR SwapchainInfoVk::CreateSwapchainCreateInfo(VkSurfaceKHR
 	createInfo.clipped = VK_TRUE;
 
 	cemuLog_logDebug(LogType::Force, "vulkan presentation mode: {}", createInfo.presentMode);
+	cemuLog_log(LogType::Force, "vulkan swapchain[{}]: extent={}x{} preTransform=0x{:x} currentTransform=0x{:x} supportedTransforms=0x{:x} minImageCount={} chosenImageCount={}",
+		mainWindow ? "TV" : "DRC",
+		extent.width, extent.height,
+		(uint32)createInfo.preTransform,
+		(uint32)swapchainSupport.capabilities.currentTransform,
+		(uint32)swapchainSupport.capabilities.supportedTransforms,
+		swapchainSupport.capabilities.minImageCount,
+		imageCount);
 	return createInfo;
 }

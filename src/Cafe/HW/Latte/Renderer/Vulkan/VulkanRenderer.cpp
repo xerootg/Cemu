@@ -3326,17 +3326,46 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	renderPassInfo.renderArea.extent = chainInfo.getExtent();
 	renderPassInfo.clearValueCount = 0;
 
+	// imageX/Y/Width/Height come in the logical landscape coordinate system (what the
+	// user sees). When the swapchain has a non-identity preTransform (Android, locked
+	// landscape activity on a portrait-natural device), the swapchain image is in the
+	// device's natural orientation. Remap the viewport rect so the same on-screen
+	// rectangle lands at the right place in the rotated swapchain image.
 	VkViewport viewport{};
-	viewport.x = imageX;
-	viewport.y = imageY;
-	viewport.width = imageWidth;
-	viewport.height = imageHeight;
 	viewport.minDepth = 0.0f;
 	viewport.maxDepth = 1.0f;
+	const VkExtent2D physExtent = chainInfo.getExtent();
+	switch (chainInfo.m_preRotation)
+	{
+	case 90:
+		viewport.x = imageY;
+		viewport.y = (float)physExtent.height - (float)imageX - (float)imageWidth;
+		viewport.width = imageHeight;
+		viewport.height = imageWidth;
+		break;
+	case 180:
+		viewport.x = (float)physExtent.width - (float)imageX - (float)imageWidth;
+		viewport.y = (float)physExtent.height - (float)imageY - (float)imageHeight;
+		viewport.width = imageWidth;
+		viewport.height = imageHeight;
+		break;
+	case 270:
+		viewport.x = (float)physExtent.width - (float)imageY - (float)imageHeight;
+		viewport.y = imageX;
+		viewport.width = imageHeight;
+		viewport.height = imageWidth;
+		break;
+	default:
+		viewport.x = imageX;
+		viewport.y = imageY;
+		viewport.width = imageWidth;
+		viewport.height = imageHeight;
+		break;
+	}
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &viewport);
 
 	VkRect2D scissor{};
-	scissor.extent = chainInfo.getExtent();
+	scissor.extent = physExtent;
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
 
 	auto descriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
@@ -3357,6 +3386,43 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	m_state.currentPipeline = pipeline;
 
 	auto outputUniforms = shader->FillUniformBlockBuffer(*texView, {imageWidth, imageHeight}, padView);
+
+	// Override the identity rotation that FillUniformBlockBuffer set with the swapchain's
+	// preRotation. The vertex shader applies this matrix to the full-screen quad so the
+	// content lands in the correct orientation inside the rotated swapchain image.
+	// Column-major mat2 packed as (m00, m10, m01, m11). The vertex shader applies
+	// vPos_new = rot * vPos_orig. Composing this with the rotated viewport in
+	// DrawBackbufferQuad must produce an upright image in the user's view; empirically
+	// for Cemu's Vulkan path (which keeps textures in Y-down memory order and pairs
+	// with the non-upside-down output shader) the matching rotations are:
+	//   0°   identity:  (1, 0, 0, 1)
+	//   90°  CW:        (0, 1, -1, 0)  — (x,y) → (-y, x)
+	//   180°:           (-1, 0, 0, -1) — (x,y) → (-x, -y)
+	//   270° CW:        (0, -1, 1, 0)  — (x,y) → (y, -x)
+	switch (chainInfo.m_preRotation)
+	{
+	case 90:
+		outputUniforms.vertexRotation[0] = 0.0f;
+		outputUniforms.vertexRotation[1] = 1.0f;
+		outputUniforms.vertexRotation[2] = -1.0f;
+		outputUniforms.vertexRotation[3] = 0.0f;
+		break;
+	case 180:
+		outputUniforms.vertexRotation[0] = -1.0f;
+		outputUniforms.vertexRotation[1] = 0.0f;
+		outputUniforms.vertexRotation[2] = 0.0f;
+		outputUniforms.vertexRotation[3] = -1.0f;
+		break;
+	case 270:
+		outputUniforms.vertexRotation[0] = 0.0f;
+		outputUniforms.vertexRotation[1] = -1.0f;
+		outputUniforms.vertexRotation[2] = 1.0f;
+		outputUniforms.vertexRotation[3] = 0.0f;
+		break;
+	default:
+		// FillUniformBlockBuffer already set identity.
+		break;
+	}
 
 	auto outputUniformOffset = uniformData_uploadUniformDataBufferGetOffset({(uint8*)&outputUniforms, sizeof(decltype(outputUniforms))});
 

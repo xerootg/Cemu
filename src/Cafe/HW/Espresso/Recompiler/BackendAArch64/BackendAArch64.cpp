@@ -1015,11 +1015,26 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	WReg memReg = gpReg<WReg>(imlInstruction->op_storeLoad.registerMem);
 	WReg dataReg = gpReg<WReg>(imlInstruction->op_storeLoad.registerData);
 
-	add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
-	if (indexed)
-		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+	// Skip add_imm when offset is zero — for non-indexed loads we can use memReg
+	// directly as the LDR index register, and for indexed loads we can fold the
+	// (mem + mem2 + 0) chain into a single add. PPC has many `lwz r, 0(rN)`-style
+	// accesses, so this saves an instruction on a hot path.
+	WReg adrIdx = TEMP_GPR1.WReg;
+	if (memOffset == 0)
+	{
+		if (indexed)
+			add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		else
+			adrIdx = memReg;
+	}
+	else
+	{
+		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+		if (indexed)
+			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+	}
 
-	auto adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
+	auto adr = AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW);
 	if (imlInstruction->op_storeLoad.copyWidth == 32)
 	{
 		ldr(dataReg, adr);
@@ -1071,10 +1086,21 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	sint32 memOffset = imlInstruction->op_storeLoad.immS32;
 	bool swapEndian = imlInstruction->op_storeLoad.flags2.swapEndian;
 
-	add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
-	if (indexed)
-		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
-	AdrExt adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
+	WReg adrIdx = TEMP_GPR1.WReg;
+	if (memOffset == 0)
+	{
+		if (indexed)
+			add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		else
+			adrIdx = memReg;
+	}
+	else
+	{
+		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
+		if (indexed)
+			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+	}
+	AdrExt adr = AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW);
 	if (imlInstruction->op_storeLoad.copyWidth == 32)
 	{
 		if (swapEndian)
@@ -1154,12 +1180,26 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
 	sint32 adrOffset = imlInstruction->op_storeLoad.immS32;
 	uint8 mode = imlInstruction->op_storeLoad.mode;
 
-	if (mode == PPCREC_FPR_LD_MODE_SINGLE)
+	// Compute the LDR index register. Skip add_imm when offset is 0 — same hot-path
+	// optimization as integer load/store. Saves one ARM instruction per FP load.
+	WReg adrIdx = TEMP_GPR1.WReg;
+	if (adrOffset == 0)
+	{
+		if (indexed)
+			add(TEMP_GPR1.WReg, realRegisterMem, indexReg);
+		else
+			adrIdx = realRegisterMem;
+	}
+	else
 	{
 		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
-		ldr(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+	}
+
+	if (mode == PPCREC_FPR_LD_MODE_SINGLE)
+	{
+		ldr(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW));
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
 		fmov(dataSReg, TEMP_GPR2.WReg);
 
@@ -1174,10 +1214,7 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
 	}
 	else if (mode == PPCREC_FPR_LD_MODE_DOUBLE)
 	{
-		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
-		if (indexed)
-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
-		ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW));
 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
 		fmov(dataDReg, TEMP_GPR2.XReg);
 	}
@@ -1199,12 +1236,25 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
 	sint32 memOffset = imlInstruction->op_storeLoad.immS32;
 	uint8 mode = imlInstruction->op_storeLoad.mode;
 
-	if (mode == PPCREC_FPR_ST_MODE_SINGLE)
+	// Compute STR index register once. Skip add_imm when offset is 0 — same hot-path
+	// optimization as integer load/store. Saves one ARM instruction per FP store.
+	WReg adrIdx = TEMP_GPR1.WReg;
+	if (memOffset == 0)
+	{
+		if (indexed)
+			add(TEMP_GPR1.WReg, memReg, indexReg);
+		else
+			adrIdx = memReg;
+	}
+	else
 	{
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+	}
 
+	if (mode == PPCREC_FPR_ST_MODE_SINGLE)
+	{
 		if (imlInstruction->op_storeLoad.flags2.notExpanded)
 		{
 			// value is already in single format
@@ -1216,25 +1266,19 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
 			fmov(TEMP_GPR2.WReg, TEMP_FPR.SReg);
 		}
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW));
 	}
 	else if (mode == PPCREC_FPR_ST_MODE_DOUBLE)
 	{
-		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
-		if (indexed)
-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
 		fmov(TEMP_GPR2.XReg, dataDReg);
 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
-		str(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		str(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW));
 	}
 	else if (mode == PPCREC_FPR_ST_MODE_UI32_FROM_PS0)
 	{
-		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
-		if (indexed)
-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
 		fmov(TEMP_GPR2.WReg, dataSReg);
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW));
 	}
 	else
 	{

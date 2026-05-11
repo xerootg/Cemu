@@ -27,14 +27,13 @@ namespace coreinit
 	// releasing it. Counters are shared across queues that hash to the same slot — that
 	// only ever causes a spurious scheduler-lock acquisition (which then no-ops via
 	// isEmpty()), never a lost wakeup or correctness bug.
-	namespace {
-	struct QueueLockSlot
-	{
-		std::atomic<uint32_t> lockState{0};
-		std::atomic<uint32_t> pendingReceiveWaiters{0};
-		std::atomic<uint32_t> pendingSendWaiters{0};
-	};
+	//
+	// QueueLockSlot's struct definition lives in the header — the AArch64 JIT emits an
+	// inlined body for OSSend/Receive that loads the pool by address and indexes slots
+	// directly. The 16-byte size lets the JIT use `add x_slot, x_pool, x_idx, lsl #4`.
+	alignas(16) QueueLockSlot g_queueLockPool[QUEUE_LOCK_POOL_SIZE];
 
+	namespace {
 	class QueueSpinLockGuard
 	{
 	public:
@@ -96,9 +95,6 @@ namespace coreinit
 		QueueLockSlot& m_slot;
 		bool m_held{false};
 	};
-
-	constexpr size_t QUEUE_LOCK_POOL_SIZE = 256;
-	QueueLockSlot g_queueLockPool[QUEUE_LOCK_POOL_SIZE];
 
 	inline QueueLockSlot& getQueueLockSlot(const void* p)
 	{
@@ -253,6 +249,22 @@ namespace coreinit
 		return g_systemMessageQueue.GetPtr();
 	}
 
+	void OSWakeOneSender(OSMessageQueue* msgQueue)
+	{
+		__OSLockScheduler();
+		if (!msgQueue->threadQueueSend.isEmpty())
+			msgQueue->threadQueueSend.wakeupSingleThreadWaitQueue(true);
+		__OSUnlockScheduler();
+	}
+
+	void OSWakeOneReceiver(OSMessageQueue* msgQueue)
+	{
+		__OSLockScheduler();
+		if (!msgQueue->threadQueueReceive.isEmpty())
+			msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueue(true);
+		__OSUnlockScheduler();
+	}
+
 	// HLE indices for the hot message-queue functions. Captured at registration time
 	// so the AArch64 JIT can recognize PPCREC_IML_MACRO_HLE invocations of these
 	// specific functions and emit an inlined fast path that bypasses
@@ -262,9 +274,14 @@ namespace coreinit
 	sint32 g_hleIdx_OSSendMessage = -1;
 	sint32 g_hleIdx_OSReceiveMessage = -1;
 
+	// Captured host pointer to the system message queue. Set once during init so the
+	// JIT-emitted inline body can compare msgQueue to it without touching SysAllocator.
+	OSMessageQueue* g_systemMessageQueuePtr = nullptr;
+
 	void InitializeMessageQueue()
 	{
 		OSInitMessageQueue(g_systemMessageQueue.GetPtr(), _systemMessageQueueArray.GetPtr(), _systemMessageQueueArray.GetCount());
+		g_systemMessageQueuePtr = g_systemMessageQueue.GetPtr();
 
 		cafeExportRegister("coreinit", OSInitMessageQueueEx, LogType::CoreinitThread);
 		cafeExportRegister("coreinit", OSInitMessageQueue, LogType::CoreinitThread);

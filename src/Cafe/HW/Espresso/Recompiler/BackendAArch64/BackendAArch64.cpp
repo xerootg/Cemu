@@ -972,40 +972,182 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		str(x30, AdrPreImm(sp, -16));
 
 		// Fast path: when the HLE id is OSSendMessage / OSReceiveMessage, skip the
-		// PPCRecompiler_virtualHLE → cafeExportCallWrapper dispatch chain and call
-		// the function directly with args marshalled inline. Saves the wrapper's
-		// argument-tuple build + log gate + function-pointer indirection on every
-		// call (~3-5% of core 1 in WW HD where this pair dominates HLE traffic).
-		// Same signature for both: (OSMessageQueue*, OSMessage*, uint32 flags) -> int.
-		// NOTE: PPCInterpreter_t::gpr[] is plain uint32 (native endian) — the existing
-		// JIT read/write paths use bare ldr/str. The wrapper goes through MEMPTR's
-		// uint32be conversion but that's a no-op double byteswap. We just use the
-		// native value directly.
+		// PPCRecompiler_virtualHLE → cafeExportCallWrapper dispatch chain AND inline
+		// the function body itself. Same signature for both:
+		//   (OSMessageQueue*, OSMessage*, uint32 flags) -> int
+		//
+		// Inlined fast path covers the queue-not-empty/not-full case. Pending waiters
+		// on the opposite side are handled inline by snapshotting the slot counter,
+		// completing the dequeue/enqueue + unlock, then calling a small wake helper
+		// (OSWakeOneSender/Receiver) only if the snapshot was non-zero. Bails to the
+		// C++ slow path when:
+		//   - msgQueue is NULL or is the system message queue
+		//   - the spinlock CAS finds the lock already held
+		//   - the queue is empty/full AND BLOCK flag is set (caller needs to sleep)
+		//   - Send is asked for HIGH_PRIORITY insertion (complex)
+		//
+		// PPCInterpreter_t::gpr[] is plain uint32 (native endian). OSMessageQueue and
+		// OSMessage fields are uint32be — we byteswap on every load/store of those.
 		bool emittedDirectCall = false;
 		if (funcId == (uint32)coreinit::g_hleIdx_OSSendMessage ||
 		    funcId == (uint32)coreinit::g_hleIdx_OSReceiveMessage)
 		{
-			// x0 = host pointer to msgQueue: 0 if gpr[3]==0, else MEM_BASE_REG + gpr[3]
+			const bool isReceive = (funcId == (uint32)coreinit::g_hleIdx_OSReceiveMessage);
+			Label slowCall, slowUnlock, fastDone;
+
+			// ===== translate guest args to host pointers (x0 = msgQueue, x1 = msg, w2 = flags) =====
 			ldr(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
 			cmp(w0, 0);
 			add(x0, MEM_BASE_REG, x0, ExtMod::UXTW);
 			csel(x0, xzr, x0, Cond::EQ);
-			// x1 = host pointer to msg
 			ldr(w1, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 4));
 			cmp(w1, 0);
 			add(x1, MEM_BASE_REG, x1, ExtMod::UXTW);
 			csel(x1, xzr, x1, Cond::EQ);
-			// w2 = flags
 			ldr(w2, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 5));
 
-			uint64 target = (funcId == (uint32)coreinit::g_hleIdx_OSSendMessage)
-			                    ? (uint64)&coreinit::OSSendMessage
-			                    : (uint64)&coreinit::OSReceiveMessage;
-			mov(TEMP_GPR1.XReg, target);
-			blr(TEMP_GPR1.XReg);
+			// ===== bail-out conditions before locking =====
+			cbz(x0, slowCall);                                              // NULL queue
+			mov(x9, (uint64)&coreinit::g_systemMessageQueuePtr);
+			ldr(x9, AdrNoOfs(x9));
+			cmp(x0, x9);
+			beq(slowCall);                                                  // system queue
 
-			// Return value in w0 → gpr[3] (native uint32, no byteswap)
-			str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			// ===== hash queue addr to slot index, compute &slot =====
+			// h = ((uintptr_t)q >> 4) * 0x9E3779B97F4A7C15ULL; slot = pool[(h >> 56) & 255]
+			lsr(x10, x0, 4);
+			mov(x9, (uint64)0x9E3779B97F4A7C15ULL);
+			mul(x10, x10, x9);
+			lsr(x10, x10, 56);                                              // x10 = slot index 0..255
+			mov(x9, (uint64)&coreinit::g_queueLockPool[0]);
+			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
+
+			// ===== CAS lockState 0 -> 1 (single attempt) =====
+			mov(w10, 0);
+			mov(w11, 1);
+			casal(w10, w11, AdrNoOfs(x9));
+			cbnz(w10, slowCall);                                            // contended → C++ slow path
+
+			// ===== under lock: snapshot opposite-side pending waiters =====
+			// Receive snapshots pendingSendWaiters (offset 8), Send snapshots
+			// pendingReceiveWaiters (offset 4). Plain ldr is sufficient: the
+			// casal-acquire above synchronizes-with the previous holder's stlr-release
+			// on lockState, so the counter's prior fetch_add (sequenced before that
+			// stlr) is visible.
+			// w16 stays live through the body and is checked after lock release —
+			// if non-zero, we call into the wake helper. We don't bail to C++ for
+			// this case so the lock isn't immediately reacquired by the C++ entry.
+			ldr(w16, AdrUimm(x9, isReceive ? 8u : 4u));
+
+			// ===== load usedCount (big-endian -> native) =====
+			ldr(w10, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, usedCount)));
+			rev(w10, w10);
+
+			if (isReceive)
+			{
+				Label dequeue;
+				cbnz(w10, dequeue);                                         // non-empty → dequeue
+
+				// empty: if BLOCK set, slow path waits; else return false
+				tbnz(w2, 0, slowUnlock);                                    // bit 0 = OS_MESSAGE_BLOCK
+				str(wzr, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+				stlr(wzr, AdrNoOfs(x9));
+				b(fastDone);
+
+				L(dequeue);
+				// firstIndex (w11), msgCount (w12), msgArray guest ptr (w13)
+				ldr(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
+				rev(w11, w11);
+				ldr(w12, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgCount)));
+				rev(w12, w12);
+				ldr(w13, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
+				rev(w13, w13);
+				add(x13, MEM_BASE_REG, x13, ExtMod::UXTW);                   // host ptr to msgArray
+				add(x13, x13, x11, ShMod::LSL, 4);                           // &msgArray[firstIndex] (16B stride)
+				ldp(x14, x15, AdrNoOfs(x13));                                // copy 16B (preserves BE layout)
+				stp(x14, x15, AdrNoOfs(x1));
+				// firstIndex = (firstIndex + 1) % msgCount (firstIndex < msgCount, so +1 ≤ msgCount)
+				add(w11, w11, 1);
+				cmp(w11, w12);
+				csel(w11, wzr, w11, Cond::EQ);
+				rev(w11, w11);
+				str(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
+				// usedCount -= 1
+				sub(w10, w10, 1);
+				rev(w10, w10);
+				str(w10, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, usedCount)));
+				// gpr[3] = 1 (stored before wake call so the helper's clobbers don't matter)
+				mov(w11, 1);
+				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+				stlr(wzr, AdrNoOfs(x9));                                    // release lock
+				// If a send-side waiter existed at snapshot time, wake one. x0 still holds msgQueue.
+				cbz(w16, fastDone);
+				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender);
+				blr(TEMP_GPR1.XReg);
+				b(fastDone);
+			}
+			else
+			{
+				Label enqueue;
+				// msgCount (w11), compare with usedCount (w10)
+				ldr(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgCount)));
+				rev(w11, w11);
+				cmp(w10, w11);
+				blt(enqueue);                                               // usedCount < msgCount → enqueue
+
+				// full: if BLOCK set, slow path waits; else return false
+				tbnz(w2, 0, slowUnlock);
+				str(wzr, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+				stlr(wzr, AdrNoOfs(x9));
+				b(fastDone);
+
+				L(enqueue);
+				// HIGH_PRIORITY uses backward firstIndex rotation — leave that to the C++ path
+				tbnz(w2, 1, slowUnlock);                                    // bit 1 = OS_MESSAGE_HIGH_PRIORITY
+				// firstIndex (w12), msgArray guest ptr (w13)
+				ldr(w12, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
+				rev(w12, w12);
+				ldr(w13, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
+				rev(w13, w13);
+				// messageIndex = (firstIndex + usedCount) mod msgCount
+				// firstIndex < msgCount && usedCount < msgCount → sum < 2*msgCount, so one subtract suffices
+				add(w14, w12, w10);
+				sub(w15, w14, w11);
+				cmp(w14, w11);
+				csel(w14, w15, w14, Cond::GE);                              // w14 = messageIndex
+				add(x13, MEM_BASE_REG, x13, ExtMod::UXTW);
+				add(x13, x13, x14, ShMod::LSL, 4);                          // &msgArray[messageIndex]
+				ldp(x14, x15, AdrNoOfs(x1));                                // load msg
+				stp(x14, x15, AdrNoOfs(x13));                               // store into slot
+				// usedCount += 1
+				add(w10, w10, 1);
+				rev(w10, w10);
+				str(w10, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, usedCount)));
+				// gpr[3] = 1 (stored before wake call so the helper's clobbers don't matter)
+				mov(w11, 1);
+				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+				stlr(wzr, AdrNoOfs(x9));
+				// If a receive-side waiter existed at snapshot time, wake one.
+				cbz(w16, fastDone);
+				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver);
+				blr(TEMP_GPR1.XReg);
+				b(fastDone);
+			}
+
+			L(slowUnlock);
+			stlr(wzr, AdrNoOfs(x9));                                        // release lock before C++ slow path
+			// fall through
+
+			L(slowCall);
+			{
+				uint64 target = isReceive ? (uint64)&coreinit::OSReceiveMessage
+				                          : (uint64)&coreinit::OSSendMessage;
+				mov(TEMP_GPR1.XReg, target);
+				blr(TEMP_GPR1.XReg);
+				str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			}
+
+			L(fastDone);
 			// instructionPointer = LR (cafeExportCallWrapper does this; mirror it here)
 			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));

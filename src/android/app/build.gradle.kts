@@ -85,7 +85,8 @@ android {
             applicationIdSuffix = ".debug"
         }
         release {
-            isMinifyEnabled = true
+            isMinifyEnabled = false
+            isDebuggable = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -94,6 +95,11 @@ android {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
+            }
+            externalNativeBuild {
+                cmake {
+                    arguments("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+                }
             }
         }
     }

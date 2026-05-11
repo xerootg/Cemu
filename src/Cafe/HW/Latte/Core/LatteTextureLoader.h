@@ -2642,13 +2642,6 @@ public:
 	{
 		const sint32 blocksPerRow = (textureLoader->width + 3) / 4;
 
-		// Diagnostic: log the first call per texture so we can confirm this decoder runs
-		cemuLog_log(LogType::Force,
-		            "BC5_TO_EAC_R11G11 addr={:08x} size={}x{} snorm={} blocksPerRow={} totalBlocks={}",
-		            textureLoader->physAddress, textureLoader->width, textureLoader->height,
-		            isSnorm ? 1 : 0, blocksPerRow,
-		            blocksPerRow * ((textureLoader->height + 3) / 4));
-
 		for (sint32 y = 0; y < textureLoader->height; y += textureLoader->stepY)
 		{
 			for (sint32 x = 0; x < textureLoader->width; x += textureLoader->stepX)
@@ -2687,27 +2680,6 @@ public:
 				uint8_t* outBlock = outputData + (blockY * blocksPerRow + blockX) * 16;
 				LatteEncodeEacR11Channel(rVals, isSnorm, outBlock);
 				LatteEncodeEacR11Channel(gVals, isSnorm, outBlock + 8);
-
-				// Diagnostic: dump the first block of each texture so we can spot-check
-				// the EAC bit layout against the spec.
-				if (blockX == 0 && blockY == 0)
-				{
-					cemuLog_log(LogType::Force,
-					            "BC5_EAC_BLOCK0 addr={:08x} R=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] G=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-					            textureLoader->physAddress,
-					            outBlock[0], outBlock[1], outBlock[2], outBlock[3],
-					            outBlock[4], outBlock[5], outBlock[6], outBlock[7],
-					            outBlock[8], outBlock[9], outBlock[10], outBlock[11],
-					            outBlock[12], outBlock[13], outBlock[14], outBlock[15]);
-					// Also dump the source BC5 block bytes for comparison
-					cemuLog_log(LogType::Force,
-					            "BC5_SRC_BLOCK0 addr={:08x} bc5=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-					            textureLoader->physAddress,
-					            blockData[0], blockData[1], blockData[2], blockData[3],
-					            blockData[4], blockData[5], blockData[6], blockData[7],
-					            blockData[8], blockData[9], blockData[10], blockData[11],
-					            blockData[12], blockData[13], blockData[14], blockData[15]);
-				}
 			}
 		}
 	}

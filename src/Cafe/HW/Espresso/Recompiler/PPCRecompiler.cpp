@@ -8,6 +8,12 @@
 #include "config/ActiveSettings.h"
 #include "config/LaunchSettings.h"
 #include "Common/ExceptionHandler/ExceptionHandler.h"
+
+#include <atomic>
+#include <mutex>
+#ifdef __unix__
+#include <unistd.h>
+#endif
 #include "Common/cpu_features.h"
 #include "util/helpers/fspinlock.h"
 #include "util/helpers/helpers.h"
@@ -348,8 +354,73 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
 	return true;
 }
 
+// JIT symbol map dump for profilers. Enabled at runtime by creating
+// /data/data/info.cemu.cemu/files/dbg_jit_map.txt (Android) — the file's mere
+// presence at JIT-function-install time switches on perf-<pid>.map emission to
+// /data/local/tmp/perf-<pid>.map, the standard format Linux perf / simpleperf
+// reads to resolve JIT'd code addresses. Without the trigger file this is a
+// no-op (single boolean load).
+//
+// Map line format: "HEX_HOST_ADDR HEX_HOST_SIZE PPC_<HEX_PPC_ADDR>"
+namespace {
+std::atomic<bool> g_jitMapEnabled{false};
+std::atomic<bool> g_jitMapChecked{false};
+FILE* g_jitMapFile = nullptr;
+std::mutex g_jitMapMutex;
+
+void PPCRecompiler_maybeOpenJitMap()
+{
+	if (g_jitMapChecked.load(std::memory_order_acquire))
+		return;
+	std::lock_guard lk(g_jitMapMutex);
+	if (g_jitMapChecked.load(std::memory_order_relaxed))
+		return;
+#ifdef __ANDROID__
+	const char* triggerPath = "/data/data/info.cemu.cemu/files/dbg_jit_map.txt";
+#else
+	const char* triggerPath = "dbg_jit_map.txt";
+#endif
+	FILE* trigger = fopen(triggerPath, "r");
+	if (trigger)
+	{
+		fclose(trigger);
+		char path[128];
+		snprintf(path, sizeof(path), "/data/local/tmp/perf-%d.map", (int)getpid());
+		g_jitMapFile = fopen(path, "w");
+		if (!g_jitMapFile)
+		{
+			// Fall back to a writable location if /data/local/tmp denies us.
+#ifdef __ANDROID__
+			snprintf(path, sizeof(path), "/data/data/info.cemu.cemu/files/perf-%d.map", (int)getpid());
+			g_jitMapFile = fopen(path, "w");
+#endif
+		}
+		if (g_jitMapFile)
+		{
+			cemuLog_log(LogType::Force, "JIT map dump enabled: {}", path);
+			g_jitMapEnabled.store(true, std::memory_order_release);
+		}
+	}
+	g_jitMapChecked.store(true, std::memory_order_release);
+}
+
+void PPCRecompiler_recordJitMapping(uint32 ppcAddr, void* hostAddr, size_t hostSize)
+{
+	if (!g_jitMapEnabled.load(std::memory_order_acquire))
+		return;
+	std::lock_guard lk(g_jitMapMutex);
+	if (!g_jitMapFile)
+		return;
+	fprintf(g_jitMapFile, "%llx %zx PPC_%08x\n",
+	        (unsigned long long)(uintptr_t)hostAddr, hostSize, ppcAddr);
+	fflush(g_jitMapFile);
+}
+}
+
 bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFunctionBoundaryTracker::PPCRange_t& range, PPCRecFunction_t* ppcRecFunc, std::vector<std::pair<MPTR, uint32>>& entryPoints)
 {
+	PPCRecompiler_maybeOpenJitMap();
+	PPCRecompiler_recordJitMapping(initialEntryPoint, ppcRecFunc->x86Code, ppcRecFunc->x86Size);
 	// update jump table
 	PPCRecompilerState.recompilerSpinlock.lock();
 

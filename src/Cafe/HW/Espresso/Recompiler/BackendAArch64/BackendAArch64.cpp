@@ -14,6 +14,7 @@
 #include "HW/Espresso/Interpreter/PPCInterpreterInternal.h"
 #include "HW/Espresso/Interpreter/PPCInterpreterHelper.h"
 #include "HW/Espresso/PPCState.h"
+#include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
 
 using namespace Xbyak_aarch64;
 
@@ -970,14 +971,58 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		// set parameters
 		str(x30, AdrPreImm(sp, -16));
 
-		mov(x0, HCPU_REG);
-		mov(w1, funcId);
-		// call HLE function
+		// Fast path: when the HLE id is OSSendMessage / OSReceiveMessage, skip the
+		// PPCRecompiler_virtualHLE → cafeExportCallWrapper dispatch chain and call
+		// the function directly with args marshalled inline. Saves the wrapper's
+		// argument-tuple build + log gate + function-pointer indirection on every
+		// call (~3-5% of core 1 in WW HD where this pair dominates HLE traffic).
+		// Same signature for both: (OSMessageQueue*, OSMessage*, uint32 flags) -> int.
+		// NOTE: PPCInterpreter_t::gpr[] is plain uint32 (native endian) — the existing
+		// JIT read/write paths use bare ldr/str. The wrapper goes through MEMPTR's
+		// uint32be conversion but that's a no-op double byteswap. We just use the
+		// native value directly.
+		bool emittedDirectCall = false;
+		if (funcId == (uint32)coreinit::g_hleIdx_OSSendMessage ||
+		    funcId == (uint32)coreinit::g_hleIdx_OSReceiveMessage)
+		{
+			// x0 = host pointer to msgQueue: 0 if gpr[3]==0, else MEM_BASE_REG + gpr[3]
+			ldr(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			cmp(w0, 0);
+			add(x0, MEM_BASE_REG, x0, ExtMod::UXTW);
+			csel(x0, xzr, x0, Cond::EQ);
+			// x1 = host pointer to msg
+			ldr(w1, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 4));
+			cmp(w1, 0);
+			add(x1, MEM_BASE_REG, x1, ExtMod::UXTW);
+			csel(x1, xzr, x1, Cond::EQ);
+			// w2 = flags
+			ldr(w2, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 5));
 
-		mov(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE);
-		blr(TEMP_GPR1.XReg);
+			uint64 target = (funcId == (uint32)coreinit::g_hleIdx_OSSendMessage)
+			                    ? (uint64)&coreinit::OSSendMessage
+			                    : (uint64)&coreinit::OSReceiveMessage;
+			mov(TEMP_GPR1.XReg, target);
+			blr(TEMP_GPR1.XReg);
 
-		mov(HCPU_REG, x0);
+			// Return value in w0 → gpr[3] (native uint32, no byteswap)
+			str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			// instructionPointer = LR (cafeExportCallWrapper does this; mirror it here)
+			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			emittedDirectCall = true;
+		}
+
+		if (!emittedDirectCall)
+		{
+			mov(x0, HCPU_REG);
+			mov(w1, funcId);
+			// call HLE function
+
+			mov(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE);
+			blr(TEMP_GPR1.XReg);
+
+			mov(HCPU_REG, x0);
+		}
 
 		ldr(x30, AdrPostImm(sp, 16));
 

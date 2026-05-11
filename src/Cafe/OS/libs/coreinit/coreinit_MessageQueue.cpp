@@ -253,6 +253,15 @@ namespace coreinit
 		return g_systemMessageQueue.GetPtr();
 	}
 
+	// HLE indices for the hot message-queue functions. Captured at registration time
+	// so the AArch64 JIT can recognize PPCREC_IML_MACRO_HLE invocations of these
+	// specific functions and emit an inlined fast path that bypasses
+	// PPCRecompiler_virtualHLE + cafeExportCallWrapper. Profile showed
+	// virtualHLE + children = 30.82% of core 1 on WW HD, of which 23.96% was
+	// OSSend/Receive body — the wrapper overhead is the inlining target.
+	sint32 g_hleIdx_OSSendMessage = -1;
+	sint32 g_hleIdx_OSReceiveMessage = -1;
+
 	void InitializeMessageQueue()
 	{
 		OSInitMessageQueue(g_systemMessageQueue.GetPtr(), _systemMessageQueueArray.GetPtr(), _systemMessageQueueArray.GetCount());
@@ -263,6 +272,10 @@ namespace coreinit
 		cafeExportRegister("coreinit", OSPeekMessage, LogType::CoreinitThread);
 		cafeExportRegister("coreinit", OSSendMessage, LogType::CoreinitThread);
 		cafeExportRegister("coreinit", OSGetSystemMessageQueue, LogType::CoreinitThread);
+
+		// Capture HLE indices for the JIT fast-path recognizer.
+		g_hleIdx_OSSendMessage = osLib_getFunctionIndex("coreinit", "OSSendMessage");
+		g_hleIdx_OSReceiveMessage = osLib_getFunctionIndex("coreinit", "OSReceiveMessage");
 	}
 };
 

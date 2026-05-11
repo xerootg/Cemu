@@ -48,4 +48,8 @@ namespace coreinit
 	OSMessageQueue* OSGetSystemMessageQueue();
 
 	void InitializeMessageQueue();
+
+	// HLE indices for the JIT fast-path recognizer. -1 until InitializeMessageQueue runs.
+	extern sint32 g_hleIdx_OSSendMessage;
+	extern sint32 g_hleIdx_OSReceiveMessage;
 };

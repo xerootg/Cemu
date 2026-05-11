@@ -83,6 +83,14 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
 
+# On Android arm64, enable LSE inline atomics (armv8.1-a). Without this, clang emits
+# out-of-line __aarch64_cas4/__aarch64_swp4 helper calls for every std::atomic op;
+# profiling Wind Waker HD showed ~10% of CPU on those helpers alone. All flagship
+# Android devices since 2018 have LSE support.
+if(ANDROID AND (ANDROID_ABI STREQUAL "arm64-v8a" OR CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a"))
+	add_compile_options(-march=armv8-a+lse)
+endif()
+
 if (MSVC)
 	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT CemuBin)
 	# floating point model: precise, fiber safe optimizations

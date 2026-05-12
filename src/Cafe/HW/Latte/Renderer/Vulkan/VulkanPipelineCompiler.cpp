@@ -989,7 +989,6 @@ bool PipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool show
 	pipelineInfo.pMultisampleState = &multisampling;
 	pipelineInfo.pColorBlendState = &colorBlending;
 	pipelineInfo.layout = m_pipelineLayout;
-	pipelineInfo.renderPass = m_renderPassObj->m_renderPass;
 	pipelineInfo.pDepthStencilState = &depthStencilState;
 	pipelineInfo.subpass = 0;
 	pipelineInfo.basePipelineHandle = nullptr;
@@ -998,6 +997,38 @@ bool PipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool show
 		pipelineInfo.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
 
 	void* prevStruct = nullptr;
+
+	// for VK_KHR_dynamic_rendering: declare attachment formats via VkPipelineRenderingCreateInfoKHR
+	// and use VK_NULL_HANDLE for renderPass. Storage must outlive vkCreateGraphicsPipelines.
+	VkPipelineRenderingCreateInfoKHR pipelineRenderingCreateInfo{};
+	VkFormat dynamicRenderingColorFormats[Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS] = {};
+	if (vkRenderer->m_featureControl.deviceExtensions.dynamic_rendering)
+	{
+		pipelineInfo.renderPass = VK_NULL_HANDLE;
+		uint32_t colorAttachmentCount = 0;
+		for (uint32_t i = 0; i < Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS; ++i)
+		{
+			dynamicRenderingColorFormats[i] = m_renderPassObj->GetColorFormat(i);
+			if (dynamicRenderingColorFormats[i] != VK_FORMAT_UNDEFINED)
+				colorAttachmentCount = i + 1;
+		}
+		VkFormat depthFormat = m_renderPassObj->GetDepthFormat();
+		bool depthHasStencil = (depthFormat == VK_FORMAT_D16_UNORM_S8_UINT ||
+		                       depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ||
+		                       depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT);
+		pipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+		pipelineRenderingCreateInfo.pNext = prevStruct;
+		pipelineRenderingCreateInfo.viewMask = 0;
+		pipelineRenderingCreateInfo.colorAttachmentCount = colorAttachmentCount;
+		pipelineRenderingCreateInfo.pColorAttachmentFormats = dynamicRenderingColorFormats;
+		pipelineRenderingCreateInfo.depthAttachmentFormat = (depthFormat != VK_FORMAT_UNDEFINED) ? depthFormat : VK_FORMAT_UNDEFINED;
+		pipelineRenderingCreateInfo.stencilAttachmentFormat = depthHasStencil ? depthFormat : VK_FORMAT_UNDEFINED;
+		prevStruct = &pipelineRenderingCreateInfo;
+	}
+	else
+	{
+		pipelineInfo.renderPass = m_renderPassObj->m_renderPass;
+	}
 
 	VkPipelineCreationFeedbackCreateInfoEXT creationFeedbackInfo;
 	VkPipelineCreationFeedbackEXT creationFeedback;

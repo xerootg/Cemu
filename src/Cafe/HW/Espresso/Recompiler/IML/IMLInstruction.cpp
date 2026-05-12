@@ -322,9 +322,18 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	}
 	else if (type == PPCREC_IML_TYPE_FPR_COMPARE)
 	{
-		registersUsed->writtenGPR1 = op_fpr_compare.regR;
-		registersUsed->readGPR1 = op_fpr_compare.regA;
-		registersUsed->readGPR2 = op_fpr_compare.regB;
+		if (operation == PPCREC_IML_OP_ARM64_FCMP)
+		{
+			// fused form: writes NZCV only, regR is unused
+			registersUsed->readGPR1 = op_fpr_compare.regA;
+			registersUsed->readGPR2 = op_fpr_compare.regB;
+		}
+		else
+		{
+			registersUsed->writtenGPR1 = op_fpr_compare.regR;
+			registersUsed->readGPR1 = op_fpr_compare.regA;
+			registersUsed->readGPR2 = op_fpr_compare.regB;
+		}
 	}
 	else if (type == PPCREC_IML_TYPE_X86_EFLAGS_JCC)
 	{
@@ -527,7 +536,11 @@ void IMLInstruction::RewriteGPR(const std::unordered_map<IMLRegID, IMLRegID>& tr
 	{
 		op_fpr_compare.regA = replaceRegisterIdMultiple(op_fpr_compare.regA, translationTable);
 		op_fpr_compare.regB = replaceRegisterIdMultiple(op_fpr_compare.regB, translationTable);
-		op_fpr_compare.regR = replaceRegisterIdMultiple(op_fpr_compare.regR, translationTable);
+		// ARM64_FCMP doesn't allocate regR (it's the fused form that writes NZCV only),
+		// so the regalloc translation table won't contain it. Skip the rewrite to avoid
+		// dereferencing an end iterator.
+		if (operation != PPCREC_IML_OP_ARM64_FCMP)
+			op_fpr_compare.regR = replaceRegisterIdMultiple(op_fpr_compare.regR, translationTable);
 	}
 	else if (type == PPCREC_IML_TYPE_X86_EFLAGS_JCC)
 	{

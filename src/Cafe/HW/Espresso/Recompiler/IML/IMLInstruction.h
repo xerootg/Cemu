@@ -164,6 +164,7 @@ enum
 
 	// AArch64 extension
 	PPCREC_IML_OP_ARM64_CMP, // R_R and R_S32 - sets NZCV but writes no GPR
+	PPCREC_IML_OP_ARM64_FCMP, // FPR_COMPARE - sets NZCV but writes no GPR
 
 	PPCREC_IML_OP_INVALID
 };

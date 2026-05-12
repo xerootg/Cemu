@@ -851,6 +851,8 @@ bool AArch64GenContext_t::r_r_r_carry(IMLInstruction* imlInstruction)
 	return true;
 }
 
+Cond ImlFPCondToArm64Cond(IMLCondition cond); // forward decl — defined alongside fpr_compare
+
 Cond ImlCondToArm64Cond(IMLCondition condition)
 {
 	switch (condition)
@@ -907,7 +909,12 @@ void AArch64GenContext_t::cjump(IMLInstruction* imlInstruction, IMLSegment* imlS
 
 void AArch64GenContext_t::cjump_nzcv(IMLInstruction* imlInstruction, IMLSegment* imlSegment)
 {
-	Cond cond = ImlCondToArm64Cond(imlInstruction->op_arm64_nzcv_jcc.cond);
+	IMLCondition imlCond = imlInstruction->op_arm64_nzcv_jcc.cond;
+	// FP conditions (UNORDERED_GT..) need the FP cond mapping because ARM's flag
+	// interpretation after fcmp differs from int cmp.
+	Cond cond = (imlCond >= IMLCondition::UNORDERED_GT)
+		? ImlFPCondToArm64Cond(imlCond)
+		: ImlCondToArm64Cond(imlCond);
 	if (imlInstruction->op_arm64_nzcv_jcc.invertedCondition)
 		cond = static_cast<Cond>(static_cast<uint32_t>(cond) ^ 1u);
 	prepareJump(NZCVJumpInfo{
@@ -1787,11 +1794,15 @@ Cond ImlFPCondToArm64Cond(IMLCondition cond)
 
 void AArch64GenContext_t::fpr_compare(IMLInstruction* imlInstruction)
 {
-	WReg regR = gpReg<WReg>(imlInstruction->op_fpr_compare.regR);
 	DReg regA = fpReg<DReg>(imlInstruction->op_fpr_compare.regA);
 	DReg regB = fpReg<DReg>(imlInstruction->op_fpr_compare.regB);
-	auto cond = ImlFPCondToArm64Cond(imlInstruction->op_fpr_compare.cond);
 	fcmp(regA, regB);
+	// Fused form (ARM64_FCMP): emit only the fcmp. The following ARM64_NZCV_JCC
+	// reads the live NZCV flags. No cset / no GPR write.
+	if (imlInstruction->operation == PPCREC_IML_OP_ARM64_FCMP)
+		return;
+	WReg regR = gpReg<WReg>(imlInstruction->op_fpr_compare.regR);
+	auto cond = ImlFPCondToArm64Cond(imlInstruction->op_fpr_compare.cond);
 	cset(regR, cond);
 }
 

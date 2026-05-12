@@ -746,6 +746,8 @@ void IMLOptimizerArm64_SubstituteCJumpForNZCVJump(IMLOptimizerRegIOAnalysis& reg
 		cond = condSetterInstr.op_compare.cond;
 	else if(condSetterInstr.type == PPCREC_IML_TYPE_COMPARE_S32)
 		cond = condSetterInstr.op_compare_s32.cond;
+	else if(condSetterInstr.type == PPCREC_IML_TYPE_FPR_COMPARE)
+		cond = condSetterInstr.op_fpr_compare.cond;
 	else
 		return;
 	// no NZCV-clobbering instructions may sit between the cmp and the cjump.
@@ -775,18 +777,24 @@ void IMLOptimizerArm64_SubstituteCJumpForNZCVJump(IMLOptimizerRegIOAnalysis& reg
 		return; // bool register is used beyond the CMP, leave the setter as a compare so the bool is still materialized
 
 	auto& cmpInstr = seg.imlList[cmpInstrIndex];
-	cemu_assert_debug(cmpInstr.type == PPCREC_IML_TYPE_COMPARE || cmpInstr.type == PPCREC_IML_TYPE_COMPARE_S32);
+	cemu_assert_debug(cmpInstr.type == PPCREC_IML_TYPE_COMPARE || cmpInstr.type == PPCREC_IML_TYPE_COMPARE_S32 || cmpInstr.type == PPCREC_IML_TYPE_FPR_COMPARE);
 	if(cmpInstr.type == PPCREC_IML_TYPE_COMPARE)
 	{
 		IMLReg regA = cmpInstr.op_compare.regA;
 		IMLReg regB = cmpInstr.op_compare.regB;
 		seg.imlList[cmpInstrIndex].make_r_r(PPCREC_IML_OP_ARM64_CMP, regA, regB);
 	}
-	else
+	else if(cmpInstr.type == PPCREC_IML_TYPE_COMPARE_S32)
 	{
 		IMLReg regA = cmpInstr.op_compare_s32.regA;
 		sint32 val = cmpInstr.op_compare_s32.immS32;
 		seg.imlList[cmpInstrIndex].make_r_s32(PPCREC_IML_OP_ARM64_CMP, regA, val);
+	}
+	else
+	{
+		// FPR_COMPARE: keep struct, switch operation. CheckRegisterUsage and
+		// RewriteGPR both special-case operation==ARM64_FCMP to ignore regR.
+		cmpInstr.operation = PPCREC_IML_OP_ARM64_FCMP;
 	}
 }
 

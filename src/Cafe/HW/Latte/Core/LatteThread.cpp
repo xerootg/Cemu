@@ -115,15 +115,15 @@ void LatteThread_HandleOSScreen()
 int Latte_ThreadEntry()
 {
 	SetThreadName("LatteThread");
-	// LatteThread feeds Vulkan submission but spends most of its budget in
-	// the GPU command-processor wait loops (~25% of an A720 mid pre-WFE was
-	// pure spin). After the WFE conversion it does ~5% of useful work per
-	// frame -- well within a little A520 core's reach at the 30 fps cap. Pin
-	// it onto the LITTLE cluster (hint=0 = highest-clocked little core) so
-	// the big cluster stays free for the JIT cores and the heat budget drops.
-	// Falls back to the big cluster on chips without a clear little/big split.
-	if (!PinCurrentThreadToLittleCores(0))
-		PinCurrentThreadToBigCores(3);
+	// LatteThread feeds Vulkan submission and runs the GPU command-processor.
+	// Stays on the big cluster (A720 mid, hint=3 keeps it off the X4 prime so
+	// it doesn't compete with OSSched[core=1]). The pre-WFE version was the
+	// thermal hotspot because the wait loops spun at 2.45 GHz; with WFE the
+	// core halts during empty polls, so this pin no longer cooks the die --
+	// and the A720's throughput is needed for the real per-frame work
+	// (memmove, descriptor builds, etc.) that the little cluster couldn't
+	// keep up with at the 30 fps target.
+	PinCurrentThreadToBigCores(3);
 	RaiseCurrentThreadPriority(-10);
 	sint32 w,h;
 	WindowSystem::GetWindowPhysSize(w,h);

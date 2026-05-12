@@ -41,4 +41,12 @@ namespace coreinit
 	uint32 OSGetStackPointer();
 
 	COSModule* GetModule();
+
+	// HLE indices for the JIT fast-path recognizer. -1 until coreinit init runs.
+	// Used by BackendAArch64.cpp to emit inlined bodies for trivial OS calls that
+	// the game hammers in hot paths — saves the PPCRecompiler_virtualHLE +
+	// cafeExportCallWrapper dispatch per call.
+	extern sint32 g_hleIdx_OSGetCoreId;
+	extern sint32 g_hleIdx_OSGetCurrentThread;
+	extern sint32 g_hleIdx_DCInvalidateRange;
 };

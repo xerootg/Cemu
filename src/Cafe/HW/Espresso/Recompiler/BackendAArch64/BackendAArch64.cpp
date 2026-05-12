@@ -15,6 +15,8 @@
 #include "HW/Espresso/Interpreter/PPCInterpreterHelper.h"
 #include "HW/Espresso/PPCState.h"
 #include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
+#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
+#include "Cafe/OS/libs/coreinit/coreinit.h"
 
 using namespace Xbyak_aarch64;
 
@@ -1023,15 +1025,17 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
 
 			// ===== CAS lockState 0 -> 1 (single attempt) =====
+			// casa (acquire-only) suffices — we don't need release-on-acquire since
+			// the matching unlock uses stlr (store-release). Saves a barrier vs casal.
 			mov(w10, 0);
 			mov(w11, 1);
-			casal(w10, w11, AdrNoOfs(x9));
+			casa(w10, w11, AdrNoOfs(x9));
 			cbnz(w10, slowCall);                                            // contended → C++ slow path
 
 			// ===== under lock: snapshot opposite-side pending waiters =====
 			// Receive snapshots pendingSendWaiters (offset 8), Send snapshots
 			// pendingReceiveWaiters (offset 4). Plain ldr is sufficient: the
-			// casal-acquire above synchronizes-with the previous holder's stlr-release
+			// casa-acquire above synchronizes-with the previous holder's stlr-release
 			// on lockState, so the counter's prior fetch_add (sequenced before that
 			// stlr) is visible.
 			// w16 stays live through the body and is checked after lock release —
@@ -1039,14 +1043,17 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// this case so the lock isn't immediately reacquired by the C++ entry.
 			ldr(w16, AdrUimm(x9, isReceive ? 8u : 4u));
 
-			// ===== load usedCount (big-endian -> native) =====
-			ldr(w10, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, usedCount)));
-			rev(w10, w10);
+			// ===== load queue fields with ldp consolidation =====
+			// firstIndex (offset 0x34) + usedCount (offset 0x38) are adjacent — one
+			// ldp loads both. usedCount is BE-encoded but uint32be==0 has the same
+			// byte pattern in any endianness, so cbz works directly on the BE value;
+			// only revswap when we need to do arithmetic on it.
+			ldp(w11, w10, AdrImm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
 
 			if (isReceive)
 			{
 				Label dequeue;
-				cbnz(w10, dequeue);                                         // non-empty → dequeue
+				cbnz(w10, dequeue);                                         // non-empty → dequeue (BE 0 == LE 0)
 
 				// empty: if BLOCK set, slow path waits; else return false
 				tbnz(w2, 0, slowUnlock);                                    // bit 0 = OS_MESSAGE_BLOCK
@@ -1055,13 +1062,12 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				b(fastDone);
 
 				L(dequeue);
-				// firstIndex (w11), msgCount (w12), msgArray guest ptr (w13)
-				ldr(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
-				rev(w11, w11);
-				ldr(w12, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgCount)));
-				rev(w12, w12);
-				ldr(w13, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
-				rev(w13, w13);
+				// msgArray (0x2C) + msgCount (0x30) via ldp
+				ldp(w13, w12, AdrImm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
+				rev(w10, w10);                                              // usedCount native
+				rev(w11, w11);                                              // firstIndex native
+				rev(w12, w12);                                              // msgCount native
+				rev(w13, w13);                                              // msgArray native
 				add(x13, MEM_BASE_REG, x13, ExtMod::UXTW);                   // host ptr to msgArray
 				add(x13, x13, x11, ShMod::LSL, 4);                           // &msgArray[firstIndex] (16B stride)
 				ldp(x14, x15, AdrNoOfs(x13));                                // copy 16B (preserves BE layout)
@@ -1071,11 +1077,11 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				cmp(w11, w12);
 				csel(w11, wzr, w11, Cond::EQ);
 				rev(w11, w11);
-				str(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
 				// usedCount -= 1
 				sub(w10, w10, 1);
 				rev(w10, w10);
-				str(w10, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, usedCount)));
+				// Store updated firstIndex + usedCount in one stp (adjacent, same offsets as load)
+				stp(w11, w10, AdrImm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
 				// gpr[3] = 1 (stored before wake call so the helper's clobbers don't matter)
 				mov(w11, 1);
 				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
@@ -1089,11 +1095,14 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			else
 			{
 				Label enqueue;
-				// msgCount (w11), compare with usedCount (w10)
-				ldr(w11, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgCount)));
-				rev(w11, w11);
-				cmp(w10, w11);
-				blt(enqueue);                                               // usedCount < msgCount → enqueue
+				// Load msgArray (0x2C) + msgCount (0x30) via ldp
+				ldp(w13, w12, AdrImm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
+				// Compare BE values directly: usedCount < msgCount. Both are small
+				// non-negative uint32; raw BE bytes preserve unsigned ordering when
+				// both high 24 bits are zero (which is always the case for these
+				// fields in practice — Wii U queues never exceed ~256 entries).
+				cmp(w10, w12);
+				blo(enqueue);                                               // usedCount < msgCount → enqueue (unsigned)
 
 				// full: if BLOCK set, slow path waits; else return false
 				tbnz(w2, 0, slowUnlock);
@@ -1104,16 +1113,16 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				L(enqueue);
 				// HIGH_PRIORITY uses backward firstIndex rotation — leave that to the C++ path
 				tbnz(w2, 1, slowUnlock);                                    // bit 1 = OS_MESSAGE_HIGH_PRIORITY
-				// firstIndex (w12), msgArray guest ptr (w13)
-				ldr(w12, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, firstIndex)));
-				rev(w12, w12);
-				ldr(w13, AdrUimm(x0, offsetof(coreinit::OSMessageQueue, msgArray)));
-				rev(w13, w13);
+				// Need native values for arithmetic
+				rev(w10, w10);                                              // usedCount native
+				rev(w11, w11);                                              // firstIndex native (was w12 in old code; now in w11 from ldp)
+				rev(w12, w12);                                              // msgCount native
+				rev(w13, w13);                                              // msgArray native
 				// messageIndex = (firstIndex + usedCount) mod msgCount
 				// firstIndex < msgCount && usedCount < msgCount → sum < 2*msgCount, so one subtract suffices
-				add(w14, w12, w10);
-				sub(w15, w14, w11);
-				cmp(w14, w11);
+				add(w14, w11, w10);
+				sub(w15, w14, w12);
+				cmp(w14, w12);
 				csel(w14, w15, w14, Cond::GE);                              // w14 = messageIndex
 				add(x13, MEM_BASE_REG, x13, ExtMod::UXTW);
 				add(x13, x13, x14, ShMod::LSL, 4);                          // &msgArray[messageIndex]
@@ -1149,6 +1158,43 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 			L(fastDone);
 			// instructionPointer = LR (cafeExportCallWrapper does this; mirror it here)
+			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			emittedDirectCall = true;
+		}
+		else if (funcId == (uint32)coreinit::g_hleIdx_OSGetCoreId)
+		{
+			// Inline OSGetCoreId: returns hCPU->spr.UPIR. Saves the
+			// PPCRecompiler_virtualHLE + cafeExportCallWrapper round-trip; game
+			// callers use this in mutex/affinity hot paths.
+			ldr(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.UPIR)));
+			str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			emittedDirectCall = true;
+		}
+		else if (funcId == (uint32)coreinit::g_hleIdx_OSGetCurrentThread)
+		{
+			// Inline OSGetCurrentThread: returns __currentCoreThread[hCPU->spr.UPIR]
+			// converted to a guest MPTR. Game uses this in every mutex/event
+			// owner-check; bypassing the C++ wrapper avoids the host-ptr<->MPTR
+			// conversion overhead in cafeExportCallWrapper.
+			ldr(w10, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.UPIR)));
+			mov(TEMP_GPR1.XReg, (uint64)&coreinit::__currentCoreThread[0]);
+			ldr(x11, AdrExt(TEMP_GPR1.XReg, w10, ExtMod::UXTW, 3));        // host ptr (sizeof OSThread_t* == 8)
+			cmp(x11, 0);
+			sub(x12, x11, MEM_BASE_REG);                                    // guest MPTR
+			csel(w12, wzr, w12, Cond::EQ);                                  // null host → 0 MPTR
+			str(w12, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
+			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			emittedDirectCall = true;
+		}
+		else if (funcId == (uint32)coreinit::g_hleIdx_DCInvalidateRange)
+		{
+			// Inline DCInvalidateRange: no-op in Cemu (the function body only does
+			// dead arithmetic; there's no real CPU cache to invalidate and the
+			// LatteBufferCache hook is commented out). Drop the call entirely.
 			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 			emittedDirectCall = true;

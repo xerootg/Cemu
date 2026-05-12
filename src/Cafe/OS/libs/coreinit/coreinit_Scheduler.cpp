@@ -21,16 +21,35 @@ CRITICAL_SECTION s_csSchedulerLock;
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <thread>
 
-// Adaptive futex-based spinlock used as the global scheduler lock. Replaces a
-// recursive pthread_mutex_t — under WW HD core 1's tight OSSendMessage/OSReceiveMessage
-// loop, the pthread path took ~30% of CPU on lock/unlock futex syscalls. The
-// PTHREAD_MUTEX_RECURSIVE attribute was defensive only; existing
-// s_schedulerLockCount <= 1 asserts confirm callers never recurse.
+// Sharded scheduler lock.
 //
-// State: 0=unlocked, 1=locked-no-waiters, 2=locked-with-waiters.
+// Writer mode (taken by __OSLockScheduler with obj=null) excludes all other
+// writers and all shard holders. Required for fiber switches, thread
+// create/destroy, and any path that holds the lock across a context switch.
+//
+// Shard mode (taken by __OSLockSchedulerShard) excludes only writers and other
+// shard holders on the same hash slot. Two shard holders on different slots
+// run in parallel. Intended for wake helpers operating on a single sync
+// primitive — under WW HD core 1's tight OSSend/ReceiveMessage loop those
+// wakes are the bulk of the lock traffic (~5M ops/sec).
+//
+// Implementation: per-shard futex spinlock array. Writer mode acquires ALL
+// shards in order (deadlock-free: shard mode only ever holds one shard, and
+// writer mode's fixed acquisition order serializes writers). No global
+// reader-count/writer-flag atomics — those were the source of cross-shard
+// contention in the first pass at this design; removing them lets shard ops
+// run independently on different cache lines.
+//
+// Tradeoff: writer mode now costs SCHED_SHARD_COUNT CAS ops (~32 cache lines)
+// instead of one. Acceptable since writers are rare in the hot path (scheduler
+// ticks, block paths) — most lock traffic is shard mode (wake helpers).
 namespace {
-class SchedulerSpinLock
+
+constexpr uint32_t SCHED_SHARD_COUNT = 32;
+
+class FutexSpinLock
 {
 public:
 	void lock() noexcept
@@ -79,9 +98,72 @@ private:
 
 	std::atomic<uint32_t> m_state{0};
 };
+
+class ShardedSchedulerLock
+{
+public:
+	// Writer: take all shards in order. Deadlock-free against shard mode
+	// (shard mode only ever holds one shard, never tries to acquire another).
+	// Writers serialize because they always acquire shard 0 first.
+	void lockExclusive() noexcept
+	{
+		for (uint32_t i = 0; i < SCHED_SHARD_COUNT; ++i)
+			m_shardLocks[i].sl.lock();
+	}
+
+	bool tryLockExclusive() noexcept
+	{
+		for (uint32_t i = 0; i < SCHED_SHARD_COUNT; ++i)
+		{
+			if (!m_shardLocks[i].sl.tryLock())
+			{
+				for (uint32_t j = i; j-- > 0;)
+					m_shardLocks[j].sl.unlock();
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void unlockExclusive() noexcept
+	{
+		for (uint32_t i = SCHED_SHARD_COUNT; i-- > 0;)
+			m_shardLocks[i].sl.unlock();
+	}
+
+	void lockShard(uint32_t shardIdx) noexcept
+	{
+		m_shardLocks[shardIdx].sl.lock();
+	}
+
+	void unlockShard(uint32_t shardIdx) noexcept
+	{
+		m_shardLocks[shardIdx].sl.unlock();
+	}
+
+	static uint32_t hashShard(const void* obj) noexcept
+	{
+		uintptr_t h = reinterpret_cast<uintptr_t>(obj);
+		h ^= (h >> 33);
+		h *= 0xff51afd7ed558ccdULL;
+		h ^= (h >> 33);
+		return static_cast<uint32_t>(h) & (SCHED_SHARD_COUNT - 1);
+	}
+
+private:
+	// Each shard is on its own cache line so unrelated shard ops don't cause
+	// false sharing between cores.
+	struct alignas(64) PaddedShard
+	{
+		FutexSpinLock sl;
+		char _pad[64 - sizeof(FutexSpinLock)];
+	};
+	PaddedShard m_shardLocks[SCHED_SHARD_COUNT];
+};
+
 }
 
-static SchedulerSpinLock s_ptmSchedulerLock;
+static ShardedSchedulerLock s_ptmSchedulerLock;
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -95,7 +177,7 @@ SCHED_LOCK_NOINLINE void __OSLockScheduler(void* obj)
 #if BOOST_OS_WINDOWS
 	EnterCriticalSection(&s_csSchedulerLock);
 #else
-	s_ptmSchedulerLock.lock();
+	s_ptmSchedulerLock.lockExclusive();
 #endif
 #ifdef CEMU_DEBUG_ASSERT
 	s_schedulerLockCount++;
@@ -120,7 +202,7 @@ SCHED_LOCK_NOINLINE bool __OSTryLockScheduler(void* obj)
 #if BOOST_OS_WINDOWS
 	r = TryEnterCriticalSection(&s_csSchedulerLock);
 #else
-	r = s_ptmSchedulerLock.tryLock();
+	r = s_ptmSchedulerLock.tryLockExclusive();
 #endif
 #ifdef CEMU_DEBUG_ASSERT
 	if (r)
@@ -138,7 +220,36 @@ SCHED_LOCK_NOINLINE void __OSUnlockScheduler(void* obj)
 #if BOOST_OS_WINDOWS
 	LeaveCriticalSection(&s_csSchedulerLock);
 #else
-	s_ptmSchedulerLock.unlock();
+	s_ptmSchedulerLock.unlockExclusive();
+#endif
+}
+
+SCHED_LOCK_NOINLINE void __OSLockSchedulerShard(void* obj)
+{
+#if BOOST_OS_WINDOWS
+	// Windows path keeps the global critical section.
+	EnterCriticalSection(&s_csSchedulerLock);
+#else
+	cemu_assert_debug(obj != nullptr);
+	s_ptmSchedulerLock.lockShard(ShardedSchedulerLock::hashShard(obj));
+#endif
+#ifdef CEMU_DEBUG_ASSERT
+	s_schedulerLockCount++;
+	cemu_assert_debug(s_schedulerLockCount <= 1);
+#endif
+}
+
+SCHED_LOCK_NOINLINE void __OSUnlockSchedulerShard(void* obj)
+{
+#ifdef CEMU_DEBUG_ASSERT
+	s_schedulerLockCount--;
+	cemu_assert_debug(s_schedulerLockCount >= 0);
+#endif
+#if BOOST_OS_WINDOWS
+	LeaveCriticalSection(&s_csSchedulerLock);
+#else
+	cemu_assert_debug(obj != nullptr);
+	s_ptmSchedulerLock.unlockShard(ShardedSchedulerLock::hashShard(obj));
 #endif
 }
 

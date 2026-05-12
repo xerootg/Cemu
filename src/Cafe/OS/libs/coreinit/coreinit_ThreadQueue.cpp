@@ -167,4 +167,33 @@ namespace coreinit
 			PPCCore_switchToSchedulerWithLock();
 	}
 
+	// Shard-safe wake variants. Identical to the non-shard variants except they
+	// never call PPCCore_switchToSchedulerWithLock — that would block while
+	// holding only a shard slot and could deadlock against a writer-mode caller.
+	// Same-core higher-priority wakes are still added to the run queue, just not
+	// boosted past the next quantum boundary.
+	void OSThreadQueueInternal::wakeupSingleThreadWaitQueueShard()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		OSThread_t* thread = takeFirstFromQueue(offsetof(OSThread_t, waitQueueLink));
+		if (thread)
+		{
+			thread->state = OSThread_t::THREAD_STATE::STATE_READY;
+			thread->currentWaitQueue = nullptr;
+			coreinit::__OSAddReadyThreadToRunQueue(thread);
+		}
+	}
+
+	void OSThreadQueueInternal::wakeupEntireWaitQueueShard()
+	{
+		cemu_assert_debug(__OSHasSchedulerLock());
+		while (OSThread_t* thread = takeFirstFromQueue(offsetof(OSThread_t, waitQueueLink)))
+		{
+			cemu_assert_debug(thread->state == OSThread_t::THREAD_STATE::STATE_WAITING);
+			thread->state = OSThread_t::THREAD_STATE::STATE_READY;
+			thread->currentWaitQueue = nullptr;
+			coreinit::__OSAddReadyThreadToRunQueue(thread);
+		}
+	}
+
 }

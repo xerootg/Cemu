@@ -167,10 +167,10 @@ namespace coreinit
 
 		if (maybeSendWaiters)
 		{
-			__OSLockScheduler(msgQueue);
+			__OSLockSchedulerShard(msgQueue);
 			if (!msgQueue->threadQueueSend.isEmpty())
-				msgQueue->threadQueueSend.wakeupSingleThreadWaitQueue(true);
-			__OSUnlockScheduler(msgQueue);
+				msgQueue->threadQueueSend.wakeupSingleThreadWaitQueueShard();
+			__OSUnlockSchedulerShard(msgQueue);
 		}
 
 		if(isSystemMessageQueue)
@@ -236,10 +236,10 @@ namespace coreinit
 
 		if (maybeReceiveWaiters)
 		{
-			__OSLockScheduler();
+			__OSLockSchedulerShard(msgQueue);
 			if (!msgQueue->threadQueueReceive.isEmpty())
-				msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueue(true);
-			__OSUnlockScheduler();
+				msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueueShard();
+			__OSUnlockSchedulerShard(msgQueue);
 		}
 		return 1;
 	}
@@ -251,18 +251,18 @@ namespace coreinit
 
 	void OSWakeOneSender(OSMessageQueue* msgQueue)
 	{
-		__OSLockScheduler();
+		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueSend.isEmpty())
-			msgQueue->threadQueueSend.wakeupSingleThreadWaitQueue(true);
-		__OSUnlockScheduler();
+			msgQueue->threadQueueSend.wakeupSingleThreadWaitQueueShard();
+		__OSUnlockSchedulerShard(msgQueue);
 	}
 
 	void OSWakeOneReceiver(OSMessageQueue* msgQueue)
 	{
-		__OSLockScheduler();
+		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueReceive.isEmpty())
-			msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueue(true);
-		__OSUnlockScheduler();
+			msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueueShard();
+		__OSUnlockSchedulerShard(msgQueue);
 	}
 
 	// HLE indices for the hot message-queue functions. Captured at registration time

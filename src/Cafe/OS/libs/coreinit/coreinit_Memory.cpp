@@ -220,6 +220,10 @@ namespace coreinit
 		cafeExportRegister("coreinit", OSMemoryBarrier, LogType::Placeholder);
 
 		cafeExportRegister("coreinit", OSGetMemBound, LogType::Placeholder);
+
+		// JIT inline-body fast-path id — DCInvalidateRange is a no-op in Cemu,
+		// so the JIT can drop the call entirely.
+		g_hleIdx_DCInvalidateRange = osLib_getFunctionIndex("coreinit", "DCInvalidateRange");
 	}
 
 }

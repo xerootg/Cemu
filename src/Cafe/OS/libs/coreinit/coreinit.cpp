@@ -281,6 +281,12 @@ namespace coreinit
 #endif
 	}
 
+	// HLE-id capture for the JIT inline-body recognizer. Init runs after all
+	// registrations, so we resolve indices then.
+	sint32 g_hleIdx_OSGetCoreId = -1;
+	sint32 g_hleIdx_OSGetCurrentThread = -1;
+	sint32 g_hleIdx_DCInvalidateRange = -1;
+
 	void InitializeCore()
 	{
 		cafeExportRegister("coreinit", OSGetCoreId, LogType::CoreinitThread);
@@ -291,6 +297,11 @@ namespace coreinit
 		cafeExportRegister("coreinit", OSGetMainCoreId, LogType::CoreinitThread);
 		cafeExportRegister("coreinit", OSIsMainCore, LogType::CoreinitThread);
 		cafeExportRegister("coreinit", OSGetStackPointer, LogType::CoreinitThread);
+
+		// Resolve HLE index for the inline-body JIT fast path of OSGetCoreId.
+		// OSGetCurrentThread / DCInvalidateRange are registered later in
+		// InitializeThread / InitializeMemory and resolve their own indices there.
+		g_hleIdx_OSGetCoreId = osLib_getFunctionIndex("coreinit", "OSGetCoreId");
 
 		osLib_addFunction("coreinit", "ENVGetEnvironmentVariable", coreinitExport_ENVGetEnvironmentVariable);
 

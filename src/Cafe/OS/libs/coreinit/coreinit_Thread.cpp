@@ -73,6 +73,39 @@ namespace coreinit
 	SysAllocator<OSThreadQueue, 3> g_coreRunQueue;
 	CounterSemaphore g_coreRunQueueThreadCount[3];
 
+	// Per-core run queue spinlocks. Acquired around mutations of
+	// g_coreRunQueue[i]. Required when shard-mode scheduler callers (which can
+	// run concurrently across different shards) update the run queue. Writer-
+	// mode callers also take these locks, but they're uncontested in that case
+	// since writer-mode excludes all shards.
+	std::atomic<uint32_t> g_coreRunQueueLock[3]{};
+
+	static inline void __OSRunQueueLock(uint32_t coreIdx)
+	{
+		uint32_t expected = 0;
+		if (g_coreRunQueueLock[coreIdx].compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
+			return;
+		for (;;)
+		{
+			for (int i = 0; i < 64; ++i)
+			{
+				expected = 0;
+				if (g_coreRunQueueLock[coreIdx].compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
+					return;
+#if defined(__aarch64__) || defined(__arm__)
+				__asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+				__asm__ __volatile__("pause" ::: "memory");
+#endif
+			}
+		}
+	}
+
+	static inline void __OSRunQueueUnlock(uint32_t coreIdx)
+	{
+		g_coreRunQueueLock[coreIdx].store(0, std::memory_order_release);
+	}
+
 	bool g_isMulticoreMode;
 
 	thread_local uint32 t_assignedCoreIndex;
@@ -808,8 +841,10 @@ namespace coreinit
 			// check affinity
 			if(!thread->context.hasCoreAffinitySet(i))
 				continue;
+			__OSRunQueueLock(i);
 			g_coreRunQueue.GetPtr()[i].addThread(thread, thread->linkRun + i);
 			thread->currentRunQueue[i] = (g_coreRunQueue.GetPtr() + i);
+			__OSRunQueueUnlock(i);
 			g_coreRunQueueThreadCount[i].increment();
 		}
 	}
@@ -821,8 +856,10 @@ namespace coreinit
 		{
 			if(thread->currentRunQueue[i] == nullptr)
 				continue;
+			__OSRunQueueLock(i);
 			g_coreRunQueue.GetPtr()[i].removeThread(thread, thread->linkRun + i);
 			thread->currentRunQueue[i] = nullptr;
+			__OSRunQueueUnlock(i);
 			g_coreRunQueueThreadCount[i].decrement();
 		}
 	}
@@ -1679,5 +1716,7 @@ namespace coreinit
 			__currentCoreThread[i] = nullptr;
 		__OSInitDefaultThreads();
 		__OSInitTerminatorThreads();
+		// JIT inline-body fast-path id (resolved after registration completes)
+		g_hleIdx_OSGetCurrentThread = osLib_getFunctionIndex("coreinit", "OSGetCurrentThread");
 	}
 }

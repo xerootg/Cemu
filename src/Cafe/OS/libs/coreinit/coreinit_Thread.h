@@ -129,6 +129,14 @@ namespace coreinit
 		void wakeupEntireWaitQueue(bool reschedule, bool sharedPriorityAndAffinityWorkaround = false);
 		void wakeupSingleThreadWaitQueue(bool reschedule, bool sharedPriorityAndAffinityWorkaround = false);
 
+		// Shard-mode wake variants — never call PPCCore_switchToSchedulerWithLock,
+		// so they are safe to invoke while holding __OSLockSchedulerShard. Same-core
+		// higher-priority wakes lose their immediate-reschedule boost; the woken
+		// thread runs at the next quantum boundary instead. Acceptable for the WW
+		// HD wake hot path (cross-core message-queue wakes don't reschedule anyway).
+		void wakeupSingleThreadWaitQueueShard();
+		void wakeupEntireWaitQueueShard();
+
 	private:
 		OSThread_t* takeFirstFromQueue(size_t linkOffset)
 		{
@@ -525,6 +533,11 @@ namespace coreinit
 
 	OSThread_t* OSGetCurrentThread();
 	void OSSetCurrentThread(uint32 coreIndex, OSThread_t* thread);
+
+	// Per-core current-thread pointer table indexed by hCPU->spr.UPIR. Exposed so
+	// the AArch64 JIT can inline OSGetCurrentThread (single host-ptr load + guest
+	// MPTR conversion).
+	extern OSThread_t* __currentCoreThread[3];
 
 	void __OSSetThreadBasePriority(OSThread_t* thread, sint32 newPriority);
 	void __OSUpdateThreadEffectivePriority(OSThread_t* thread);

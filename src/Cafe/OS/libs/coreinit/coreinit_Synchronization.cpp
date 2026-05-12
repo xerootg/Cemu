@@ -138,6 +138,29 @@ namespace coreinit
 
 	void OSSignalEvent(OSEvent* event)
 	{
+		// Auto-mode events with no waiters can complete entirely under shard
+		// mode — the state mutation and wait-queue check are both local to this
+		// event. If a waiter is present we fall through to writer-mode below
+		// since wakeupSingleThreadWaitQueue may reschedule the current thread,
+		// which requires the global lock for the fiber switch.
+		if (event->mode == OSEvent::EVENT_MODE::MODE_AUTO)
+		{
+			__OSLockSchedulerShard(event);
+			if (event->state != OSEvent::EVENT_STATE::STATE_SIGNALED)
+			{
+				if (event->threadQueue.isEmpty())
+				{
+					event->state = OSEvent::EVENT_STATE::STATE_SIGNALED;
+					__OSUnlockSchedulerShard(event);
+					return;
+				}
+				event->threadQueue.wakeupSingleThreadWaitQueueShard();
+				__OSUnlockSchedulerShard(event);
+				return;
+			}
+			__OSUnlockSchedulerShard(event);
+			return;
+		}
 		__OSLockScheduler();
 		OSSignalEventInternal(event);
 		__OSUnlockScheduler();
@@ -323,6 +346,22 @@ namespace coreinit
 
 	void OSUnlockMutex(OSMutex* mutex)
 	{
+		// Mutex unlock with no waiters and no recursion is fully local to this
+		// mutex — neither the owner thread's mutexQueue (per-thread) nor the
+		// mutex state itself is shared with other primitives. Stay in shard mode
+		// for that case; escalate to writer when wakeup may be needed.
+		OSThread_t* currentThread = OSGetCurrentThread();
+		if (mutex->owner == currentThread && (uint32)mutex->lockCount > 1)
+		{
+			__OSLockSchedulerShard(mutex);
+			if (mutex->owner == currentThread && (uint32)mutex->lockCount > 1)
+			{
+				mutex->lockCount = (uint32)mutex->lockCount - 1;
+				__OSUnlockSchedulerShard(mutex);
+				return;
+			}
+			__OSUnlockSchedulerShard(mutex);
+		}
 		__OSLockScheduler();
 		OSUnlockMutexInternal(mutex);
 		__OSUnlockScheduler();

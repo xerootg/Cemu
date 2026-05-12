@@ -2054,6 +2054,7 @@ bool VulkanRenderer::ImguiBegin(bool mainWindow)
 	if (!AcquireNextSwapchainImage(mainWindow))
 		return false;
 
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndImgui.increment();
 	draw_endRenderPass();
 	m_state.currentPipeline = VK_NULL_HANDLE;
 
@@ -2197,6 +2198,7 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
 
 void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphore waitSemaphore)
 {
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndSubmit.increment();
 	draw_endRenderPass();
 
 	// drain any deferred clears that didn't get folded into a render pass
@@ -3246,6 +3248,7 @@ void VulkanRenderer::ClearColorbuffer(bool padView)
 
 void VulkanRenderer::ClearColorImageRaw(VkImage image, uint32 sliceIndex, uint32 mipIndex, const VkClearColorValue& color, VkImageLayout inputLayout, VkImageLayout outputLayout)
 {
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndClearColor.increment();
 	draw_endRenderPass();
 
 	VkImageSubresourceRange subresourceRange{};
@@ -3808,6 +3811,7 @@ void VulkanRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 s
 		return;
 	}
 
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndClearDepth.increment();
 	draw_endRenderPass(); // vkCmdClearDepthStencilImage must not be inside renderpass
 
 	auto imageObj = vkTexture->GetImageObj();
@@ -3850,6 +3854,7 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 	auto vkImageObj = vkTexture->GetImageObj();
 	vkImageObj->flagForCurrentCommandBuffer();
 
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndTextureUpload.increment();
 	draw_endRenderPass();
 
 	VkMemoryRequirements memRequirements;
@@ -3968,6 +3973,7 @@ void VulkanRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, 
 	texture_flushPendingClear(srcVk);
 	texture_flushPendingClear(dstVk);
 
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndImageCopy.increment();
 	draw_endRenderPass(); // vkCmdCopyImage must be called outside of a renderpass
 
 	VKRObjectTexture* srcVkObj = srcVk->GetImageObj();
@@ -4201,11 +4207,17 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
 	m_importedMemBaseAddress = 0x10000000;
 	size_t hostAllocationSize = 0x40000000ull;
 	// todo - get size of allocation
-	bool configUseHostMemory = false; // todo - replace this with a config option
+	// Enable VK_EXT_external_memory_host to import Wii U guest memory directly as a Vulkan
+	// buffer. This makes bufferCache_upload a no-op (data lives in the same backing memory
+	// the GPU already reads from), eliminating the vkCmdCopyBuffer + render-pass break that
+	// was firing 250+ times/frame in profiling.
+	bool configUseHostMemory = true;
 	m_useHostMemoryForCache = false;
+	cemuLog_log(LogType::Force, "[BufCacheProbe] external_memory_host available={} configRequested={}", (bool)m_featureControl.deviceExtensions.external_memory_host, configUseHostMemory);
 	if (m_featureControl.deviceExtensions.external_memory_host && configUseHostMemory)
 	{
 		m_useHostMemoryForCache = memoryManager->CreateBufferFromHostMemory(memory_getPointerFromVirtualOffset(m_importedMemBaseAddress), hostAllocationSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_importedMem, m_importedMemMemory);
+		cemuLog_log(LogType::Force, "[BufCacheProbe] CreateBufferFromHostMemory result={}", m_useHostMemoryForCache);
 		if (!m_useHostMemoryForCache)
 		{
 			cemuLog_log(LogType::Force, "Unable to import host memory to Vulkan buffer. Use default cache system instead");
@@ -4217,6 +4229,7 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
 
 void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
 {
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndBufferCache.increment();
 	draw_endRenderPass();
 
 	VKRSynchronizedRingAllocator& vkMemAllocator = memoryManager->getStagingAllocator();
@@ -4243,6 +4256,7 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
 void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size)
 {
 	cemu_assert_debug(!m_useHostMemoryForCache);
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndBufferCache.increment();
 	draw_endRenderPass();
 
 	barrier_sequentializeTransfer();
@@ -4261,6 +4275,7 @@ void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32
 
 void VulkanRenderer::bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uint32 dstOffset, uint32 size)
 {
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndBufferCache.increment();
 	draw_endRenderPass();
 
 	VkBuffer dstBuffer;

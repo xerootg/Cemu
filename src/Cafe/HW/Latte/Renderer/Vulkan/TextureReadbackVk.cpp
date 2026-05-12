@@ -1,6 +1,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
+#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 
 LatteTextureReadbackInfoVk::LatteTextureReadbackInfoVk(VkDevice device, LatteTextureView* textureView)
 	: LatteTextureReadbackInfo(textureView), m_device(device)
@@ -121,6 +122,7 @@ void LatteTextureReadbackInfoVk::StartTransfer()
 	region.imageExtent = {(uint32)baseTexture->width,(uint32)baseTexture->height,1};
 
 	const auto renderer = VulkanRenderer::GetInstance();
+	if (renderer->m_state.activeRenderpassFBO) performanceMonitor.vk.extEndTextureReadback.increment();
 	renderer->draw_endRenderPass();
 
 	renderer->barrier_image<VulkanRenderer::ANY_TRANSFER | VulkanRenderer::IMAGE_WRITE, VulkanRenderer::TRANSFER_READ>(baseTexture, region.imageSubresource, VK_IMAGE_LAYOUT_GENERAL);

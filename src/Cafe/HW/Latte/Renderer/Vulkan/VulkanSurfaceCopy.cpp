@@ -1,5 +1,6 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
+#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 
 struct CopyShaderPushConstantData_t
 {
@@ -587,6 +588,7 @@ void VulkanRenderer::surfaceCopy_viaDrawcall(LatteTextureVk* srcTextureVk, sint3
 	texture_flushPendingClear(srcTextureVk);
 	texture_flushPendingClear(dstTextureVk);
 
+	if (m_state.activeRenderpassFBO) performanceMonitor.vk.extEndSurfaceCopy.increment();
 	draw_endRenderPass();
 
 	//debug_printf("surfaceCopy_viaDrawcall Src %04d %04d Dst %04d %04d CopySize %04d %04d\n", srcTextureVk->width, srcTextureVk->height, dstTextureVk->width, dstTextureVk->height, effectiveCopyWidth, effectiveCopyHeight);
@@ -821,6 +823,19 @@ void VulkanRenderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* s
 	if (srcTextureVk->GetBPP() != dstTextureVk->GetBPP())
 	{
 		cemuLog_logDebug(LogType::Force, "surfaceCopy_copySurfaceViaDrawcall(): Mismatching BPP");
+		return;
+	}
+
+	// fast path: if both surfaces share the same VkFormat the copy is a pure bit copy and
+	// can be issued as a vkCmdCopyImage in the transfer stage — no extra render pass,
+	// no pipeline bind, no draw call. surfaceCopy_viaDrawcall conversely spins up its own
+	// render pass per call, which on Mali (TBR) costs hundreds of microseconds in tile
+	// flush/load overhead per invocation.
+	if (srcTextureVk->GetFormat() == dstTextureVk->GetFormat())
+	{
+		texture_copyImageSubData(sourceTexture, texSrcMip, 0, 0, texSrcSlice,
+		                        destinationTexture, texDstMip, 0, 0, texDstSlice,
+		                        effectiveCopyWidth, effectiveCopyHeight, 1);
 		return;
 	}
 

@@ -275,6 +275,13 @@ bool PPCRecompilerImlGen_FMADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
+#if defined(__aarch64__)
+	// PPC fmadd: rD = rA*rC + rB. AArch64 has fmadd as a single host instruction
+	// that reads all three sources before writing the destination, so dst/src
+	// overlap is safe -- no temp register, no assign, no separate mul + add.
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_MULTIPLY_ADD, fprD, fprA, fprC, fprB);
+	return true;
+#else
 	// if frB is already in frD we need a temporary register to store the product of frA*frC
 	if( frB == frD )
 	{
@@ -303,6 +310,7 @@ bool PPCRecompilerImlGen_FMADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
 	// add frB
 	ppcImlGenContext->emitInst().make_fpr_r_r(PPCREC_IML_OP_FPR_ADD, fprD, fprB);
 	return true;
+#endif
 }
 
 bool PPCRecompilerImlGen_FMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
@@ -313,6 +321,14 @@ bool PPCRecompilerImlGen_FMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
+#if defined(__aarch64__)
+	// PPC fmsub: rD = rA*rC - rB. Single AArch64 fnmsub host instruction
+	// after lowering. No temp/overlap handling needed (FMA reads all sources
+	// before writing). Also incidentally fixes the frB==frD return-false bug
+	// in the legacy x86 path below.
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_MULTIPLY_SUB, fprD, fprA, fprC, fprB);
+	return true;
+#else
 	if( frB == frD )
 	{
 		// if frB is already in frD we need a temporary register to store the product of frA*frC
@@ -338,6 +354,7 @@ bool PPCRecompilerImlGen_FMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
 	// sub frB
 	ppcImlGenContext->emitInst().make_fpr_r_r(PPCREC_IML_OP_FPR_SUB, fprD, fprB);
 	return true;
+#endif
 }
 
 bool PPCRecompilerImlGen_FNMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
@@ -348,6 +365,13 @@ bool PPCRecompilerImlGen_FNMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
+#if defined(__aarch64__)
+	// PPC fnmsub: rD = -(rA*rC - rB) = rB - rA*rC. AArch64 fmsub fits exactly
+	// (Vd = -Va*Vb + Vc in ARM ARM notation). One host op vs the legacy x86
+	// path's assign+mul+sub+negate chain.
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_NEG_MULTIPLY_SUB, fprD, fprA, fprC, fprB);
+	return true;
+#else
 	// if frB is already in frD we need a temporary register to store the product of frA*frC
 	if( frB == frD )
 	{
@@ -382,6 +406,7 @@ bool PPCRecompilerImlGen_FNMSUB(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	// negate result
 	ppcImlGenContext->emitInst().make_fpr_r(PPCREC_IML_OP_FPR_NEGATE, fprD);
 	return true;
+#endif
 }
 
 #define PSE_CopyResultToPs1() 	if( ppcImlGenContext->PSE ) \
@@ -498,6 +523,17 @@ bool PPCRecompilerImlGen_FMADDS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
+#if defined(__aarch64__)
+	// fmadds = round_to_single(rA*rC + rB). FMA into the destination directly
+	// (AArch64 reads all three operands before writing), then round to single.
+	// Drops the conditional temp + 2 separate mul/add IMLs the legacy path
+	// needed to avoid the overlap pessimization. fmadds is the #1 single-
+	// precision FMA in WW HD by static count.
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_MULTIPLY_ADD, fprD, fprA, fprC, fprB);
+	PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
+	PSE_CopyResultToPs1();
+	return true;
+#else
 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
 	IMLReg fprRegisterTemp;
 	if( frD != frA && frD != frB && frD != frC )
@@ -515,6 +551,7 @@ bool PPCRecompilerImlGen_FMADDS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	}
 	PSE_CopyResultToPs1();
 	return true;
+#endif
 }
 
 bool PPCRecompilerImlGen_FMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
@@ -525,7 +562,13 @@ bool PPCRecompilerImlGen_FMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
-
+#if defined(__aarch64__)
+	// fmsubs = round_to_single(rA*rC - rB).
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_MULTIPLY_SUB, fprD, fprA, fprC, fprB);
+	PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
+	PSE_CopyResultToPs1();
+	return true;
+#else
 	IMLReg fprRegisterTemp;
 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
 	if( frD != frA && frD != frB && frD != frC )
@@ -543,6 +586,7 @@ bool PPCRecompilerImlGen_FMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	}
 	PSE_CopyResultToPs1();
 	return true;
+#endif
 }
 
 bool PPCRecompilerImlGen_FNMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
@@ -553,6 +597,14 @@ bool PPCRecompilerImlGen_FNMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 op
 	DefinePS0(fprB, frB);
 	DefinePS0(fprC, frC);
 	DefinePS0(fprD, frD);
+#if defined(__aarch64__)
+	// fnmsubs = round_to_single(-(rA*rC - rB)) = round_to_single(rB - rA*rC).
+	// Drops the legacy mul + sub + negate + (optional copy) chain.
+	ppcImlGenContext->emitInst().make_fpr_r_r_r_r(PPCREC_IML_OP_FPR_NEG_MULTIPLY_SUB, fprD, fprA, fprC, fprB);
+	PPRecompilerImmGen_roundToSinglePrecision(ppcImlGenContext, fprD);
+	PSE_CopyResultToPs1();
+	return true;
+#else
 	IMLReg fprRegisterTemp;
 	// if none of the operand registers overlap with the result register then we can avoid the usage of a temporary register
 	if( frD != frA && frD != frB && frD != frC )
@@ -569,6 +621,7 @@ bool PPCRecompilerImlGen_FNMSUBS(ppcImlGenContext_t* ppcImlGenContext, uint32 op
 		ppcImlGenContext->emitInst().make_fpr_r_r(PPCREC_IML_OP_FPR_ASSIGN, fprD, fprRegisterTemp);
 	PSE_CopyResultToPs1();
 	return true;
+#endif
 }
 
 bool PPCRecompilerImlGen_FCMPO(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)

@@ -139,6 +139,17 @@ enum
 	PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM, // round 64bit double to 64bit double with 32bit float precision (in bottom half of xmm register)
 	PPCREC_IML_OP_FPR_FCTIWZ,
 	PPCREC_IML_OP_FPR_SELECT, // selectively copy bottom value from operand B or C based on value in operand A
+
+	// Fused multiply-add family. R_R_R_R: result = (regA * regB) +/- regC,
+	// computed as a single rounded operation -- matches PPC's fmadd/fmsub/fnmadd/fnmsub
+	// (and the single-precision variants when followed by a round_to_single).
+	// AArch64 has these as one-cycle host instructions; the old IML emitted
+	// separate FPR_MULTIPLY + FPR_ADD/SUB (+ optional FPR_NEGATE), which
+	// doubled the FMA cost in vertex/matrix-heavy hot paths.
+	PPCREC_IML_OP_FPR_MULTIPLY_ADD,        // result = a * b + c
+	PPCREC_IML_OP_FPR_MULTIPLY_SUB,        // result = a * b - c
+	PPCREC_IML_OP_FPR_NEG_MULTIPLY_ADD,    // result = -(a * b + c)
+	PPCREC_IML_OP_FPR_NEG_MULTIPLY_SUB,    // result = c - a * b   (i.e. -(a * b - c))
 	// Conversion (FPR_R_R)
 	PPCREC_IML_OP_FPR_INT_TO_FLOAT, // convert integer value in gpr to floating point value in fpr
 	PPCREC_IML_OP_FPR_FLOAT_TO_INT, // convert floating point value in fpr to integer value in gpr

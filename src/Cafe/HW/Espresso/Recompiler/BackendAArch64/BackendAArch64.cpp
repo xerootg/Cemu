@@ -2096,6 +2096,29 @@ void AArch64GenContext_t::fpr_r_r_r_r(IMLInstruction* imlInstruction)
 		fcmp(regA, 0.0);
 		fcsel(regR, regC, regB, Cond::GE);
 	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_MULTIPLY_ADD)
+	{
+		// Vd = Va*Vb + Vc -- the AArch64 fmadd Da, Db, Dc form. The host
+		// instruction reads all three operands before writing Vd, so any
+		// regR/source overlap (common in PPC code) is safe.
+		fmadd(regR, regA, regB, regC);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_MULTIPLY_SUB)
+	{
+		// PPC fmsub semantics: Va*Vb - Vc. AArch64 maps this to fnmsub
+		// (despite the name) -- ARM ARM defines fnmsub Dd = Da*Db - Dc.
+		fnmsub(regR, regA, regB, regC);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_NEG_MULTIPLY_ADD)
+	{
+		// -(Va*Vb + Vc). AArch64 fnmadd Dd = -Va*Vb - Vc.
+		fnmadd(regR, regA, regB, regC);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_NEG_MULTIPLY_SUB)
+	{
+		// Vc - Va*Vb (= -(Va*Vb - Vc), PPC fnmsub). AArch64 fmsub Dd = -Va*Vb + Vc.
+		fmsub(regR, regA, regB, regC);
+	}
 	else
 	{
 		cemu_assert_suspicious();

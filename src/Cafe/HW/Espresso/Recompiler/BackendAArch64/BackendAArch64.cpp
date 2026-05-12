@@ -162,6 +162,14 @@ struct AArch64GenContext_t : CodeGenerator
 	void compare_s32(IMLInstruction* imlInstruction);
 	bool load(IMLInstruction* imlInstruction, bool indexed);
 	bool store(IMLInstruction* imlInstruction, bool indexed);
+	// Peepholes that fuse two adjacent IML LOAD/STOREs (same base reg, +4
+	// stride, 32-bit width, same endian-swap flag, data regs in consecutive
+	// AArch64 host registers, offset in LDP/STP's range) into a single LDP/
+	// STP. They catch the IML expansion of `lmw`/`stmw` plus any hand-written
+	// multi-lwz/multi-stw burst the register allocator laid out into
+	// consecutive host regs. Return true if both instructions were emitted.
+	bool tryFuseLoadPair(IMLInstruction* a, IMLInstruction* b);
+	bool tryFuseStorePair(IMLInstruction* a, IMLInstruction* b);
 	void atomic_cmp_store(IMLInstruction* imlInstruction);
 	bool macro(IMLInstruction* imlInstruction);
 	void call_imm(IMLInstruction* imlInstruction);
@@ -1447,6 +1455,64 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	return true;
 }
 
+bool AArch64GenContext_t::tryFuseLoadPair(IMLInstruction* a, IMLInstruction* b)
+{
+	// Both must be plain non-indexed 32-bit loads.
+	if (a->type != PPCREC_IML_TYPE_LOAD || b->type != PPCREC_IML_TYPE_LOAD)
+		return false;
+	if (a->op_storeLoad.copyWidth != 32 || b->op_storeLoad.copyWidth != 32)
+		return false;
+	if (a->op_storeLoad.flags2.swapEndian != b->op_storeLoad.flags2.swapEndian)
+		return false;
+	// 32-bit loads ignore signExtend, but be conservative.
+	if (a->op_storeLoad.flags2.signExtend || b->op_storeLoad.flags2.signExtend)
+		return false;
+	// Same base register.
+	if (a->op_storeLoad.registerMem.GetRegID() != b->op_storeLoad.registerMem.GetRegID())
+		return false;
+	// +4 stride in increasing address order. (LDP semantics: Wt1 at offset+0,
+	// Wt2 at offset+4.)
+	sint32 offA = a->op_storeLoad.immS32;
+	sint32 offB = b->op_storeLoad.immS32;
+	if (offB != offA + 4)
+		return false;
+	// LDP immediate field is signed imm7 scaled by 4 → range [-256, +252],
+	// must be a multiple of 4. Stride-4 pairs are word-aligned to each other,
+	// but the first offset itself isn't guaranteed to be 4-aligned (rare, but
+	// we have to check before encoding).
+	if (offA < -256 || offA > 252 || (offA & 3) != 0)
+		return false;
+	// Destination IMLRegs must be different and map to consecutive AArch64 host
+	// registers in the order they will be loaded (Wt1 lower index, Wt2 higher).
+	IMLReg dataA = a->op_storeLoad.registerData;
+	IMLReg dataB = b->op_storeLoad.registerData;
+	if (dataA.GetRegID() == dataB.GetRegID())
+		return false; // AArch64 LDP requires distinct dest regs
+	WReg wDataA = gpReg<WReg>(dataA);
+	WReg wDataB = gpReg<WReg>(dataB);
+	if (wDataA.getIdx() + 1 != wDataB.getIdx())
+		return false;
+	// The base PPC reg must not be one of the destinations (else the LDP would
+	// overwrite the base before reading both halves — actually LDP reads the
+	// base first so technically safe, but we leave the dest=base case to the
+	// per-instruction lowering for clarity / safety).
+	WReg wBase = gpReg<WReg>(a->op_storeLoad.registerMem);
+	if (wBase.getIdx() == wDataA.getIdx() || wBase.getIdx() == wDataB.getIdx())
+		return false;
+	// Emit:  add Xtmp, MEM_BASE, Wbase, UXTW
+	//        ldp Wa, Wb, [Xtmp, #offA]
+	//        rev Wa, Wa   (if swap)
+	//        rev Wb, Wb   (if swap)
+	add(TEMP_GPR1.XReg, MEM_BASE_REG, wBase, ExtMod::UXTW);
+	ldp(wDataA, wDataB, AdrImm(TEMP_GPR1.XReg, offA));
+	if (a->op_storeLoad.flags2.swapEndian)
+	{
+		rev(wDataA, wDataA);
+		rev(wDataB, wDataB);
+	}
+	return true;
+}
+
 bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 {
 	cemu_assert_debug(imlInstruction->op_storeLoad.registerData.GetRegFormat() == IMLRegFormat::I32);
@@ -1506,6 +1572,82 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	else
 	{
 		return false;
+	}
+	return true;
+}
+
+bool AArch64GenContext_t::tryFuseStorePair(IMLInstruction* a, IMLInstruction* b)
+{
+	// Symmetric to tryFuseLoadPair, with one twist: when swapEndian is set
+	// (the common case for PPC stores into Wii U BE memory), we'd normally
+	// need two scratch GPRs to hold the byte-swapped source values, but we
+	// only have TEMP_GPR1 (used for the address) and TEMP_GPR2 left. Use
+	// NEON instead: pack both 32-bit values into a vector register, rev32
+	// each lane, then str D — uses only TEMP_FPR plus TEMP_GPR1.
+	if (a->type != PPCREC_IML_TYPE_STORE || b->type != PPCREC_IML_TYPE_STORE)
+		return false;
+	if (a->op_storeLoad.copyWidth != 32 || b->op_storeLoad.copyWidth != 32)
+		return false;
+	if (a->op_storeLoad.flags2.swapEndian != b->op_storeLoad.flags2.swapEndian)
+		return false;
+	if (a->op_storeLoad.registerMem.GetRegID() != b->op_storeLoad.registerMem.GetRegID())
+		return false;
+	sint32 offA = a->op_storeLoad.immS32;
+	sint32 offB = b->op_storeLoad.immS32;
+	if (offB != offA + 4)
+		return false;
+	// STP-W and the NEON-shuffle STUR-D path have different encodable ranges,
+	// so the per-path range check happens below after we know which one we'll
+	// emit. Common precondition: offA must be a multiple of 4 for STP-W; for
+	// STUR-D it can be any byte offset in [-256, +255]. PPC word stores are
+	// always 4-aligned, but be defensive.
+	if ((offA & 3) != 0)
+		return false;
+	IMLReg dataA = a->op_storeLoad.registerData;
+	IMLReg dataB = b->op_storeLoad.registerData;
+	// STP requires distinct source registers (the architecture allows it but
+	// xbyak rejects identical Wt1/Wt2 for non-WBACK form).
+	if (dataA.GetRegID() == dataB.GetRegID())
+		return false;
+	WReg wDataA = gpReg<WReg>(dataA);
+	WReg wDataB = gpReg<WReg>(dataB);
+	bool swap = a->op_storeLoad.flags2.swapEndian;
+	if (!swap)
+	{
+		// No-swap path needs consecutive source host regs for STP — the
+		// instruction takes two register operands by name. The byte-swap
+		// path below does NOT require this because we shuffle via NEON.
+		if (wDataA.getIdx() + 1 != wDataB.getIdx())
+			return false;
+		// STP-W: signed imm7 scaled by 4 → [-256, +252].
+		if (offA < -256 || offA > 252)
+			return false;
+	}
+	else
+	{
+		// STUR-D imm9 range, any byte alignment.
+		if (offA < -256 || offA > 255)
+			return false;
+	}
+	WReg wBase = gpReg<WReg>(a->op_storeLoad.registerMem);
+	// Compute the host address once.
+	add(TEMP_GPR1.XReg, MEM_BASE_REG, wBase, ExtMod::UXTW);
+	if (swap)
+	{
+		// Pack [Wa, Wb] into TEMP_FPR.D, byte-reverse each 32-bit lane, stur D.
+		// fmov to SReg writes lane 0 of V and clears the upper bits; mov into
+		// the s2[1] element view writes lane 1 without touching lane 0.
+		// Use stur (unscaled, signed imm9) rather than str — str(DReg, AdrImm)
+		// silently converts to the unsigned-offset form and aborts when offA
+		// is negative or not 8-aligned.
+		fmov(TEMP_FPR.SReg, wDataA);
+		mov(TEMP_FPR.VReg.s2[1], wDataB);
+		rev32(TEMP_FPR.VReg.b8, TEMP_FPR.VReg.b8);
+		stur(TEMP_FPR.DReg, AdrImm(TEMP_GPR1.XReg, offA));
+	}
+	else
+	{
+		stp(wDataA, wDataB, AdrImm(TEMP_GPR1.XReg, offA));
 	}
 	return true;
 }
@@ -1952,7 +2094,22 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_LOAD)
 			{
-				if (!aarch64GenContext.load(imlInstruction, false))
+				// Try fusing with the next instruction into a single LDP. This
+				// collapses the IML expansion of `lmw` (one IML LOAD per saved
+				// register) as well as any hand-written multi-lwz burst the
+				// register allocator happened to lay out into consecutive host
+				// regs.
+				bool fused = false;
+				if (i + 1 < segIt->imlList.size())
+				{
+					IMLInstruction* next = segIt->imlList.data() + (i + 1);
+					if (aarch64GenContext.tryFuseLoadPair(imlInstruction, next))
+					{
+						i++; // skip the partner LOAD we just emitted
+						fused = true;
+					}
+				}
+				if (!fused && !aarch64GenContext.load(imlInstruction, false))
 					codeGenerationFailed = true;
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_LOAD_INDEXED)
@@ -1962,7 +2119,22 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_STORE)
 			{
-				if (!aarch64GenContext.store(imlInstruction, false))
+				// Try fusing with the next STORE into a single STP (or, for
+				// the byte-swapped Wii U BE case, a NEON-shuffled str D).
+				// Mirrors the LDP fusion above; together they collapse the
+				// IML expansion of lmw/stmw into roughly half the AArch64
+				// instructions.
+				bool fused = false;
+				if (i + 1 < segIt->imlList.size())
+				{
+					IMLInstruction* next = segIt->imlList.data() + (i + 1);
+					if (aarch64GenContext.tryFuseStorePair(imlInstruction, next))
+					{
+						i++;
+						fused = true;
+					}
+				}
+				if (!fused && !aarch64GenContext.store(imlInstruction, false))
 					codeGenerationFailed = true;
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_STORE_INDEXED)

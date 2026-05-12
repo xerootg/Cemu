@@ -651,6 +651,23 @@ private:
 	VkBuffer m_bufferCache = VK_NULL_HANDLE;
 	VkDeviceMemory m_bufferCacheMemory = VK_NULL_HANDLE;
 
+	// host-memory mode snapshot pool: every vertex buffer bind copies the
+	// current Wii U memory contents into this host-visible+coherent VkBuffer
+	// so the draw is guaranteed to read what the game wrote AT BIND TIME, even
+	// if the JIT later overwrites the same address. Avoids the race that
+	// otherwise hits surfaces using shared vertex buffers (animated meshes,
+	// scratch pools). No vkCmdCopyBuffer involved — staging is host-mapped
+	// directly into a GPU-visible heap on unified-memory devices (Mali).
+	// Ring buffer with read/write tracking modeled on m_uniformVarBuffer.
+	VkBuffer m_hostMemSnapshotBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_hostMemSnapshotBufferMemory = VK_NULL_HANDLE;
+	uint8* m_hostMemSnapshotBufferPtr = nullptr;
+	uint32 m_hostMemSnapshotWriteIndex = 0;
+	uint32 m_hostMemSnapshotReadIndex = 0;
+	std::array<uint32, 128> m_cmdBufferHostMemSnapshotIndices{}; // must match kCommandBufferPoolSize
+	bool m_hostMemSnapshotBufferIsCoherent = false;
+	static constexpr uint32 kHostMemSnapshotPoolSize = 128u * 1024u * 1024u; // 128 MiB
+
 	// texture readback
 	VkBuffer m_textureReadbackBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory m_textureReadbackBufferMemory = VK_NULL_HANDLE;

@@ -2176,6 +2176,8 @@ void VulkanRenderer::ProcessFinishedCommandBuffers()
 		{
 			ProcessDestructionQueue();
 			m_uniformVarBufferReadIndex = m_cmdBufferUniformRingbufIndices[m_commandBufferSyncIndex];
+			if (m_useHostMemoryForCache)
+				m_hostMemSnapshotReadIndex = m_cmdBufferHostMemSnapshotIndices[m_commandBufferSyncIndex];
 			m_commandBufferSyncIndex = (m_commandBufferSyncIndex + 1) % m_commandBuffers.size();
 			memoryManager->cleanupBuffers(m_countCommandBufferFinished);
 			m_countCommandBufferFinished++;
@@ -2274,6 +2276,7 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 		WaitForNextFinishedCommandBuffer();
 	}
 	m_cmdBufferUniformRingbufIndices[nextCmdBufferIndex] = m_cmdBufferUniformRingbufIndices[m_commandBufferIndex];
+	m_cmdBufferHostMemSnapshotIndices[nextCmdBufferIndex] = m_cmdBufferHostMemSnapshotIndices[m_commandBufferIndex];
 	m_commandBufferIndex = nextCmdBufferIndex;
 
 
@@ -2313,6 +2316,12 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	occlusionQuery_notifyBeginCommandBuffer();
 
 	m_recordedDrawcalls = 0;
+	// When host-imported Wii U memory is used, every additional draw recorded
+	// into a CB widens the window between submission and execution during which
+	// CPU/JIT can overwrite a buffer the recorded draws will later read. Smaller
+	// CBs = smaller race window. Mali handles frequent vkQueueSubmits cheaply,
+	// and we currently sit at ~22ms GPU idle per 33ms frame so submit overhead
+	// is easily absorbed.
 	m_submitThreshold = 300;
 	m_submitOnIdle = false;
 }
@@ -4256,6 +4265,26 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
 	}
 	if(!m_useHostMemoryForCache)
 		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
+	else
+	{
+		// Host-visible + host-coherent snapshot pool. Memory writes from
+		// memcpy() are visible to the GPU without an explicit barrier on
+		// unified-memory devices.
+		VkBufferUsageFlags snapUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+		m_hostMemSnapshotBufferIsCoherent = false;
+		if (memoryManager->CreateBuffer(kHostMemSnapshotPoolSize, snapUsage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_hostMemSnapshotBuffer, m_hostMemSnapshotBufferMemory))
+			m_hostMemSnapshotBufferIsCoherent = true;
+		else if (memoryManager->CreateBuffer(kHostMemSnapshotPoolSize, snapUsage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_hostMemSnapshotBuffer, m_hostMemSnapshotBufferMemory))
+			m_hostMemSnapshotBufferIsCoherent = true;
+		else if (memoryManager->CreateBuffer(kHostMemSnapshotPoolSize, snapUsage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_hostMemSnapshotBuffer, m_hostMemSnapshotBufferMemory))
+			m_hostMemSnapshotBufferIsCoherent = true;
+		else
+			memoryManager->CreateBuffer(kHostMemSnapshotPoolSize, snapUsage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, m_hostMemSnapshotBuffer, m_hostMemSnapshotBufferMemory);
+		void* bufferPtr = nullptr;
+		vkMapMemory(m_logicalDevice, m_hostMemSnapshotBufferMemory, 0, VK_WHOLE_SIZE, 0, &bufferPtr);
+		m_hostMemSnapshotBufferPtr = (uint8*)bufferPtr;
+		cemuLog_log(LogType::Force, "[HostMemSnap] snapshot pool {} MiB, coherent={}", kHostMemSnapshotPoolSize / (1024 * 1024), m_hostMemSnapshotBufferIsCoherent);
+	}
 }
 
 void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)

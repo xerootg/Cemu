@@ -1592,7 +1592,7 @@ bool AArch64GenContext_t::tryFuseLoadPair(IMLInstruction* a, IMLInstruction* b)
 	if (wDataA.getIdx() + 1 != wDataB.getIdx())
 		return false;
 	// The base PPC reg must not be one of the destinations (else the LDP would
-	// overwrite the base before reading both halves — actually LDP reads the
+	// overwrite the base before reading both halves -- actually LDP reads the
 	// base first so technically safe, but we leave the dest=base case to the
 	// per-instruction lowering for clarity / safety).
 	WReg wBase = gpReg<WReg>(a->op_storeLoad.registerMem);
@@ -1602,6 +1602,11 @@ bool AArch64GenContext_t::tryFuseLoadPair(IMLInstruction* a, IMLInstruction* b)
 	//        ldp Wa, Wb, [Xtmp, #offA]
 	//        rev Wa, Wa   (if swap)
 	//        rev Wb, Wb   (if swap)
+	//
+	// A NEON-shuffle fallback (ldur D + rev32 + fmov + umov) was attempted for
+	// the non-adjacent case but measured neutral-to-slightly-worse: the FP-to-GPR
+	// extract latency (~6 cycles on A720/X4) exceeded the savings from 1 fewer
+	// host insn, so two independent ldr+rev chains win for parallelism.
 	add(TEMP_GPR1.XReg, MEM_BASE_REG, wBase, ExtMod::UXTW);
 	ldp(wDataA, wDataB, AdrImm(TEMP_GPR1.XReg, offA));
 	if (a->op_storeLoad.flags2.swapEndian)

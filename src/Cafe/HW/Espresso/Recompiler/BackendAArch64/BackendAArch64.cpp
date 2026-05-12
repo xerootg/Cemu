@@ -123,10 +123,17 @@ struct NegativeRegValueJumpInfo
 	WReg regValue;
 };
 
+struct NZCVJumpInfo
+{
+	IMLSegment* target;
+	Cond cond;
+};
+
 using JumpInfo = std::variant<
 	UnconditionalJumpInfo,
 	ConditionalRegJumpInfo,
-	NegativeRegValueJumpInfo>;
+	NegativeRegValueJumpInfo,
+	NZCVJumpInfo>;
 
 struct AArch64GenContext_t : CodeGenerator
 {
@@ -157,6 +164,7 @@ struct AArch64GenContext_t : CodeGenerator
 	void fpr_r(IMLInstruction* imlInstruction);
 	void fpr_compare(IMLInstruction* imlInstruction);
 	void cjump(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
+	void cjump_nzcv(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
 	void jump(IMLSegment* imlSegment);
 	void conditionalJumpCycleCheck(IMLSegment* imlSegment);
 
@@ -253,6 +261,34 @@ struct AArch64GenContext_t : CodeGenerator
 		cemu_assert_suspicious();
 
 		return false;
+	}
+
+	bool handleJump(sint64 addressOffset, const NZCVJumpInfo& jump)
+	{
+		// b.cond reach: +/-1MB
+		if (-0x100000 <= addressOffset && addressOffset <= 0xfffff)
+		{
+			b(jump.cond, addressOffset);
+			return true;
+		}
+		// fall back to inverted-cond skip + b for +/-128MB
+		Label skipJump;
+		b(invert(jump.cond), skipJump);
+		addressOffset -= 4;
+		if (-0x8000000 <= addressOffset && addressOffset <= 0x7ffffff)
+		{
+			b(addressOffset);
+			L(skipJump);
+			return true;
+		}
+		cemu_assert_suspicious();
+		return false;
+	}
+
+	static Cond invert(Cond c)
+	{
+		// flip the bottom bit per the ARM A64 condition encoding
+		return static_cast<Cond>(static_cast<uint32>(c) ^ 1u);
 	}
 
 	bool handleJump(sint64 addressOffset, const NegativeRegValueJumpInfo& jump)
@@ -579,6 +615,12 @@ bool AArch64GenContext_t::r_r(IMLInstruction* imlInstruction)
 	{
 		clz(regR, regA);
 	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_CMP)
+	{
+		// fused cmp emitted by IMLOptimizerArm64_SubstituteCJumpForNZCVJump.
+		// regR is the first operand (PPC's rA), regA is the second (PPC's rB).
+		cmp(regR, regA);
+	}
 	else
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompilerAArch64Gen_imlInstruction_r_r(): Unsupported operation {:x}", imlInstruction->operation);
@@ -599,6 +641,11 @@ bool AArch64GenContext_t::r_s32(IMLInstruction* imlInstruction)
 	else if (imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE)
 	{
 		ror(reg, reg, 32 - (imm32 & 0x1f));
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_CMP)
+	{
+		// fused cmp emitted by IMLOptimizerArm64_SubstituteCJumpForNZCVJump.
+		cmp_imm(reg, imm32, TEMP_GPR1.WReg);
 	}
 	else
 	{
@@ -855,6 +902,17 @@ void AArch64GenContext_t::cjump(IMLInstruction* imlInstruction, IMLSegment* imlS
 		.target = imlSegment->nextSegmentBranchTaken,
 		.regBool = regBool,
 		.mustBeTrue = imlInstruction->op_conditional_jump.mustBeTrue,
+	});
+}
+
+void AArch64GenContext_t::cjump_nzcv(IMLInstruction* imlInstruction, IMLSegment* imlSegment)
+{
+	Cond cond = ImlCondToArm64Cond(imlInstruction->op_arm64_nzcv_jcc.cond);
+	if (imlInstruction->op_arm64_nzcv_jcc.invertedCondition)
+		cond = static_cast<Cond>(static_cast<uint32_t>(cond) ^ 1u);
+	prepareJump(NZCVJumpInfo{
+		.target = imlSegment->nextSegmentBranchTaken,
+		.cond = cond,
 	});
 }
 
@@ -1812,6 +1870,10 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			else if (imlInstruction->type == PPCREC_IML_TYPE_CONDITIONAL_JUMP)
 			{
 				aarch64GenContext.cjump(imlInstruction, segIt);
+			}
+			else if (imlInstruction->type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+			{
+				aarch64GenContext.cjump_nzcv(imlInstruction, segIt);
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_JUMP)
 			{

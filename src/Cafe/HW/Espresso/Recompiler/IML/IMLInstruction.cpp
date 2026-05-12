@@ -32,7 +32,7 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	}
 	else if (type == PPCREC_IML_TYPE_R_R)
 	{
-		if (operation == PPCREC_IML_OP_X86_CMP)
+		if (operation == PPCREC_IML_OP_X86_CMP || operation == PPCREC_IML_OP_ARM64_CMP)
 		{
 			// both operands are read only
 			registersUsed->readGPR1 = op_r_r.regR;
@@ -68,7 +68,7 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 			registersUsed->readGPR1 = op_r_immS32.regR;
 			registersUsed->writtenGPR1 = op_r_immS32.regR;
 		}
-		else if (operation == PPCREC_IML_OP_X86_CMP)
+		else if (operation == PPCREC_IML_OP_X86_CMP || operation == PPCREC_IML_OP_ARM64_CMP)
 		{
 			// register operand is read only
 			registersUsed->readGPR1 = op_r_immS32.regR;
@@ -330,6 +330,10 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	{
 		// no registers read or written (except for the implicit eflags)
 	}
+	else if (type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+	{
+		// no registers read or written (except for the implicit NZCV)
+	}
 	else
 	{
 		cemu_assert_unimplemented();
@@ -528,6 +532,10 @@ void IMLInstruction::RewriteGPR(const std::unordered_map<IMLRegID, IMLRegID>& tr
 	else if (type == PPCREC_IML_TYPE_X86_EFLAGS_JCC)
 	{
 		// no registers read or written (except for the implicit eflags)
+	}
+	else if (type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+	{
+		// no registers read or written (except for the implicit NZCV)
 	}
 	else
 	{

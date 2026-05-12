@@ -162,6 +162,9 @@ enum
 	// X86 extension
 	PPCREC_IML_OP_X86_CMP, // R_R and R_S32
 
+	// AArch64 extension
+	PPCREC_IML_OP_ARM64_CMP, // R_R and R_S32 - sets NZCV but writes no GPR
+
 	PPCREC_IML_OP_INVALID
 };
 
@@ -246,6 +249,9 @@ enum
 
 	// X86 specific
 	PPCREC_IML_TYPE_X86_EFLAGS_JCC,
+
+	// AArch64 specific
+	PPCREC_IML_TYPE_ARM64_NZCV_JCC,
 };
 
 enum // IMLName
@@ -507,6 +513,12 @@ struct IMLInstruction
 			IMLCondition cond;
 			bool invertedCondition;
 		}op_x86_eflags_jcc;
+		// AArch64 specific (alias-compatible with op_x86_eflags_jcc)
+		struct
+		{
+			IMLCondition cond;
+			bool invertedCondition;
+		}op_arm64_nzcv_jcc;
 	};
 
 	bool IsSuffixInstruction() const
@@ -519,7 +531,8 @@ struct IMLInstruction
 			type == PPCREC_IML_TYPE_CJUMP_CYCLE_CHECK ||
 			type == PPCREC_IML_TYPE_JUMP ||
 			type == PPCREC_IML_TYPE_CONDITIONAL_JUMP ||
-			type == PPCREC_IML_TYPE_X86_EFLAGS_JCC)
+			type == PPCREC_IML_TYPE_X86_EFLAGS_JCC ||
+			type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
 			return true;
 		return false;
 	}
@@ -810,6 +823,15 @@ struct IMLInstruction
 		this->operation = -999;
 		this->op_x86_eflags_jcc.cond = cond;
 		this->op_x86_eflags_jcc.invertedCondition = invertedCondition;
+	}
+
+	/* AArch64 specific */
+	void make_arm64_nzcv_jcc(IMLCondition cond, bool invertedCondition)
+	{
+		this->type = PPCREC_IML_TYPE_ARM64_NZCV_JCC;
+		this->operation = -999;
+		this->op_arm64_nzcv_jcc.cond = cond;
+		this->op_arm64_nzcv_jcc.invertedCondition = invertedCondition;
 	}
 
 	void CheckRegisterUsage(IMLUsedRegisters* registersUsed) const;

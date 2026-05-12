@@ -461,6 +461,10 @@ void IMLDebug_DisassembleInstruction(const IMLInstruction& inst, std::string& di
 	{
 		strOutput.addFmt("X86_JCC {}", IMLDebug_GetConditionName(inst.op_x86_eflags_jcc.cond));
 	}
+	else if (inst.type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+	{
+		strOutput.addFmt("ARM64_JCC {}", IMLDebug_GetConditionName(inst.op_arm64_nzcv_jcc.cond));
+	}
 	else
 	{
 		strOutput.addFmt("Unknown iml type {}", inst.type);

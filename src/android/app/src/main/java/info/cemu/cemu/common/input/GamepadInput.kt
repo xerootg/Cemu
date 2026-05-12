@@ -15,7 +15,7 @@ object GamepadInputSource {
     private val _keyEvents = MutableSharedFlow<InputEvent.Key>(extraBufferCapacity = 64)
     val keyEvents = _keyEvents.asSharedFlow()
     val hasKeySubscribers: Boolean
-        get() = _motionEvents.subscriptionCount.value > 0
+        get() = _keyEvents.subscriptionCount.value > 0
 
     val events = merge(_motionEvents, _keyEvents)
 

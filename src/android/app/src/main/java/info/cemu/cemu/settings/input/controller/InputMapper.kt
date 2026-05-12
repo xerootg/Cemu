@@ -15,8 +15,8 @@ private fun getNativeAxisKey(axis: Int, isPositive: Boolean): Int? {
             MotionEvent.AXIS_Y -> NativeInput.Axis.Y_POS
             MotionEvent.AXIS_RX, MotionEvent.AXIS_Z -> NativeInput.Axis.ROTATION_X_POS
             MotionEvent.AXIS_RY, MotionEvent.AXIS_RZ -> NativeInput.Axis.ROTATION_Y_POS
-            MotionEvent.AXIS_LTRIGGER -> NativeInput.Axis.TRIGGER_X_POS
-            MotionEvent.AXIS_RTRIGGER -> NativeInput.Axis.TRIGGER_Y_POS
+            MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE -> NativeInput.Axis.TRIGGER_X_POS
+            MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS -> NativeInput.Axis.TRIGGER_Y_POS
             MotionEvent.AXIS_HAT_X -> NativeInput.Axis.DPAD_RIGHT
             MotionEvent.AXIS_HAT_Y -> NativeInput.Axis.DPAD_DOWN
             else -> null
@@ -222,12 +222,20 @@ object InputMapper {
             VPadButtons.ZL,
             ProControllerButtons.ZL,
             ClassicControllerButtons.ZL,
-                -> arrayOf(ButtonInputMapping.BUTTON_L2, AxisInputMapping.LTRIGGER)
+                -> arrayOf(
+                AxisInputMapping.LTRIGGER,
+                AxisInputMapping.BRAKE,
+                ButtonInputMapping.BUTTON_L2,
+            )
 
             VPadButtons.ZR,
             ProControllerButtons.ZR,
             ClassicControllerButtons.ZR,
-                -> arrayOf(ButtonInputMapping.BUTTON_R2, AxisInputMapping.RTRIGGER)
+                -> arrayOf(
+                AxisInputMapping.RTRIGGER,
+                AxisInputMapping.GAS,
+                ButtonInputMapping.BUTTON_R2,
+            )
 
             VPadButtons.PLUS,
             ProControllerButtons.PLUS,
@@ -395,6 +403,8 @@ private enum class AxisInputMapping(val axisCode: Int, val isPositive: Boolean) 
     RZ_NEG(MotionEvent.AXIS_RZ, false),
     LTRIGGER(MotionEvent.AXIS_LTRIGGER, true),
     RTRIGGER(MotionEvent.AXIS_RTRIGGER, true),
+    BRAKE(MotionEvent.AXIS_BRAKE, true),
+    GAS(MotionEvent.AXIS_GAS, true),
     X_POS(MotionEvent.AXIS_X, true),
     X_NEG(MotionEvent.AXIS_X, false),
     Y_POS(MotionEvent.AXIS_Y, true),

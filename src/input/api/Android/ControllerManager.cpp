@@ -122,9 +122,11 @@ void ControllerManager::process_axis_event(const std::string& deviceDescriptor, 
 			controllerState.rotation.y = value;
 			break;
 		case AMOTION_EVENT_AXIS_LTRIGGER:
+		case AMOTION_EVENT_AXIS_BRAKE:
 			controllerState.trigger.x = value;
 			break;
 		case AMOTION_EVENT_AXIS_RTRIGGER:
+		case AMOTION_EVENT_AXIS_GAS:
 			controllerState.trigger.y = value;
 			break;
 		case AMOTION_EVENT_AXIS_HAT_X:

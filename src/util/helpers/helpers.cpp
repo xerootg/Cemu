@@ -1,7 +1,7 @@
 #include "helpers.h"
 
-#include <algorithm> 
-#include <functional> 
+#include <algorithm>
+#include <functional>
 #include <cctype>
 #include <random>
 
@@ -10,6 +10,16 @@
 #include <boost/random/uniform_int.hpp>
 
 #include <zlib.h>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <fstream>
+#include <vector>
+#endif
 
 
 #if BOOST_OS_WINDOWS
@@ -466,4 +476,121 @@ std::optional<std::vector<uint8>> zlibDecompress(const std::vector<uint8>& compr
 	decompressed.resize(stream.total_out);
 
 	return decompressed;
+}
+
+#if defined(__linux__) || defined(__ANDROID__)
+namespace {
+// Read a single integer from a sysfs path. Returns 0 on any read error so the
+// caller's max-scan naturally ignores absent/offline CPUs.
+uint32_t readSysfsUint(const char* path)
+{
+	std::ifstream f(path);
+	if (!f)
+		return 0;
+	uint32_t v = 0;
+	f >> v;
+	return v;
+}
+
+// Returns the per-CPU max frequency in kHz (cpu0..cpu_n-1). Stops at the first
+// CPU that has no cpuinfo_max_freq entry, which on Linux/Android corresponds
+// to "no more online CPUs" (CPU_SETSIZE upper bound keeps us safe).
+std::vector<uint32_t> readCpuMaxFreqs()
+{
+	std::vector<uint32_t> freqs;
+	for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+	{
+		char path[128];
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+		uint32_t f = readSysfsUint(path);
+		if (f == 0)
+			break;
+		freqs.push_back(f);
+	}
+	return freqs;
+}
+} // namespace
+#endif
+
+bool PinCurrentThreadToBigCores([[maybe_unused]] int preferredHint)
+{
+#if defined(__linux__) || defined(__ANDROID__)
+	auto freqs = readCpuMaxFreqs();
+	if (freqs.size() < 2)
+		return false;
+
+	// Detect the "big" cluster by finding the largest frequency gap when the
+	// unique max-frequencies are sorted ascending. Everything at or above the
+	// gap is "big". This avoids a fixed-percentage threshold that mis-classes
+	// SoCs with closely-spaced clusters — e.g. Tensor G4 (X4 3.105 / A720 2.6
+	// gives ratio 0.84, below an 85% cutoff) or Dimensity 9300 (where the
+	// step-A720 is at ~93% of X4). On homogeneous CPUs the only "gap" is zero
+	// and we return false (no narrowing).
+	std::vector<uint32_t> sortedUniq(freqs.begin(), freqs.end());
+	std::sort(sortedUniq.begin(), sortedUniq.end());
+	sortedUniq.erase(std::unique(sortedUniq.begin(), sortedUniq.end()), sortedUniq.end());
+	if (sortedUniq.size() < 2)
+		return false; // homogeneous
+
+	uint32_t bestGap = 0;
+	uint32_t bigCutoff = sortedUniq.front();
+	for (size_t i = 1; i < sortedUniq.size(); ++i)
+	{
+		uint32_t gap = sortedUniq[i] - sortedUniq[i - 1];
+		if (gap > bestGap)
+		{
+			bestGap = gap;
+			bigCutoff = sortedUniq[i];
+		}
+	}
+	// Require the gap to be at least ~10% of the highest frequency, else the
+	// CPU is effectively homogeneous (clusters that overlap in frequency).
+	if (bestGap * 10 < sortedUniq.back())
+		return false;
+
+	std::vector<int> bigCpus;
+	for (size_t i = 0; i < freqs.size(); ++i)
+	{
+		if (freqs[i] >= bigCutoff)
+			bigCpus.push_back(static_cast<int>(i));
+	}
+	if (bigCpus.empty() || bigCpus.size() >= freqs.size())
+		return false;
+
+	// Re-sort bigCpus by frequency descending so preferredHint=0 always picks
+	// the highest-clocked core (X4 / prime) regardless of CPU numbering.
+	std::sort(bigCpus.begin(), bigCpus.end(),
+	          [&](int a, int b) { return freqs[a] > freqs[b]; });
+
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (preferredHint >= 0 && static_cast<size_t>(preferredHint) < bigCpus.size())
+	{
+		// bigCpus is sorted highest-freq-first, so hint=0 picks the prime
+		// core, hint=1 the next-fastest, etc. Caller is responsible for
+		// staggering hints across threads to avoid them all landing on one CPU.
+		CPU_SET(bigCpus[preferredHint], &set);
+	}
+	else
+	{
+		for (int cpu : bigCpus)
+			CPU_SET(cpu, &set);
+	}
+	if (sched_setaffinity(0, sizeof(set), &set) != 0)
+		return false;
+	return true;
+#else
+	return false;
+#endif
+}
+
+void RaiseCurrentThreadPriority([[maybe_unused]] int niceValue)
+{
+#if defined(__linux__) || defined(__ANDROID__)
+	// PRIO_PROCESS + who==0 sets the calling thread's nice on Linux (despite
+	// the name — Linux's setpriority operates on the calling task, not the
+	// whole process). Stock Android shells allow lowering by up to ~10 without
+	// CAP_SYS_NICE; silently ignore failure.
+	setpriority(PRIO_PROCESS, 0, niceValue);
+#endif
 }

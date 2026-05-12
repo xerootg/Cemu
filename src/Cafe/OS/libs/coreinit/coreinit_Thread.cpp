@@ -1465,8 +1465,35 @@ namespace coreinit
 
 	void OSSchedulerCoreEmulationThread(void* _assignedCoreIndex)
 	{
-		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
-		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
+		sint32 coreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
+		SetThreadName(fmt::format("OSSched[core={}]", coreIndex).c_str());
+		t_assignedCoreIndex = coreIndex;
+
+		// Pin to the device's big cluster (no-op on homogeneous CPUs).
+		// PPC core 1 is the game's main thread; ask for the top-clocked core
+		// via preferredHint=0. PPC core 0 takes the next-highest (=1), core 2
+		// the one after (=2). This keeps the three emulation threads on
+		// distinct big cores when possible. Without explicit pinning Android's
+		// EAS routinely parks the 70%-hot OSSched[core=1] thread on a mid /
+		// little core, costing up to 1.6x wallclock on hot code.
+		// Map PPC->big-cluster index: core 1 = top, core 0 = next, core 2 = next+1.
+		int hint;
+		switch (coreIndex)
+		{
+		case 1:  hint = 0; break;
+		case 0:  hint = 1; break;
+		case 2:  hint = 2; break;
+		default: hint = -1; break;
+		}
+		if (!PinCurrentThreadToBigCores(hint))
+		{
+			// Fall back to "any big core" if per-core pinning failed (e.g. the
+			// big cluster has fewer cores than emulation threads).
+			PinCurrentThreadToBigCores();
+		}
+		// Lower nice so the scheduler is less eager to slot small system
+		// threads in front of us. Best-effort, no permissions required.
+		RaiseCurrentThreadPriority(-10);
 
 		enableFlushDenormalsToZero();
 

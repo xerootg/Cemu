@@ -225,6 +225,27 @@ size_t RemoveDuplicatesKeepOrder(std::vector<T>& vec)
 
 void SetThreadName(const char* name);
 
+// Pin the calling thread to the device's "big" CPU cores (Linux/Android only,
+// no-op elsewhere). Big cores are detected at runtime by scanning
+// /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq and keeping every core
+// whose advertised max frequency is within 85% of the highest. On a Tensor G4
+// (1 X4 + 3 A720 + 4 A520) this resolves to CPUs 4-7; on a Snapdragon 8G3
+// (1 X4 + 3 A720 + 2 A720 + 2 A520) it resolves to CPUs 3-7; on devices with
+// no detectable mismatch (desktop, x86) it returns the full mask, i.e. no-op.
+// Returns true if affinity was actually narrowed.
+//
+// Optional `preferredHint` (0 == top of the big cluster, 1 == below it, ...)
+// rotates the selected cores so callers can stagger across the big cluster
+// without colliding on a single CPU. Currently honoured only when there are
+// strictly more big cores than callers requesting a hint.
+bool PinCurrentThreadToBigCores(int preferredHint = -1);
+
+// Raise the calling thread's nice value to a more aggressive setting
+// (`setpriority(PRIO_PROCESS, 0, niceValue)`) without requiring root. Most
+// Android shells allow lowering nice by ~10 without CAP_SYS_NICE. Failure is
+// silent — best-effort scheduling hint.
+void RaiseCurrentThreadPriority(int niceValue = -10);
+
 inline uint64 MakeU64(uint32 high, uint32 low)
 {
 	return ((uint64)high << 32) | ((uint64)low);

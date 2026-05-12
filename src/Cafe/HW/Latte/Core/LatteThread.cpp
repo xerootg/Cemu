@@ -115,6 +115,13 @@ void LatteThread_HandleOSScreen()
 int Latte_ThreadEntry()
 {
 	SetThreadName("LatteThread");
+	// LatteThread is the second-hottest emulation thread (~11% of cycles in
+	// WW HD) and feeds Vulkan submission. Pin it onto the big cluster too —
+	// it doesn't need the X4 prime, so use a lower preference (=3) so it
+	// shares the A720 cores with OSSched[core=2] rather than competing with
+	// OSSched[core=1] for the X4.
+	PinCurrentThreadToBigCores(3);
+	RaiseCurrentThreadPriority(-10);
 	sint32 w,h;
 	WindowSystem::GetWindowPhysSize(w,h);
 

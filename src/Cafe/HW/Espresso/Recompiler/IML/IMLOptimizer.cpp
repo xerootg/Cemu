@@ -798,8 +798,57 @@ void IMLOptimizerArm64_SubstituteCJumpForNZCVJump(IMLOptimizerRegIOAnalysis& reg
 	}
 }
 
+// Fold `lis Rd, Hi; addi/addis/ori/oris/xori/xoris Rd, Rd, Lo` into a single
+// 32-bit immediate ASSIGN. PPC has no 32-bit immediate load so any constant
+// gets built up as a high+low pair; the JIT lowers each half independently,
+// which on AArch64 means a movz followed by an add/orr/eor of another 16-bit
+// chunk. Folding gives the backend a single ASSIGN imm32 op which lowers to
+// the optimal movz+movk pair and shows the regalloc only one definition.
+//
+// Pattern: adjacent IML ops where the second's regR/regA both equal the
+// first's regR and nothing else uses the dest in between (adjacency is
+// enough — if there's any instruction between them, no fold). Static
+// analysis of WW HD's .text counts ~10 374 sites for the addi pair plus
+// thousands more for the oris/xoris variants.
+static void IMLOptimizer_FoldLisFollowedByImmediateOp(IMLSegment& seg)
+{
+	for (sint32 i = 0; i + 1 < (sint32)seg.imlList.size(); i++)
+	{
+		IMLInstruction& a = seg.imlList[i];
+		IMLInstruction& b = seg.imlList[i + 1];
+		// a must be `ASSIGN regR, imm`
+		if (a.type != PPCREC_IML_TYPE_R_S32 || a.operation != PPCREC_IML_OP_ASSIGN)
+			continue;
+		// b must be `ADD/OR/XOR regR, regR, imm` (i.e. updates the same reg using itself + an immediate)
+		if (b.type != PPCREC_IML_TYPE_R_R_S32)
+			continue;
+		if (b.operation != PPCREC_IML_OP_ADD &&
+		    b.operation != PPCREC_IML_OP_OR &&
+		    b.operation != PPCREC_IML_OP_XOR)
+			continue;
+		if (a.op_r_immS32.regR.GetRegID() != b.op_r_r_s32.regR.GetRegID())
+			continue;
+		if (b.op_r_r_s32.regR.GetRegID() != b.op_r_r_s32.regA.GetRegID())
+			continue;
+		// Compute the fused constant.
+		sint32 fused = a.op_r_immS32.immS32;
+		switch (b.operation)
+		{
+		case PPCREC_IML_OP_ADD: fused = (sint32)((uint32)fused + (uint32)b.op_r_r_s32.immS32); break;
+		case PPCREC_IML_OP_OR:  fused = (sint32)((uint32)fused | (uint32)b.op_r_r_s32.immS32); break;
+		case PPCREC_IML_OP_XOR: fused = (sint32)((uint32)fused ^ (uint32)b.op_r_r_s32.immS32); break;
+		}
+		// Rewrite: keep ASSIGN, drop the follow-up.
+		a.op_r_immS32.immS32 = fused;
+		b.make_no_op();
+	}
+}
+
 void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
 {
+	// Fold lis+addi/ori before DCE so the dead intermediate ADD can be removed.
+	IMLOptimizer_FoldLisFollowedByImmediateOp(seg);
+
 	IMLOptimizer_RemoveDeadCodeFromSegment(regIoAnalysis, seg);
 
 #ifdef ARCH_X86_64

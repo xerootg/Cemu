@@ -84,6 +84,13 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	{
 		registersUsed->writtenGPR1 = op_r_r_s32.regR;
 		registersUsed->readGPR1 = op_r_r_s32.regA;
+		if (operation == PPCREC_IML_OP_BFI || operation == PPCREC_IML_OP_BFXIL)
+		{
+			// regR is also read: bits outside the insertion window are
+			// preserved, so the RA must keep regR's prior value live up to
+			// this point.
+			registersUsed->readGPR2 = op_r_r_s32.regR;
+		}
 	}
 	else if (type == PPCREC_IML_TYPE_R_R_S32_CARRY)
 	{

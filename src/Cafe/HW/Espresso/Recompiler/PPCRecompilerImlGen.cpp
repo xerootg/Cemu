@@ -1211,16 +1211,48 @@ bool PPCRecompilerImlGen_RLWIMI(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 	PPC_OPC_TEMPL_M(opcode, rS, rA, SH, MB, ME);
 	IMLReg regS = _GetRegGPR(ppcImlGenContext, rS);
 	IMLReg regR = _GetRegGPR(ppcImlGenContext, rA);
-	IMLReg regTmp = _GetRegTemporary(ppcImlGenContext, 0);
 	uint32 mask = ppc_mask(MB, ME);
-	ppcImlGenContext->emitInst().make_r_r(PPCREC_IML_OP_ASSIGN, regTmp, regS);
-	if (SH)
-		ppcImlGenContext->emitInst().make_r_s32(PPCREC_IML_OP_LEFT_ROTATE, regTmp, SH);
-	if (mask != 0)
-		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regR, regR, (sint32)~mask);
-	if (mask != 0xFFFFFFFF)
-		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regTmp, regTmp, (sint32)mask);
-	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_OR, regR, regR, regTmp);
+	// Fast path: rlwimi shapes that map 1:1 to AArch64 bfi/bfxil. We only
+	// look at non-wraparound masks (MB <= ME). After the PPC left-rotate by
+	// SH, the kept bits originate from source lsb positions
+	//   (31-ME-SH) mod 32 .. (31-MB-SH) mod 32
+	// and land at destination lsb positions
+	//   31-ME .. 31-MB.
+	// BFI applies when the source lsb is 0 (i.e. SH == (31-ME) mod 32).
+	// BFXIL applies when the destination lsb is 0 (i.e. ME == 31). For SH=0
+	// and ME=31 both fire — prefer BFI for consistency.
+	bool emittedBitfield = false;
+	if (MB <= ME)
+	{
+		sint32 width = ME - MB + 1;
+		sint32 dstLsb = 31 - ME;
+		sint32 srcLsb = (31 - (sint32)ME - (sint32)SH) & 0x1f;
+		auto pack = [](sint32 lsb, sint32 width) -> sint32 {
+			return (lsb & 0x1f) | (((width - 1) & 0x1f) << 5);
+		};
+		if (srcLsb == 0)
+		{
+			ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_BFI, regR, regS, pack(dstLsb, width));
+			emittedBitfield = true;
+		}
+		else if (dstLsb == 0)
+		{
+			ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_BFXIL, regR, regS, pack(srcLsb, width));
+			emittedBitfield = true;
+		}
+	}
+	if (!emittedBitfield)
+	{
+		IMLReg regTmp = _GetRegTemporary(ppcImlGenContext, 0);
+		ppcImlGenContext->emitInst().make_r_r(PPCREC_IML_OP_ASSIGN, regTmp, regS);
+		if (SH)
+			ppcImlGenContext->emitInst().make_r_s32(PPCREC_IML_OP_LEFT_ROTATE, regTmp, SH);
+		if (mask != 0)
+			ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regR, regR, (sint32)~mask);
+		if (mask != 0xFFFFFFFF)
+			ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regTmp, regTmp, (sint32)mask);
+		ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_OR, regR, regR, regTmp);
+	}
 	if (opcode & PPC_OPC_RC)
 		PPCImlGen_UpdateCR0(ppcImlGenContext, regR);
 	return true;

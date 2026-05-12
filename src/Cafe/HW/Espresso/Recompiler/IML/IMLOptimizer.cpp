@@ -576,6 +576,10 @@ bool IMLOptimizerArm64_ModifiesNZCV(IMLInstruction& inst)
 		return false;
 	if((inst.type == PPCREC_IML_TYPE_R_R || inst.type == PPCREC_IML_TYPE_R_S32) && inst.operation == PPCREC_IML_OP_ASSIGN)
 		return false;
+	// bfi/bfxil don't touch NZCV — they're plain bitfield-insert encodings.
+	if(inst.type == PPCREC_IML_TYPE_R_R_S32 &&
+	   (inst.operation == PPCREC_IML_OP_BFI || inst.operation == PPCREC_IML_OP_BFXIL))
+		return false;
 	return true; // if we don't know for sure, assume it does
 }
 

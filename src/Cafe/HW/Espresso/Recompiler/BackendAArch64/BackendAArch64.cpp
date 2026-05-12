@@ -746,6 +746,18 @@ bool AArch64GenContext_t::r_r_s32(IMLInstruction* imlInstruction)
 	{
 		asr(regR, regA, (uint32)immS32 & 0x1f);
 	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_BFI ||
+	         imlInstruction->operation == PPCREC_IML_OP_BFXIL)
+	{
+		// immS32 layout: bits[4:0] = lsb (0..31), bits[9:5] = width-1
+		// (encoding widths 1..32). See IMLInstruction.h.
+		uint32 lsb = (uint32)immS32 & 0x1f;
+		uint32 width = (((uint32)immS32 >> 5) & 0x1f) + 1;
+		if (imlInstruction->operation == PPCREC_IML_OP_BFI)
+			bfi(regR, regA, lsb, width);
+		else
+			bfxil(regR, regA, lsb, width);
+	}
 	else
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompilerAArch64Gen_imlInstruction_r_r_s32(): Unsupported operation {:x}", imlInstruction->operation);

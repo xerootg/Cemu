@@ -166,6 +166,15 @@ enum
 	PPCREC_IML_OP_ARM64_CMP, // R_R and R_S32 - sets NZCV but writes no GPR
 	PPCREC_IML_OP_ARM64_FCMP, // FPR_COMPARE - sets NZCV but writes no GPR
 
+	// Bitfield insert. R_R_S32: regR is read and written (bits outside the
+	// insertion window are preserved), regA is read. immS32 packs the window:
+	// bits[4:0] = lsb (0..31), bits[9:5] = width-1 (encoding widths 1..32).
+	// BFI inserts regA[width-1:0]                  into regR[lsb+width-1:lsb].
+	// BFXIL inserts regA[lsb+width-1:lsb]          into regR[width-1:0].
+	// Both lower to a single AArch64 bfi/bfxil instruction.
+	PPCREC_IML_OP_BFI,
+	PPCREC_IML_OP_BFXIL,
+
 	PPCREC_IML_OP_INVALID
 };
 

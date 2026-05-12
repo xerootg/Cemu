@@ -1002,7 +1002,9 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 
 void VulkanRenderer::sync_inputTexturesChanged()
 {
-	bool writeFlushRequired = false;
+	bool vtxNeedsWait = false;
+	bool geoNeedsWait = false;
+	bool pxNeedsWait = false;
 
 	if (m_state.activeVertexDS)
 	{
@@ -1010,7 +1012,7 @@ void VulkanRenderer::sync_inputTexturesChanged()
 		{
 			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
 			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
-				writeFlushRequired = true;
+				vtxNeedsWait = true;
 		}
 	}
 	if (m_state.activeGeometryDS)
@@ -1019,7 +1021,7 @@ void VulkanRenderer::sync_inputTexturesChanged()
 		{
 			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
 			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
-				writeFlushRequired = true;
+				geoNeedsWait = true;
 		}
 	}
 	if (m_state.activePixelDS)
@@ -1028,33 +1030,23 @@ void VulkanRenderer::sync_inputTexturesChanged()
 		{
 			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
 			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
-				writeFlushRequired = true;
+				pxNeedsWait = true;
 		}
 	}
-	// barrier here
-	if (writeFlushRequired)
+	// barrier here — only target the shader stages that actually have a write-before-read hit
+	if (vtxNeedsWait || geoNeedsWait || pxNeedsWait)
 	{
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		memoryBarrier.srcAccessMask = 0;
-		memoryBarrier.dstAccessMask = 0;
+		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-		VkPipelineStageFlags srcStage = 0;
+		VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+			| VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 		VkPipelineStageFlags dstStage = 0;
-
-		// src
-		srcStage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		memoryBarrier.srcAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-		srcStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		memoryBarrier.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-		// dst
-		dstStage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		memoryBarrier.dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-
-		dstStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		memoryBarrier.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+		if (vtxNeedsWait) dstStage |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+		if (geoNeedsWait) dstStage |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+		if (pxNeedsWait)  dstStage |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
@@ -1081,30 +1073,22 @@ void VulkanRenderer::sync_RenderPassLoadTextures(CachedFBOVk* fboVk)
 		if (texVk->m_vkFlushIndex_read == m_state.currentFlushIndex)
 			readFlushRequired = true;
 	}
-	// barrier here
+	// barrier here — dst is restricted to the attachment-write stages of the upcoming render pass
 	if (readFlushRequired)
 	{
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		memoryBarrier.srcAccessMask = 0;
-		memoryBarrier.dstAccessMask = 0;
+		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+			| VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+			| VK_ACCESS_SHADER_READ_BIT;
+		memoryBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+			| VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
-		VkPipelineStageFlags srcStage = 0;
-		VkPipelineStageFlags dstStage = 0;
-
-		// src
-		srcStage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		memoryBarrier.srcAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-		srcStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		memoryBarrier.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-		// dst
-		dstStage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		memoryBarrier.dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-
-		dstStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		memoryBarrier.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+		VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+			| VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+			| VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+			| VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
@@ -1208,7 +1192,80 @@ void VulkanRenderer::draw_setRenderPass()
 
 	if (m_featureControl.deviceExtensions.dynamic_rendering)
 	{
-		vkCmdBeginRenderingKHR(m_state.currentCommandBuffer, fboVk->GetRenderingInfo());
+		// 1) For each FBO color attachment, reset loadOp = LOAD as default; if the texture has a
+		//    pending color clear that matches this view's slice/mip, fold the clear into the
+		//    attachment (loadOp = CLEAR + clearValue) and consume the pending state.
+		auto* renderingInfo = fboVk->GetRenderingInfo();
+		for (uint32 i = 0; i < renderingInfo->colorAttachmentCount; ++i)
+		{
+			auto& att = fboVk->GetMutableColorAttachment(i);
+			att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+			auto& cb = fboVk->colorBuffer[i];
+			if (!cb.texture)
+				continue;
+			auto vkTex = (LatteTextureVk*)cb.texture->baseTexture;
+			auto& pc = vkTex->m_pendingClear;
+			if (pc.active && !pc.isDepth &&
+				pc.mip == (uint32)cb.texture->firstMip && pc.slice == (uint32)cb.texture->firstSlice)
+			{
+				att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+				att.clearValue.color = pc.color;
+				pc.active = false;
+			}
+		}
+		// 2) Depth/stencil fold-in
+		if (fboVk->depthBuffer.texture)
+		{
+			auto vkDepthTex = (LatteTextureVk*)fboVk->depthBuffer.texture->baseTexture;
+			auto& pc = vkDepthTex->m_pendingClear;
+			if (renderingInfo->pDepthAttachment)
+			{
+				auto& dAtt = fboVk->GetMutableDepthAttachment();
+				dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+				if (pc.active && pc.isDepth &&
+					pc.mip == (uint32)fboVk->depthBuffer.texture->firstMip &&
+					pc.slice == (uint32)fboVk->depthBuffer.texture->firstSlice &&
+					(pc.aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+				{
+					dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+					dAtt.clearValue.depthStencil = pc.depthStencil;
+				}
+			}
+			if (renderingInfo->pStencilAttachment)
+			{
+				auto& sAtt = fboVk->GetMutableStencilAttachment();
+				sAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+				if (pc.active && pc.isDepth &&
+					pc.mip == (uint32)fboVk->depthBuffer.texture->firstMip &&
+					pc.slice == (uint32)fboVk->depthBuffer.texture->firstSlice &&
+					(pc.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
+				{
+					sAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+					sAtt.clearValue.depthStencil = pc.depthStencil;
+				}
+			}
+			if (pc.active && pc.isDepth &&
+				pc.mip == (uint32)fboVk->depthBuffer.texture->firstMip &&
+				pc.slice == (uint32)fboVk->depthBuffer.texture->firstSlice)
+			{
+				pc.active = false;
+			}
+		}
+		// 3) For all textures bound as sampler inputs that still have pending clears (i.e. did
+		//    not get folded above), flush via a real clear so the upcoming draw sees clean data.
+		auto flushSampledTextures = [this](VkDescriptorSetInfo* ds) {
+			if (!ds) return;
+			for (auto& tex : ds->list_fboCandidates)
+			{
+				if (tex->m_pendingClear.active)
+					texture_flushPendingClear(tex);
+			}
+		};
+		flushSampledTextures(m_state.activeVertexDS);
+		flushSampledTextures(m_state.activeGeometryDS);
+		flushSampledTextures(m_state.activePixelDS);
+
+		vkCmdBeginRenderingKHR(m_state.currentCommandBuffer, renderingInfo);
 	}
 	else
 	{

@@ -69,9 +69,41 @@ uint64 PPCTimer_estimateRDTSCFrequency()
 	return tsc_freq;
 }
 
+#if defined(__aarch64__)
+// ARM64 fast-path state. cntvct_el0 is a system-wide invariant monotonic
+// counter (every core reads the same value at the same wall-clock time), so
+// the x86-style accumulator + spinlock dance in the slow path is overkill --
+// it exists to paper over RDTSC's per-core skew and non-invariance, which
+// ARM64 doesn't have. We precompute a fixed-point scale at init and the hot
+// path becomes a single mrs + 64x64->128 multiply + shift, lock-free.
+//
+// scale = ((CORE_CLOCK * 8) * 2^32) / _rdtscFrequency
+//   so that ticks = (dt * scale) >> 32 matches the slow path's
+//   (dt * CORE_CLOCK / freq) * 8 modulo sub-tick rounding.
+static uint64 _arm64TickScale = 0;
+static uint64 _arm64TickBase = 0;
+
+static void PPCTimer_initArm64FastPath()
+{
+	uint64 num64 = (uint64)Espresso::CORE_CLOCK * 8ull;
+	uint64 numLow = num64 << 32;
+	uint64 numHigh = num64 >> 32;
+	uint64 remainder;
+	uint64 scale = _udiv128(numHigh, numLow, _rdtscFrequency, &remainder);
+	// Establish the time base before publishing the scale so any concurrent
+	// caller that sees a non-zero scale also sees a valid base.
+	_arm64TickBase = __rdtsc();
+	std::atomic_thread_fence(std::memory_order_release);
+	_arm64TickScale = scale;
+}
+#endif
+
 int PPCTimer_initThread()
 {
 	_rdtscFrequency = PPCTimer_estimateRDTSCFrequency();
+#if defined(__aarch64__)
+	PPCTimer_initArm64FastPath();
+#endif
 	return 0;
 }
 
@@ -126,6 +158,21 @@ FSpinlock sTimerSpinlock;
 // thread safe
 uint64 PPCTimer_getFromRDTSC()
 {
+#if defined(__aarch64__)
+	// Fast path: lock-free, pure arithmetic. Falls through to the slow path
+	// if init hasn't published the scale yet (very early boot only).
+	uint64 scale = _arm64TickScale;
+	if (scale != 0) [[likely]]
+	{
+		std::atomic_thread_fence(std::memory_order_acquire);
+		uint64 dt = __rdtsc() - _arm64TickBase;
+		uint64 prodHigh;
+		uint64 prodLow = _umul128(dt, scale, &prodHigh);
+		// (dt * scale) >> 32 == PPC ticks (×8) since timer base
+		uint64 ticks = (prodHigh << 32) | (prodLow >> 32);
+		return ticks >> ActiveSettings::GetTimerShiftFactor();
+	}
+#endif
 	sTimerSpinlock.lock();
 	_mm_mfence();
 	uint64 rdtscCurrentMeasure = __rdtsc();

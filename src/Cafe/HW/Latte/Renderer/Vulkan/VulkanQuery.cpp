@@ -1,4 +1,5 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
+#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 
 class LatteQueryObjectVk : public LatteQueryObject
 {
@@ -52,6 +53,7 @@ bool LatteQueryObjectVk::getResult(uint64& numSamplesPassed)
 
 void LatteQueryObjectVk::beginFragment()
 {
+	if (m_rendererVk->m_state.activeRenderpassFBO) performanceMonitor.vk.extEndQuery.increment();
 	m_rendererVk->draw_endRenderPass();
 
 	handleFinishedFragments();
@@ -80,6 +82,7 @@ void LatteQueryObjectVk::begin()
 
 void LatteQueryObjectVk::endFragment()
 {
+	if (m_rendererVk->m_state.activeRenderpassFBO) performanceMonitor.vk.extEndQuery.increment();
 	m_rendererVk->draw_endRenderPass();
 
 	cemu_assert_debug(m_hasActiveFragment);

@@ -1159,6 +1159,7 @@ void VulkanRenderer::draw_updateDepthBias(bool forceUpdate)
 }
 
 bool s_syncOnNextDraw = false;
+thread_local bool s_endRenderPassInternal = false;
 
 void VulkanRenderer::draw_setRenderPass()
 {
@@ -1181,7 +1182,17 @@ void VulkanRenderer::draw_setRenderPass()
 			sync_inputTexturesChanged();
 		return;
 	}
+	if (m_state.activeRenderpassFBO == nullptr)
+	{
+		// no prior pass — this BeginRendering is the first after an explicit end
+	}
+	else if (m_state.activeRenderpassFBO == fboVk)
+		performanceMonitor.vk.numRenderpassSelfDepBreaksPerFrame.increment();
+	else
+		performanceMonitor.vk.numRenderpassFBOChangesPerFrame.increment();
+	s_endRenderPassInternal = true;
 	draw_endRenderPass();
+	s_endRenderPassInternal = false;
 	if (m_state.descriptorSetsChanged)
 		sync_inputTexturesChanged();
 
@@ -1295,6 +1306,8 @@ void VulkanRenderer::draw_endRenderPass()
 {
 	if (!m_state.activeRenderpassFBO)
 		return;
+	if (!s_endRenderPassInternal)
+		performanceMonitor.vk.numRenderpassExternalEndsPerFrame.increment();
 	if (m_featureControl.deviceExtensions.dynamic_rendering)
 		vkCmdEndRenderingKHR(m_state.currentCommandBuffer);
 	else

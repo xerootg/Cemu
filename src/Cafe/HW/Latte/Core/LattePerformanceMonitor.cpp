@@ -113,6 +113,37 @@ void LattePerformanceMonitor_frameEnd()
 			LatteOverlay_updateStats(fps, drawCallCounter / elapsedFrames, fastDrawCallCounter / elapsedFrames);
 			WindowSystem::UpdateWindowTitles(false, false, fps);
 		}
+		{
+			uint64 totalUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_frameTime.getPreviousFrameValue());
+			uint64 idleUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_idleTime.getPreviousFrameValue());
+			uint64 fenceUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_fenceTime.getPreviousFrameValue());
+			uint64 texUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageTextures.getPreviousFrameValue());
+			uint64 vtxUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageVertexMgr.getPreviousFrameValue());
+			uint64 shUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageShaderAndUniformMgr.getPreviousFrameValue());
+			uint64 idxUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageIndexMgr.getPreviousFrameValue());
+			uint64 mrtUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageMRT.getPreviousFrameValue());
+			uint64 dcUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_dcStageDrawcallAPI.getPreviousFrameValue());
+			uint64 awUS = PPCTimer_tscToMicroseconds(performanceMonitor.gpuTime_waitForAsync.getPreviousFrameValue());
+			cemuLog_log(LogType::Force,
+				"[VkPerf] fps={:.1f} draws={} fast={} | frame={}us idle={}us | passes={} (FBOchg={} extEnd={}) ext[imgCopy={} surfCopy={} clrD={} clrC={} upload={} readback={} query={} submit={} imgui={} bufCache={} other={}] | DS={} pipes={}",
+				fps, drawCallCounter / elapsedFrames, fastDrawCallCounter / elapsedFrames,
+				totalUS, idleUS,
+				performanceMonitor.vk.numBeginRenderpassPerFrame.get(),
+				performanceMonitor.vk.numRenderpassFBOChangesPerFrame.get(),
+				performanceMonitor.vk.numRenderpassExternalEndsPerFrame.get(),
+				performanceMonitor.vk.extEndImageCopy.get(),
+				performanceMonitor.vk.extEndSurfaceCopy.get(),
+				performanceMonitor.vk.extEndClearDepth.get(),
+				performanceMonitor.vk.extEndClearColor.get(),
+				performanceMonitor.vk.extEndTextureUpload.get(),
+				performanceMonitor.vk.extEndTextureReadback.get(),
+				performanceMonitor.vk.extEndQuery.get(),
+				performanceMonitor.vk.extEndSubmit.get(),
+				performanceMonitor.vk.extEndImgui.get(),
+				performanceMonitor.vk.extEndBufferCache.get(),
+				performanceMonitor.vk.extEndOther.get(),
+				performanceMonitor.vk.numDescriptorSets.get(), performanceMonitor.vk.numGraphicPipelines.get());
+		}
 	}
 }
 
@@ -120,4 +151,18 @@ void LattePerformanceMonitor_frameBegin()
 {
 	performanceMonitor.vk.numDrawBarriersPerFrame.reset();
 	performanceMonitor.vk.numBeginRenderpassPerFrame.reset();
+	performanceMonitor.vk.numRenderpassFBOChangesPerFrame.reset();
+	performanceMonitor.vk.numRenderpassSelfDepBreaksPerFrame.reset();
+	performanceMonitor.vk.numRenderpassExternalEndsPerFrame.reset();
+	performanceMonitor.vk.extEndImageCopy.reset();
+	performanceMonitor.vk.extEndSurfaceCopy.reset();
+	performanceMonitor.vk.extEndClearDepth.reset();
+	performanceMonitor.vk.extEndClearColor.reset();
+	performanceMonitor.vk.extEndTextureUpload.reset();
+	performanceMonitor.vk.extEndTextureReadback.reset();
+	performanceMonitor.vk.extEndQuery.reset();
+	performanceMonitor.vk.extEndSubmit.reset();
+	performanceMonitor.vk.extEndImgui.reset();
+	performanceMonitor.vk.extEndBufferCache.reset();
+	performanceMonitor.vk.extEndOther.reset();
 }

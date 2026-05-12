@@ -131,6 +131,21 @@ typedef struct
 		// per frame
 		LattePerfStatCounter numDrawBarriersPerFrame;
 		LattePerfStatCounter numBeginRenderpassPerFrame;
+		LattePerfStatCounter numRenderpassFBOChangesPerFrame; // begun because FBO pointer differs
+		LattePerfStatCounter numRenderpassSelfDepBreaksPerFrame; // begun because self-dependency forced a break (same FBO)
+		LattePerfStatCounter numRenderpassExternalEndsPerFrame; // ended for an external reason (copy, readback, submit, query, etc.)
+		// breakdown of extEnd by source
+		LattePerfStatCounter extEndImageCopy;       // texture_copyImageSubData
+		LattePerfStatCounter extEndSurfaceCopy;     // surfaceCopy_viaDrawcall
+		LattePerfStatCounter extEndClearDepth;      // texture_clearDepthSlice (deferred-flush)
+		LattePerfStatCounter extEndClearColor;      // texture_clearColorSlice -> ClearColorImageRaw
+		LattePerfStatCounter extEndTextureUpload;   // texture_loadSlice
+		LattePerfStatCounter extEndTextureReadback; // TextureReadbackVk
+		LattePerfStatCounter extEndQuery;           // occlusion query begin/end
+		LattePerfStatCounter extEndSubmit;          // SubmitCommandBuffer
+		LattePerfStatCounter extEndImgui;           // ImguiBegin
+		LattePerfStatCounter extEndBufferCache;     // bufferCache_upload/copy/copyStreamout
+		LattePerfStatCounter extEndOther;           // anything else
 	}vk;
 
 	// calculated stats (per frame)

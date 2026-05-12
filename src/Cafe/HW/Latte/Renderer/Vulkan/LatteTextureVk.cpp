@@ -3,6 +3,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include "Cafe/HW/Latte/Core/LatteTextureLoader.h"
+#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 
 LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddress, Latte::E_GX2SURFFMT format, uint32 width, uint32 height, uint32 depth, uint32 pitch, uint32 mipLevels, uint32 swizzle,
 	Latte::E_HWTILEMODE tileMode, bool isDepth)
@@ -220,6 +221,7 @@ void LatteTextureVk::UploadBakedView(BakedView* baked, const uint8 compSel[4])
 	// Decode BC5 source data CPU-side with the requested compSel baked into RGBA8 layout,
 	// upload to the baked VkImage. Handles all slices and mip levels.
 	// End any active renderpass — vkCmdCopyBufferToImage is invalid inside one.
+	if (m_vkr->m_state.activeRenderpassFBO) performanceMonitor.vk.extEndOther.increment();
 	m_vkr->draw_endRenderPass();
 	auto device = m_vkr->GetLogicalDevice();
 	uint32 layerCount = std::max<uint32>(depth, 1);

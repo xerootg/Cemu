@@ -612,6 +612,53 @@ bool PPCRecompilerImlGen_CMPI(ppcImlGenContext_t* ppcImlGenContext, uint32 opcod
 // Forward decl — defined below alongside the rest of the ADD-family translators.
 bool PPCRecompilerImlGen_ADDI(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 
+// Try to fold a `bl trampoline` where `trampoline` is a single-instruction HLE
+// import thunk (opcode `(1 << 26) | hleIdx`) directly into the caller. Without
+// this, every HLE call goes through:
+//   bl → dispatch-lookup-target → trampoline JIT block (1 IML insn = MACRO_HLE)
+//      → inlined HLE body → returns via dispatch-lookup-LR
+// i.e. two jump-table lookups + two indirect branches per HLE call.
+//
+// Inlined here, we set LR = caller_resume_pc and emit MACRO_HLE directly so the
+// trampoline's JIT block is bypassed entirely (saves the bl→trampoline lookup).
+// The MACRO_HLE lowering still updates IP to the trampoline's PC at entry so
+// the debugger and any HLE-side error reporting see the same address they
+// would have without the inline. Applies to every HLE call site in the binary,
+// not just the message-queue wrappers — generic JIT speedup.
+static bool PPCRecompilerImlGen_TryInlineHleTrampoline(ppcImlGenContext_t* ppcImlGenContext, uint32 trampolineAddr)
+{
+	// Trampolines live in the import / trampoline code area; refuse anything else
+	// so a stray bl into game code never gets mistaken for an HLE trampoline.
+	if (trampolineAddr < 0x00E00000 || trampolineAddr >= 0x01000000)
+		return false;
+	uint32 trampOpcode = memory_readU32(trampolineAddr);
+	// HLE trampolines are exactly one instruction long: VIRTUAL_HLE primary opcode
+	// (Espresso::PrimaryOpcode::ZERO == 0 with funcId in low 16 bits via the
+	// (1<<26)|funcId encoding from rpl.cpp:730/768).
+	if ((trampOpcode >> 26) != 1)
+		return false;
+	uint32 funcId = trampOpcode & 0xFFFF;
+	if (funcId == 0xFFD0)
+		return false; // unsupported-import sentinel — defer to the regular bl path
+
+	uint32 callerResumePc = ppcImlGenContext->ppcAddressOfCurrentInstruction + 4;
+
+	// Write LR = caller_resume_pc so the HLE handler returns directly here when
+	// it dispatches via PPC LR after the body. Matches what PPCREC_IML_MACRO_BL
+	// would have done as its first step.
+	IMLReg regLR = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_SPR0 + SPR_LR);
+	ppcImlGenContext->emitInst().make_r_s32(PPCREC_IML_OP_ASSIGN, regLR, (sint32)callerResumePc);
+
+	// Now emit the HLE call as if it were happening at the trampoline's PC.
+	// MACRO_HLE writes IP=trampolineAddr at entry (so debugger / non-return
+	// detection / GamePatch_IsNonReturnFunction all see the trampoline as the
+	// active PC, matching the non-inlined behavior), runs the inlined body,
+	// then dispatches to whatever the body left in IP (which is LR after a
+	// normal HLE return — i.e., callerResumePc).
+	ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_HLE, trampolineAddr, funcId, 0, IMLREG_INVALID);
+	return true;
+}
+
 // Try to fold a `bl thunk` where `thunk` is a 2-instruction tail-call shim of the
 // form `addi rA, rB, IMM; b TARGET` into the caller. C++-emitted wrappers (e.g.
 // game-side message-queue helpers) tail-call into HLE import trampolines through
@@ -677,6 +724,12 @@ bool PPCRecompilerImlGen_B(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
 	}
 	if( opcode&PPC_OPC_LK )
 	{
+		// Try to inline a bl whose target is a single-instruction HLE trampoline.
+		// Order matters — the HLE-trampoline check is strictly tighter than the
+		// tail-call thunk pattern, and skipping it loses the bigger win (a full
+		// dispatch lookup per HLE call site).
+		if (PPCRecompilerImlGen_TryInlineHleTrampoline(ppcImlGenContext, jumpAddressDest))
+			return true;
 		// Try to fold a 2-instruction tail-call thunk in place of the function call.
 		if (PPCRecompilerImlGen_TryInlineTailCallThunk(ppcImlGenContext, jumpAddressDest))
 			return true;

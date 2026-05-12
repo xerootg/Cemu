@@ -20,14 +20,35 @@
 
 using namespace Xbyak_aarch64;
 
-// x24 holds PPCInterpreter_t::remainingCycles for the lifetime of a JIT
-// execution session. See IMLArchAArch64::PHYSREG_GPR_COUNT -- x24 is held
-// back from the IML allocator pool so the basic-block cycle decrement is a
-// single sub_imm against a live host register instead of an ldr/sub/str
-// round-trip to PPCInterpreter_t.
+// x23 and x24 are held back from the IML allocator pool to cache hot
+// PPCInterpreter_t fields in live host registers for the entire JIT session.
+// See IMLArchAArch64::PHYSREG_GPR_COUNT for the pool size.
+//
+// x23 = PPC_LR_REG holds PPCInterpreter_t::spr.LR. Touched by every
+// bl/blr/mflr/mtlr and the BCSPR/BCCTR family; collapsing the str/ldr to
+// memory into a register move pays back across the most-frequent control
+// transfers in the binary.
+//
+// x24 = REMAINING_CYCLES_REG holds PPCInterpreter_t::remainingCycles.
+// Touched at every basic block boundary; collapsing the ldr/sub/str triple
+// to a single sub_imm is the most-emitted IML macro becoming free.
+//
+// The pair of writebacks happens in leaveRecompilerCode (the universal
+// JIT->native exit stub); the matching reloads happen in
+// enterRecompilerCode. MACRO_HLE flushes both around its C++ call.
+constexpr uint32 PPC_LR_REG_ID = 23;
 constexpr uint32 REMAINING_CYCLES_REG_ID = 24;
 constexpr uint32 TEMP_GPR_1_ID = 25;
 constexpr uint32 TEMP_GPR_2_ID = 26;
+// x27 holds &PPCRecompilerInstanceData_t::ppcRecompilerDirectJumpTable[0]
+// directly. The AArch64 backend never accesses any other field of
+// PPCRecompilerInstanceData_t, so we pre-skip the struct's leading
+// ppcRecompilerFuncTable (~128MB on a 64MB code area) once at JIT entry
+// and turn every jump-table read into a single
+//   ldr Xt, [PPC_REC_INSTANCE_REG, Wn, UXTW #3]
+// where Wn is the PPC instruction index (newIP >> 2). Saves a 2-3 op
+// 64-bit immediate materialization on every bl / blr / MACRO_LEAVE /
+// MACRO_HLE-exit / MACRO_B_FAR. The legacy name is kept for diff size.
 constexpr uint32 PPC_RECOMPILER_INSTANCE_DATA_REG_ID = 27;
 constexpr uint32 MEMORY_BASE_REG_ID = 28;
 constexpr uint32 HCPU_REG_ID = 29;
@@ -65,6 +86,7 @@ static const GPReg TEMP_GPR1{TEMP_GPR_1_ID};
 static const GPReg TEMP_GPR2{TEMP_GPR_2_ID};
 static const GPReg LR{TEMP_GPR_2_ID};
 static const GPReg REMAINING_CYCLES_REG{REMAINING_CYCLES_REG_ID};
+static const GPReg PPC_LR_REG{PPC_LR_REG_ID};
 
 static const FPReg TEMP_FPR{TEMP_FPR_ID};
 
@@ -500,7 +522,9 @@ void AArch64GenContext_t::r_name(IMLInstruction* imlInstruction)
 		{
 			uint32 sprIndex = (name - PPCREC_NAME_SPR0);
 			if (sprIndex == SPR_LR)
-				ldr(regR, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+				// spr.LR is cached in PPC_LR_REG for the JIT session; r_name
+				// becomes a register move instead of a memory load.
+				mov(regR, PPC_LR_REG.WReg);
 			else if (sprIndex == SPR_CTR)
 				ldr(regR, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.CTR)));
 			else if (sprIndex == SPR_XER)
@@ -581,7 +605,10 @@ void AArch64GenContext_t::name_r(IMLInstruction* imlInstruction)
 		{
 			uint32 sprIndex = (name - PPCREC_NAME_SPR0);
 			if (sprIndex == SPR_LR)
-				str(regR, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+				// spr.LR is cached in PPC_LR_REG -- mirror the load path; the
+				// writeback to PPCInterpreter_t happens in leaveRecompilerCode
+				// (and around the C++ call in MACRO_HLE).
+				mov(PPC_LR_REG.WReg, regR);
 			else if (sprIndex == SPR_CTR)
 				str(regR, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.CTR)));
 			else if (sprIndex == SPR_XER)
@@ -1069,26 +1096,29 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 {
 	if (imlInstruction->operation == PPCREC_IML_MACRO_B_TO_REG)
 	{
+		// blr/bctr: target PPC address is in branchDstReg. Convert to an
+		// instruction index by >> 2, then load directJumpTable[index] using
+		// the LSL #3 scaling form of LDR (scale-by-8 = element size).
+		// PPC_REC_INSTANCE_REG already points at directJumpTable[0].
 		WReg branchDstReg = gpReg<WReg>(imlInstruction->op_macro.paramReg);
-
-		mov(TEMP_GPR1.WReg, offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
-		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, branchDstReg, ShMod::LSL, 1);
-		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		lsr(TEMP_GPR1.WReg, branchDstReg, 2);
+		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		mov(LR.WReg, branchDstReg);
 		br(TEMP_GPR1.XReg);
 		return true;
 	}
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_BL)
 	{
+		// PPC bl: spr.LR := next instruction, jump to target.
+		// newLR/newIP are both compile-time constants -- materialize the
+		// instruction index (newIP >> 2) directly and skip the 64-bit
+		// lookupOffset that the legacy path had to assemble at runtime.
 		uint32 newLR = imlInstruction->op_macro.param + 4;
-
-		mov(TEMP_GPR1.WReg, newLR);
-		str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
+		mov(PPC_LR_REG.WReg, newLR);
 
 		uint32 newIP = imlInstruction->op_macro.param2;
-		uint64 lookupOffset = (uint64)offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable) + (uint64)newIP * 2ULL;
-		mov(TEMP_GPR1.XReg, lookupOffset);
-		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
+		mov(TEMP_GPR1.WReg, (uint32)(newIP >> 2));
+		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		mov(LR.WReg, newIP);
 		br(TEMP_GPR1.XReg);
 		return true;
@@ -1096,18 +1126,17 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_B_FAR)
 	{
 		uint32 newIP = imlInstruction->op_macro.param2;
-		uint64 lookupOffset = (uint64)offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable) + (uint64)newIP * 2ULL;
-		mov(TEMP_GPR1.XReg, lookupOffset);
-		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
+		mov(TEMP_GPR1.WReg, (uint32)(newIP >> 2));
+		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		mov(LR.WReg, newIP);
 		br(TEMP_GPR1.XReg);
 		return true;
 	}
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_LEAVE)
 	{
+		// directJumpTable[0] is the universal exit stub (leaveRecompilerCode_*).
 		uint32 currentInstructionAddress = imlInstruction->op_macro.param;
-		mov(TEMP_GPR1.XReg, (uint64)offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable)); // newIP = 0 special value for recompiler exit
-		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
+		ldr(TEMP_GPR1.XReg, AdrUimm(PPC_REC_INSTANCE_REG, 0));
 		mov(LR.WReg, currentInstructionAddress);
 		br(TEMP_GPR1.XReg);
 		return true;
@@ -1136,12 +1165,13 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		// update instruction pointer
 		mov(TEMP_GPR1.WReg, ppcAddress);
 		str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
-		// Flush the in-register cycle counter to PPCInterpreter_t before any
-		// C++ call -- PPCRecompiler_virtualHLE reads/writes remainingCycles
-		// directly (-= 500 per HLE), and we don't want to clobber that with
-		// the cached register value on the way out. We reload below after
-		// the call returns.
+		// Flush in-register PPCInterpreter_t caches to memory before any C++
+		// call -- the HLE bodies (and the wake-helper in the inline OSSend/
+		// Receive path) read these fields directly. PPCRecompiler_virtualHLE
+		// in particular does remainingCycles -= 500. We reload after the
+		// call returns; cafeExportCallWrapper can also rewrite spr.LR.
 		str(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+		str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 		// set parameters
 		str(x30, AdrPreImm(sp, -16));
 
@@ -1350,8 +1380,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 			L(fastDone);
 			// instructionPointer = LR (cafeExportCallWrapper does this; mirror it here)
-			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
-			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			// PPC_LR_REG holds the live spr.LR (it was flushed to memory at
+			// MACRO_HLE entry, so the in-memory value is also fresh -- but
+			// reading the register directly drops the redundant load).
+			str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 			emittedDirectCall = true;
 		}
 		else if (funcId == (uint32)coreinit::g_hleIdx_OSGetCoreId)
@@ -1361,8 +1393,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// callers use this in mutex/affinity hot paths.
 			ldr(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.UPIR)));
 			str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
-			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			// PPC_LR_REG holds the live spr.LR (it was flushed to memory at
+			// MACRO_HLE entry, so the in-memory value is also fresh -- but
+			// reading the register directly drops the redundant load).
+			str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 			emittedDirectCall = true;
 		}
 		else if (funcId == (uint32)coreinit::g_hleIdx_OSGetCurrentThread)
@@ -1378,8 +1412,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			sub(x12, x11, MEM_BASE_REG);                                    // guest MPTR
 			csel(w12, wzr, w12, Cond::EQ);                                  // null host → 0 MPTR
 			str(w12, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
-			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			// PPC_LR_REG holds the live spr.LR (it was flushed to memory at
+			// MACRO_HLE entry, so the in-memory value is also fresh -- but
+			// reading the register directly drops the redundant load).
+			str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 			emittedDirectCall = true;
 		}
 		else if (funcId == (uint32)coreinit::g_hleIdx_DCInvalidateRange)
@@ -1387,8 +1423,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// Inline DCInvalidateRange: no-op in Cemu (the function body only does
 			// dead arithmetic; there's no real CPU cache to invalidate and the
 			// LatteBufferCache hook is commented out). Drop the call entirely.
-			ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
-			str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+			// PPC_LR_REG holds the live spr.LR (it was flushed to memory at
+			// MACRO_HLE entry, so the in-memory value is also fresh -- but
+			// reading the register directly drops the redundant load).
+			str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 			emittedDirectCall = true;
 		}
 
@@ -1406,27 +1444,29 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 		ldr(x30, AdrPostImm(sp, 16));
 
-		// Refill the cycle counter cache after the HLE call: virtualHLE
+		// Refill both in-register caches after the HLE call: virtualHLE
 		// (or the wake-helper / native OSSend|Receive in the inline path)
-		// may have modified PPCInterpreter_t::remainingCycles. After the
-		// fiber-aware HCPU reload above this points at the correct context.
+		// may have modified PPCInterpreter_t::remainingCycles, and
+		// cafeExportCallWrapper rewrites spr.LR as part of the return
+		// stitch-up. After the fiber-aware HCPU reload above, HCPU_REG
+		// points at the correct context to reload from.
 		ldr(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+		ldr(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 		tbz(REMAINING_CYCLES_REG.WReg, 31, cyclesLeftLabel); // check if negative
 
-		mov(TEMP_GPR1.XReg, offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
-		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
+		// Cycles exhausted -- exit through directJumpTable[0] (the universal
+		// leaveRecompilerCode stub). PPC_REC_INSTANCE_REG is the table base.
+		ldr(TEMP_GPR1.XReg, AdrUimm(PPC_REC_INSTANCE_REG, 0));
 		ldr(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
-		// branch to recompiler exit
 		br(TEMP_GPR1.XReg);
 
 		L(cyclesLeftLabel);
-		// check if instruction pointer was changed
-		// assign new instruction pointer to LR.WReg
+		// resume at the new instructionPointer set by the HLE call.
+		// PPC_REC_INSTANCE_REG is &directJumpTable[0]; instruction index is
+		// instructionPointer >> 2; the LDR scales by 8 to land on the entry.
 		ldr(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
-		mov(TEMP_GPR1.XReg, offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
-		add(TEMP_GPR1.XReg, TEMP_GPR1.XReg, LR.XReg, ShMod::LSL, 1);
-		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
-		// branch to [ppcRecompilerDirectJumpTable + PPCInterpreter_t::instructionPointer * 2]
+		lsr(TEMP_GPR1.WReg, LR.WReg, 2);
+		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		br(TEMP_GPR1.XReg);
 		return true;
 	}
@@ -2499,15 +2539,22 @@ void AArch64GenContext_t::enterRecompilerCode()
 	st4((v8.d - v11.d)[0], AdrPostImm(x9, 32));
 	st4((v12.d - v15.d)[0], AdrPostImm(x9, 32));
 	mov(HCPU_REG, x1); // call argument 2
-	mov(PPC_REC_INSTANCE_REG, (uint64)ppcRecompilerInstanceData);
+	// PPC_REC_INSTANCE_REG holds &directJumpTable[0] directly (not the struct
+	// base). The AArch64 backend never touches any other field of
+	// PPCRecompilerInstanceData_t, and pre-skipping the leading
+	// ppcRecompilerFuncTable here lets every dispatcher emit a single
+	//   ldr Xt, [PPC_REC_INSTANCE_REG, Wn, UXTW #3]
+	// against an instruction-index Wn instead of paying a 64-bit immediate
+	// build for the table-relative byte offset.
+	mov(PPC_REC_INSTANCE_REG, (uint64)&ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[0]);
 	mov(MEM_BASE_REG, (uint64)memory_base);
-	// Cache the cycle counter in a callee-saved host register for the whole
-	// JIT execution session. Decrements at every basic block boundary then
-	// become a one-instruction sub_imm against this register instead of an
-	// ldr/sub/str triple against PPCInterpreter_t. The matching writeback
-	// happens in leaveRecompilerCode (the universal JIT->native exit stub)
-	// and around the synchronous HLE call in MACRO_HLE.
+	// Cache the cycle counter and PPC spr.LR in callee-saved host registers
+	// for the whole JIT execution session. Decrements / LR reads / LR writes
+	// then become register-only operations. Writebacks happen in
+	// leaveRecompilerCode (the universal JIT->native exit stub) and around
+	// the synchronous HLE call in MACRO_HLE.
 	ldr(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+	ldr(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 
 	// branch to recFunc
 	blr(x0); // call argument 1
@@ -2529,10 +2576,12 @@ void AArch64GenContext_t::enterRecompilerCode()
 
 void AArch64GenContext_t::leaveRecompilerCode()
 {
-	// Flush the in-register cycle counter back to PPCInterpreter_t. Every
-	// MACRO_LEAVE and every cycle-exhausted exit path branches through this
-	// stub, so doing the writeback once here covers all of them.
+	// Flush both in-register caches (remainingCycles and spr.LR) back to
+	// PPCInterpreter_t. Every MACRO_LEAVE / cycles-exhausted exit / branch
+	// to an uncompiled target branches through this stub, so the writeback
+	// here covers all JIT->native transitions.
 	str(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+	str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 	str(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 	ret();
 }

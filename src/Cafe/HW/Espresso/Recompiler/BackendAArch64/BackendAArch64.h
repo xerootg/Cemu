@@ -12,11 +12,15 @@ void PPCRecompilerAArch64Gen_generateRecompilerInterfaceFunctions();
 namespace IMLArchAArch64
 {
 	static constexpr int PHYSREG_GPR_BASE = 0;
-	// x24 is held back from the allocator pool to cache PPCInterpreter_t::
-	// remainingCycles across the JIT execution session -- one ldr at JIT
-	// entry / one str at exit instead of an ldr+sub+str triple at every
-	// basic block boundary.
-	static constexpr int PHYSREG_GPR_COUNT = 24;
+	// x23 and x24 are held back from the allocator pool to cache hot
+	// PPCInterpreter_t fields across the JIT execution session:
+	//   x23 = PPC_LR_REG (spr.LR)        -- consumed by every bl/blr/mflr/mtlr
+	//   x24 = REMAINING_CYCLES_REG       -- consumed at every basic-block entry
+	// Both are PPCInterpreter_t scalars that the JIT touches dozens of times
+	// per ms; the alternative is an ldr/str round-trip to the struct at every
+	// reference. Net loss is two fewer host GPRs for the IML allocator; the
+	// gain is two of the most-emitted IML names becoming free register moves.
+	static constexpr int PHYSREG_GPR_COUNT = 23;
 	static constexpr int PHYSREG_FPR_BASE = PHYSREG_GPR_COUNT;
 	static constexpr int PHYSREG_FPR_COUNT = 31;
 }; // namespace IMLArchAArch64

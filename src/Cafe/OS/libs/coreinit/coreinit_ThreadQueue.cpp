@@ -49,7 +49,7 @@ namespace coreinit
 		{
 			threadLink->next = nullptr;
 			threadLink->prev = nullptr;
-			head = thread;
+			storeHeadRelease(thread);  // pairs with isEmptyAcquire in wake-helper fast path
 			tail = thread;
 		}
 		else
@@ -71,7 +71,7 @@ namespace coreinit
 		{
 			threadLink->next = nullptr;
 			threadLink->prev = nullptr;
-			head = thread;
+			storeHeadRelease(thread);  // first waiter — publish for lock-free wake check
 			tail = thread;
 		}
 		else
@@ -86,7 +86,7 @@ namespace coreinit
 				threadLink->next = head;
 				threadLink->prev = nullptr;
 				_getThreadLink(head.GetPtr(), linkOffset)->prev = thread;
-				head = thread;
+				storeHeadRelease(thread);  // head changed — publish
 			}
 			else
 			{
@@ -116,7 +116,7 @@ namespace coreinit
 		if (threadLink->prev)
 			_getThreadLink(threadLink->prev.GetPtr(), linkOffset)->next = threadLink->next;
 		else
-			head = threadLink->next;
+			storeHeadRelease(threadLink->next);  // head was this thread — publish new head (or null)
 		if (threadLink->next)
 			_getThreadLink(threadLink->next.GetPtr(), linkOffset)->prev = threadLink->prev;
 		else

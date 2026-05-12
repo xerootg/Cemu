@@ -251,6 +251,15 @@ namespace coreinit
 
 	void OSWakeOneSender(OSMessageQueue* msgQueue)
 	{
+		// Lock-free fast path: if the wait queue is observably empty, no waiter
+		// to wake. The acquire-load pairs with storeHeadRelease in the slow path
+		// addThreadByPriority. A stale-null read can only happen when no slow
+		// path has yet published a head — in that case the slow path's
+		// post-enqueue queue re-check will bail (queue is non-empty), so no one
+		// is actually sleeping waiting on us. Eliminates the shard-lock cost
+		// for the common "pendingWaiters > 0 but wait queue empty" race.
+		if (msgQueue->threadQueueSend.isEmptyAcquire())
+			return;
 		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueSend.isEmpty())
 			msgQueue->threadQueueSend.wakeupSingleThreadWaitQueueShard();
@@ -259,6 +268,8 @@ namespace coreinit
 
 	void OSWakeOneReceiver(OSMessageQueue* msgQueue)
 	{
+		if (msgQueue->threadQueueReceive.isEmptyAcquire())
+			return;
 		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueReceive.isEmpty())
 			msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueueShard();

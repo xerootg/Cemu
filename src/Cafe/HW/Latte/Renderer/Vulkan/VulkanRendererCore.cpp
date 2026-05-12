@@ -917,7 +917,13 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 	// descriptor for uniform buffers
 
 	VkDescriptorBufferInfo uniformBufferInfo{};
-	uniformBufferInfo.buffer = m_useHostMemoryForCache ? m_importedMem : m_bufferCache;
+	// In host-memory mode the descriptor points at the snapshot ring buffer
+	// rather than m_importedMem so uniforms (skeleton matrices etc.) get the
+	// same per-bind snapshot treatment as vertex buffers — the game writes new
+	// uniforms between draws to the same physical address, and the dynamic
+	// offset is updated in draw_updateUniformBuffersDirectAccess to point at
+	// the snapshot copy.
+	uniformBufferInfo.buffer = m_useHostMemoryForCache ? m_hostMemSnapshotBuffer : m_bufferCache;
 	uniformBufferInfo.offset = 0; // fixed offset is always zero since we only use dynamic offsets
 
 	if (m_vendor == GfxVendor::AMD)
@@ -1632,6 +1638,59 @@ void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
 }
 
 // used in place of vertex/uniform caching when direct memory access is possible
+uint32 VulkanRenderer::hostMemSnapshot_allocateAndCopy(MPTR srcAddress, uint32 size)
+{
+	// Ring buffer with read/write tracking modeled on m_uniformVarBuffer.
+	// writeIndex advances per allocation, readIndex advances when a CB
+	// completes (ProcessFinishedCommandBuffers). Wrap and overflow handled
+	// the same way as the uniform path.
+	uint32 alignedSize = (size + 255u) & ~255u;
+	auto waitOrSubmit = [&]() {
+		if (m_commandBufferSyncIndex == m_commandBufferIndex)
+		{
+			if (m_cmdBufferHostMemSnapshotIndices[m_commandBufferIndex] != m_hostMemSnapshotReadIndex)
+			{
+				draw_endRenderPass();
+				SubmitCommandBuffer();
+			}
+			else
+			{
+				cemuLog_log(LogType::Force, "host-mem snapshot pool overflow within a single command buffer (alloc {} bytes, write={} read={})", alignedSize, m_hostMemSnapshotWriteIndex, m_hostMemSnapshotReadIndex);
+				return;
+			}
+		}
+		WaitForNextFinishedCommandBuffer();
+	};
+	if (m_hostMemSnapshotWriteIndex + alignedSize > kHostMemSnapshotPoolSize)
+	{
+		while (m_hostMemSnapshotReadIndex > m_hostMemSnapshotWriteIndex || m_hostMemSnapshotReadIndex == 0)
+			waitOrSubmit();
+		m_hostMemSnapshotWriteIndex = 0;
+	}
+	auto ringBufRemaining = [&]() {
+		ssize_t used = (ssize_t)m_hostMemSnapshotWriteIndex - (ssize_t)m_hostMemSnapshotReadIndex;
+		if (used < 0) used += kHostMemSnapshotPoolSize;
+		return kHostMemSnapshotPoolSize - 1 - used;
+	};
+	while (ringBufRemaining() < alignedSize)
+		waitOrSubmit();
+
+	uint32 snapshotOffset = m_hostMemSnapshotWriteIndex;
+	m_hostMemSnapshotWriteIndex += alignedSize;
+	memcpy(m_hostMemSnapshotBufferPtr + snapshotOffset, memory_getPointerFromVirtualOffset(srcAddress), size);
+	if (!m_hostMemSnapshotBufferIsCoherent)
+	{
+		VkMappedMemoryRange flushRange{};
+		flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+		flushRange.memory = m_hostMemSnapshotBufferMemory;
+		flushRange.offset = snapshotOffset;
+		flushRange.size = alignedSize;
+		vkFlushMappedMemoryRanges(m_logicalDevice, 1, &flushRange);
+	}
+	m_cmdBufferHostMemSnapshotIndices[m_commandBufferIndex] = m_hostMemSnapshotWriteIndex;
+	return snapshotOffset;
+}
+
 void VulkanRenderer::draw_updateVertexBuffersDirectAccess()
 {
 	LatteFetchShader* parsedFetchShader = LatteSHRC_GetActiveFetchShader();
@@ -1651,65 +1710,7 @@ void VulkanRenderer::draw_updateVertexBuffersDirectAccess()
 		}
 		cemu_assert_debug(bufferAddress < 0x50000000);
 
-		// Snapshot the Wii U memory contents at BIND time into the host-visible
-		// snapshot pool. This captures what the game wrote for this draw, so the
-		// data is stable even if the JIT later overwrites the same address for a
-		// subsequent draw (the race that otherwise hits animated meshes / shared
-		// scratch buffers). The pool is host-mapped + coherent, so the memcpy is
-		// directly visible to the GPU on unified-memory devices — no
-		// vkCmdCopyBuffer (and therefore no render-pass break) required.
-		//
-		// Ring buffer with read/write tracking: writeIndex advances per bind,
-		// readIndex advances when a CB completes (set in ProcessFinishedCB).
-		// Wrapping and overflow handled the same way as m_uniformVarBuffer.
-		uint32 alignedSize = (bufferSize + 255u) & ~255u;
-		auto waitOrSubmit = [&]() {
-			if (m_commandBufferSyncIndex == m_commandBufferIndex)
-			{
-				if (m_cmdBufferHostMemSnapshotIndices[m_commandBufferIndex] != m_hostMemSnapshotReadIndex)
-				{
-					draw_endRenderPass();
-					SubmitCommandBuffer();
-				}
-				else
-				{
-					cemuLog_log(LogType::Force, "host-mem snapshot pool overflow within a single command buffer (binding {} bytes, write={} read={})", alignedSize, m_hostMemSnapshotWriteIndex, m_hostMemSnapshotReadIndex);
-					return;
-				}
-			}
-			WaitForNextFinishedCommandBuffer();
-		};
-		// wrap if it doesn't fit consecutively
-		if (m_hostMemSnapshotWriteIndex + alignedSize > kHostMemSnapshotPoolSize)
-		{
-			while (m_hostMemSnapshotReadIndex > m_hostMemSnapshotWriteIndex || m_hostMemSnapshotReadIndex == 0)
-				waitOrSubmit();
-			m_hostMemSnapshotWriteIndex = 0;
-		}
-		// ensure remaining ring room
-		auto ringBufRemaining = [&]() {
-			ssize_t used = (ssize_t)m_hostMemSnapshotWriteIndex - (ssize_t)m_hostMemSnapshotReadIndex;
-			if (used < 0) used += kHostMemSnapshotPoolSize;
-			return kHostMemSnapshotPoolSize - 1 - used;
-		};
-		while (ringBufRemaining() < alignedSize)
-			waitOrSubmit();
-
-		uint32 snapshotOffset = m_hostMemSnapshotWriteIndex;
-		m_hostMemSnapshotWriteIndex += alignedSize;
-		memcpy(m_hostMemSnapshotBufferPtr + snapshotOffset, memory_getPointerFromVirtualOffset(bufferAddress), bufferSize);
-		if (!m_hostMemSnapshotBufferIsCoherent)
-		{
-			VkMappedMemoryRange flushRange{};
-			flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-			flushRange.memory = m_hostMemSnapshotBufferMemory;
-			flushRange.offset = snapshotOffset;
-			flushRange.size = alignedSize;
-			vkFlushMappedMemoryRanges(m_logicalDevice, 1, &flushRange);
-		}
-		// record per-CB "this CB will read up to this point" — same pattern as m_uniformVarBuffer
-		m_cmdBufferHostMemSnapshotIndices[m_commandBufferIndex] = m_hostMemSnapshotWriteIndex;
-
+		uint32 snapshotOffset = hostMemSnapshot_allocateAndCopy(bufferAddress, bufferSize);
 		VkDeviceSize attrOffset = snapshotOffset;
 		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, bufferIndex, 1, &m_hostMemSnapshotBuffer, &attrOffset);
 		m_state.currentVertexBinding[bufferIndex].offset = 0xFFFFFFFF; // bound from snapshot pool, force rebind path next time
@@ -1738,16 +1739,23 @@ void VulkanRenderer::draw_updateUniformBuffersDirectAccess(LatteDecompilerShader
 			uint32 bufferIndex = i;
 			cemu_assert_debug(bufferIndex < 16);
 
+			// Snapshot the uniform data into the host-memory snapshot ring so
+			// the GPU reads what the game wrote AT BIND TIME, not whatever the
+			// JIT happened to write last. The descriptor is bound to
+			// m_hostMemSnapshotBuffer (see line ~920) so the dynamic offset
+			// is the offset within the snapshot ring.
+			uint32 snapshotOffset = hostMemSnapshot_allocateAndCopy(physicalAddr, uniformSize);
+
 			switch (shaderType)
 			{
 			case LatteConst::ShaderType::Vertex:
-				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX].uniformBufferOffset[bufferIndex] = physicalAddr - m_importedMemBaseAddress;
+				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX].uniformBufferOffset[bufferIndex] = snapshotOffset;
 				break;
 			case LatteConst::ShaderType::Geometry:
-				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY].uniformBufferOffset[bufferIndex] = physicalAddr - m_importedMemBaseAddress;
+				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY].uniformBufferOffset[bufferIndex] = snapshotOffset;
 				break;
 			case LatteConst::ShaderType::Pixel:
-				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT].uniformBufferOffset[bufferIndex] = physicalAddr - m_importedMemBaseAddress;
+				dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT].uniformBufferOffset[bufferIndex] = snapshotOffset;
 				break;
 			default:
 				UNREACHABLE;

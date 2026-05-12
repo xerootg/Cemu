@@ -276,6 +276,10 @@ public:
 	// flushes a pending deferred clear (issues a real vkCmdClear*Image). No-op if no pending clear.
 	void texture_flushPendingClear(LatteTextureVk* vkTexture);
 
+	// snapshot a range of Wii U memory into the host-memory snapshot ring buffer.
+	// returns the byte offset within m_hostMemSnapshotBuffer where the data now lives.
+	uint32 hostMemSnapshot_allocateAndCopy(MPTR srcAddress, uint32 size);
+
 	// called when a texture is destroyed to drop it from the pending-clear tracking list
 	void texture_notifyDeferredClearTracked_destroy(LatteTextureVk* vkTexture);
 

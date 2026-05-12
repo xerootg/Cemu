@@ -2143,6 +2143,23 @@ void VulkanRenderer::InitFirstCommandBuffer()
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(m_state.currentCommandBuffer, &beginInfo);
 
+	// When the Wii U guest memory is imported as a Vulkan buffer
+	// (m_useHostMemoryForCache), CPU/JIT writes to that memory have no implicit
+	// transfer-stage synchronization with the GPU's read of the same range. A
+	// HOST_WRITE -> {vertex/index/uniform/shader-read} barrier at command-buffer
+	// start makes any prior host write visible to the upcoming draws.
+	if (m_useHostMemoryForCache)
+	{
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer,
+			VK_PIPELINE_STAGE_HOST_BIT,
+			VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
+	}
+
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &m_state.currentScissorRect);
 
@@ -2268,6 +2285,20 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(m_state.currentCommandBuffer, &beginInfo);
+
+	// see InitFirstCommandBuffer — host-imported memory needs a HOST_WRITE barrier
+	// at the start of each CB so prior CPU writes are visible to upcoming GPU reads.
+	if (m_useHostMemoryForCache)
+	{
+		VkMemoryBarrier hostBarrier{};
+		hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		hostBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+		hostBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer,
+			VK_PIPELINE_STAGE_HOST_BIT,
+			VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
+	}
 
 	// make sure some states are set for this command buffer
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);

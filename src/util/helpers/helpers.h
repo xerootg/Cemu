@@ -240,6 +240,14 @@ void SetThreadName(const char* name);
 // strictly more big cores than callers requesting a hint.
 bool PinCurrentThreadToBigCores(int preferredHint = -1);
 
+// Mirror of PinCurrentThreadToBigCores for the LITTLE cluster: pins the
+// calling thread to the slowest-frequency cluster. Useful for threads that
+// are mostly idle/waiting (e.g. the GPU command-processor spin loop) -- it
+// keeps a big core free for compute, and the slower core sips power while
+// waiting. preferredHint follows the same convention (0 == highest-clocked
+// little core, 1 == next, ...). Returns true if affinity was narrowed.
+bool PinCurrentThreadToLittleCores(int preferredHint = -1);
+
 // Raise the calling thread's nice value to a more aggressive setting
 // (`setpriority(PRIO_PROCESS, 0, niceValue)`) without requiring root. Most
 // Android shells allow lowering nice by ~10 without CAP_SYS_NICE. Failure is

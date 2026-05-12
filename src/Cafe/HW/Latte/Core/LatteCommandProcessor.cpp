@@ -33,6 +33,25 @@ void LatteThread_HandleOSScreen();
 
 void LatteThread_Exit();
 
+namespace {
+// Low-power spin hint used by the GPU command-processor wait loops. Replaces
+// hammering _mm_pause (which on AArch64 emits `isb sy` -- a full pipeline
+// barrier that keeps the core at peak clock). On AArch64 issues WFE
+// (wait-for-event): the core enters a low-power state until any event or IRQ
+// wakes it. Without an explicit producer-side SEV, WFE still wakes within a
+// few ms on Android via scheduler ticks and assorted background events --
+// well under the 33 ms frame budget. Massive power saving on the LatteThread
+// pin, which was previously holding an A720 mid-core at 2.45 GHz spinning.
+inline void LatteCP_lowPowerSpin()
+{
+#if defined(__aarch64__)
+	asm volatile("wfe");
+#else
+	_mm_pause();
+#endif
+}
+}
+
 class DrawPassContext
 {
 	struct CmdQueuePos
@@ -151,10 +170,14 @@ uint32 LatteCP_readU32Deprc()
 
 		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
 		performanceMonitor.gpuTime_idleTime.beginMeasuring();
-		// no command data available, spin in a busy loop for a bit then check again
-		for (sint32 busy = 0; busy < 80; busy++)
+		// no command data available, low-power wait then re-check. WFE on
+		// AArch64 halts the core until an event/IRQ (typically a few ms on
+		// Android), which is fine under the 33 ms frame budget and saves
+		// the ~25% of an A720 mid-core that this loop was eating at 2.45 GHz
+		// (LatteCP_readU32Deprc was the #1 thermal contributor pre-WFE).
+		for (sint32 busy = 0; busy < 4; busy++)
 		{
-			_mm_pause();
+			LatteCP_lowPowerSpin();
 		}
 		LatteThread_HandleOSScreen(); // check if new frame was presented via OSScreen API
 
@@ -908,7 +931,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
 	uint32 currentFlipCount = LatteGPUState.flipCounter;
 	while (true)
 	{
-		_mm_pause();
+		LatteCP_lowPowerSpin();
 		if (currentFlipCount != LatteGPUState.flipCounter)
 		{
 			break;

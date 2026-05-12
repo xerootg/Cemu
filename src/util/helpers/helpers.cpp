@@ -634,6 +634,71 @@ bool PinCurrentThreadToBigCores([[maybe_unused]] int preferredHint)
 #endif
 }
 
+bool PinCurrentThreadToLittleCores([[maybe_unused]] int preferredHint)
+{
+#if defined(__linux__) || defined(__ANDROID__)
+	auto freqs = readCpuMaxFreqs();
+	if (freqs.size() < 2)
+		return false;
+
+	// Same gap-detection as PinCurrentThreadToBigCores, but everything BELOW
+	// the cutoff is the little cluster. Keeping the logic identical (instead
+	// of factoring out a shared helper) so a fix in one classifier propagates
+	// here naturally during review.
+	std::vector<uint32_t> sortedUniq(freqs.begin(), freqs.end());
+	std::sort(sortedUniq.begin(), sortedUniq.end());
+	sortedUniq.erase(std::unique(sortedUniq.begin(), sortedUniq.end()), sortedUniq.end());
+	if (sortedUniq.size() < 2)
+		return false; // homogeneous
+
+	uint32_t bestGap = 0;
+	uint32_t bigCutoff = sortedUniq.front();
+	for (size_t i = 1; i < sortedUniq.size(); ++i)
+	{
+		uint32_t gap = sortedUniq[i] - sortedUniq[i - 1];
+		if (gap > bestGap)
+		{
+			bestGap = gap;
+			bigCutoff = sortedUniq[i];
+		}
+	}
+	if (bestGap * 10 < sortedUniq.back())
+		return false;
+
+	std::vector<int> littleCpus;
+	for (size_t i = 0; i < freqs.size(); ++i)
+	{
+		if (freqs[i] < bigCutoff)
+			littleCpus.push_back(static_cast<int>(i));
+	}
+	if (littleCpus.empty() || littleCpus.size() >= freqs.size())
+		return false;
+
+	// Sort highest-freq-first so hint=0 picks the fastest little core (matches
+	// PinCurrentThreadToBigCores semantics).
+	std::sort(littleCpus.begin(), littleCpus.end(),
+	          [&](int a, int b) { return freqs[a] > freqs[b]; });
+
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (preferredHint >= 0 && static_cast<size_t>(preferredHint) < littleCpus.size())
+	{
+		CPU_SET(littleCpus[preferredHint], &set);
+	}
+	else
+	{
+		for (int cpu : littleCpus)
+			CPU_SET(cpu, &set);
+	}
+	if (sched_setaffinity(0, sizeof(set), &set) != 0)
+		return false;
+	registerPinForCurrentThread(set);
+	return true;
+#else
+	return false;
+#endif
+}
+
 void RaiseCurrentThreadPriority([[maybe_unused]] int niceValue)
 {
 #if defined(__linux__) || defined(__ANDROID__)

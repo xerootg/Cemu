@@ -115,12 +115,15 @@ void LatteThread_HandleOSScreen()
 int Latte_ThreadEntry()
 {
 	SetThreadName("LatteThread");
-	// LatteThread is the second-hottest emulation thread (~11% of cycles in
-	// WW HD) and feeds Vulkan submission. Pin it onto the big cluster too —
-	// it doesn't need the X4 prime, so use a lower preference (=3) so it
-	// shares the A720 cores with OSSched[core=2] rather than competing with
-	// OSSched[core=1] for the X4.
-	PinCurrentThreadToBigCores(3);
+	// LatteThread feeds Vulkan submission but spends most of its budget in
+	// the GPU command-processor wait loops (~25% of an A720 mid pre-WFE was
+	// pure spin). After the WFE conversion it does ~5% of useful work per
+	// frame -- well within a little A520 core's reach at the 30 fps cap. Pin
+	// it onto the LITTLE cluster (hint=0 = highest-clocked little core) so
+	// the big cluster stays free for the JIT cores and the heat budget drops.
+	// Falls back to the big cluster on chips without a clear little/big split.
+	if (!PinCurrentThreadToLittleCores(0))
+		PinCurrentThreadToBigCores(3);
 	RaiseCurrentThreadPriority(-10);
 	sint32 w,h;
 	WindowSystem::GetWindowPhysSize(w,h);

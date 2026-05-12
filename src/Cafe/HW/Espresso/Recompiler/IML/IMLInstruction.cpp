@@ -10,6 +10,15 @@ bool IMLInstruction::HasSideEffects() const
 	bool hasSideEffects = true;
 	if(type == PPCREC_IML_TYPE_R_R || type == PPCREC_IML_TYPE_R_R_S32 || type == PPCREC_IML_TYPE_COMPARE || type == PPCREC_IML_TYPE_COMPARE_S32)
 		hasSideEffects = false;
+	// FPR_COMPARE in its unfused form is `fcmp + cset` -- a pure compute-into-GPR
+	// op with no externally visible state beyond regR. PPC's fcmpu lowers to four
+	// of these (LT/GT/EQ/SO into the corresponding CR bits) but typical consumer
+	// patterns only branch on one bit; the other three CR-bit writes are dead and
+	// DCE can drop them. ARM64_FCMP is the fused form which writes NZCV invisibly
+	// for the suffix branch to consume -- it must stay even though it reports no
+	// written GPRs, so keep side-effects=true for that opcode.
+	else if(type == PPCREC_IML_TYPE_FPR_COMPARE && operation != PPCREC_IML_OP_ARM64_FCMP)
+		hasSideEffects = false;
 	// todo - add more cases
 	return hasSideEffects;
 }

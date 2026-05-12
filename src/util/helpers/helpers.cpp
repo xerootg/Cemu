@@ -19,6 +19,10 @@
 #include <unistd.h>
 #include <fstream>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 #endif
 
 
@@ -492,6 +496,49 @@ uint32_t readSysfsUint(const char* path)
 	return v;
 }
 
+// Android resets thread CPU affinity to the cpuset cgroup's full range when
+// ActivityManager updates task profiles (foreground/background transitions,
+// process state changes). Pinning at thread-start succeeds, then gets wiped
+// out a few seconds in. The watchdog re-applies the pin every ~500ms so the
+// scheduler can't park the hot OSSched threads on the slow A520 cluster.
+struct PinRegistryEntry
+{
+	pid_t tid;
+	cpu_set_t set;
+};
+std::mutex s_pinRegistryMutex;
+std::vector<PinRegistryEntry> s_pinRegistry;
+std::atomic<bool> s_pinWatchdogStarted{false};
+
+void pinWatchdogLoop()
+{
+	pthread_setname_np(pthread_self(), "PinWatchdog");
+	for (;;)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		std::lock_guard<std::mutex> g(s_pinRegistryMutex);
+		for (auto& e : s_pinRegistry)
+			sched_setaffinity(e.tid, sizeof(e.set), &e.set);
+	}
+}
+
+void registerPinForCurrentThread(const cpu_set_t& set)
+{
+	pid_t tid = (pid_t)syscall(SYS_gettid);
+	std::lock_guard<std::mutex> g(s_pinRegistryMutex);
+	for (auto& e : s_pinRegistry)
+	{
+		if (e.tid == tid)
+		{
+			e.set = set;
+			return;
+		}
+	}
+	s_pinRegistry.push_back({tid, set});
+	if (!s_pinWatchdogStarted.exchange(true))
+		std::thread(pinWatchdogLoop).detach();
+}
+
 // Returns the per-CPU max frequency in kHz (cpu0..cpu_n-1). Stops at the first
 // CPU that has no cpuinfo_max_freq entry, which on Linux/Android corresponds
 // to "no more online CPUs" (CPU_SETSIZE upper bound keeps us safe).
@@ -578,6 +625,9 @@ bool PinCurrentThreadToBigCores([[maybe_unused]] int preferredHint)
 	}
 	if (sched_setaffinity(0, sizeof(set), &set) != 0)
 		return false;
+	// Register so the watchdog can re-apply if Android resets affinity later
+	// (which it does, via SetTaskProfiles, when foreground/background transitions).
+	registerPinForCurrentThread(set);
 	return true;
 #else
 	return false;

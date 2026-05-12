@@ -17,14 +17,30 @@ namespace coreinit
 	// Per-queue spinlock slot. Exposed in the header so the AArch64 JIT can emit an
 	// inlined message-queue body that bypasses the C++ entrypoint entirely. Layout is
 	// part of the JIT ABI — do not reorder fields without updating BackendAArch64.cpp.
+	//
+	// All state packed into a single 32-bit word so the JIT fast path observes both
+	// the lock acquisition AND the opposite-side waiter snapshot from one atomic op
+	// (LDSETA), removing the post-CAS dependent LDR that previously dominated cycle
+	// attribution on the message-queue hot path:
+	//   bit  0     : LOCKED_BIT
+	//   bits 1..15 : pendingReceiveWaiters count (RECV_WAITER_MASK)
+	//   bits 16..30: pendingSendWaiters count    (SEND_WAITER_MASK)
+	//   bit  31    : reserved
+	// Waiter counters are only ever mutated while the lock is held; the atomic
+	// fetch_add/sub there is for cross-thread visibility, not concurrent RMW.
 	struct alignas(16) QueueLockSlot
 	{
-		std::atomic<uint32_t> lockState{0};             // offset 0
-		std::atomic<uint32_t> pendingReceiveWaiters{0}; // offset 4
-		std::atomic<uint32_t> pendingSendWaiters{0};    // offset 8
-		uint32_t _pad{0};                               // offset 12 — keeps slot size at 16 for shift-based indexing
+		static constexpr uint32_t LOCKED_BIT       = 1u << 0;
+		static constexpr uint32_t RECV_WAITER_INC  = 1u << 1;
+		static constexpr uint32_t RECV_WAITER_MASK = 0xFFFEu;        // bits 1..15
+		static constexpr uint32_t SEND_WAITER_INC  = 1u << 16;
+		static constexpr uint32_t SEND_WAITER_MASK = 0x7FFF0000u;    // bits 16..30
+
+		std::atomic<uint32_t> packed{0};                // offset 0
+		uint32_t _pad[3]{};                             // pad to 16 bytes for shift-based slot indexing
 	};
 	static_assert(sizeof(QueueLockSlot) == 16);
+	static_assert(offsetof(QueueLockSlot, packed) == 0);
 
 	constexpr size_t QUEUE_LOCK_POOL_SIZE = 256;
 	extern QueueLockSlot g_queueLockPool[QUEUE_LOCK_POOL_SIZE];

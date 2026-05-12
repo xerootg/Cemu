@@ -34,6 +34,10 @@ namespace coreinit
 	alignas(16) QueueLockSlot g_queueLockPool[QUEUE_LOCK_POOL_SIZE];
 
 	namespace {
+	// Lock acquisition uses fetch_or(LOCKED_BIT) so the returned prior value also
+	// snapshots the upper-bit waiter counters in one atomic round-trip — matches
+	// the JIT fast path's LDSETA pattern. Unlock uses fetch_and(~LOCKED_BIT) to
+	// preserve waiter bits across the release.
 	class QueueSpinLockGuard
 	{
 	public:
@@ -45,7 +49,7 @@ namespace coreinit
 		~QueueSpinLockGuard() noexcept
 		{
 			if (m_held)
-				m_slot.lockState.store(0, std::memory_order_release);
+				m_slot.packed.fetch_and(~QueueLockSlot::LOCKED_BIT, std::memory_order_release);
 		}
 		QueueSpinLockGuard(const QueueSpinLockGuard&) = delete;
 		QueueSpinLockGuard& operator=(const QueueSpinLockGuard&) = delete;
@@ -53,7 +57,7 @@ namespace coreinit
 		void unlock() noexcept
 		{
 			cemu_assert_debug(m_held);
-			m_slot.lockState.store(0, std::memory_order_release);
+			m_slot.packed.fetch_and(~QueueLockSlot::LOCKED_BIT, std::memory_order_release);
 			m_held = false;
 		}
 		void relock() noexcept
@@ -65,8 +69,8 @@ namespace coreinit
 	private:
 		void lockSlot(QueueLockSlot& slot) noexcept
 		{
-			uint32_t expected = 0;
-			if (slot.lockState.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
+			uint32_t prior = slot.packed.fetch_or(QueueLockSlot::LOCKED_BIT, std::memory_order_acquire);
+			if (!(prior & QueueLockSlot::LOCKED_BIT))
 			{
 				m_held = true;
 				return;
@@ -80,9 +84,16 @@ namespace coreinit
 			{
 				for (int i = 0; i < 128; ++i)
 				{
-					uint32_t expected = 0;
-					if (slot.lockState.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed))
-						return;
+					// Peek-then-OR avoids needlessly writing the same bit when
+					// already locked (LDSET is RMW even on a no-op clear) so the
+					// cache line stays in shared state for the holder.
+					uint32_t snap = slot.packed.load(std::memory_order_relaxed);
+					if (!(snap & QueueLockSlot::LOCKED_BIT))
+					{
+						uint32_t prior = slot.packed.fetch_or(QueueLockSlot::LOCKED_BIT, std::memory_order_acquire);
+						if (!(prior & QueueLockSlot::LOCKED_BIT))
+							return;
+					}
 #if defined(__aarch64__) || defined(__arm__)
 					__asm__ __volatile__("yield" ::: "memory");
 #elif defined(__x86_64__) || defined(__i386__)
@@ -134,21 +145,23 @@ namespace coreinit
 			if (!(flags & OS_MESSAGE_BLOCK))
 				return false;
 			// Publish our intent to wait before releasing the queue lock so any
-			// concurrent sender's post-enqueue waiter check sees us.
-			qlock.slot().pendingReceiveWaiters.fetch_add(1, std::memory_order_seq_cst);
+			// concurrent sender's post-enqueue waiter check sees us. Counter is
+			// in the upper bits of the packed slot word — fetch_add at the unit
+			// increment moves only that counter, leaving the lock bit alone.
+			qlock.slot().packed.fetch_add(QueueLockSlot::RECV_WAITER_INC, std::memory_order_seq_cst);
 			qlock.unlock();
 			__OSLockScheduler(msgQueue);
 			if (msgQueue->usedCount != (uint32be)0)
 			{
 				// Raced with a sender. Bail out of the wait setup; the next loop
 				// iteration under qlock will see the message and dequeue it.
-				qlock.slot().pendingReceiveWaiters.fetch_sub(1, std::memory_order_seq_cst);
+				qlock.slot().packed.fetch_sub(QueueLockSlot::RECV_WAITER_INC, std::memory_order_seq_cst);
 				__OSUnlockScheduler(msgQueue);
 				qlock.relock();
 				continue;
 			}
 			msgQueue->threadQueueReceive.queueAndWait(OSGetCurrentThread());
-			qlock.slot().pendingReceiveWaiters.fetch_sub(1, std::memory_order_seq_cst);
+			qlock.slot().packed.fetch_sub(QueueLockSlot::RECV_WAITER_INC, std::memory_order_seq_cst);
 			__OSUnlockScheduler(msgQueue);
 			qlock.relock();
 		}
@@ -162,7 +175,7 @@ namespace coreinit
 		// Probe for waiters via the per-slot counter (cross-queue false positives are
 		// harmless — see slot lookup comment). Counter is seq_cst, so any prior
 		// queue-lock-held increment is visible here.
-		bool maybeSendWaiters = qlock.slot().pendingSendWaiters.load(std::memory_order_seq_cst) != 0;
+		bool maybeSendWaiters = (qlock.slot().packed.load(std::memory_order_seq_cst) & QueueLockSlot::SEND_WAITER_MASK) != 0;
 		qlock.unlock();
 
 		if (maybeSendWaiters)
@@ -199,18 +212,18 @@ namespace coreinit
 		{
 			if (!(flags & OS_MESSAGE_BLOCK))
 				return 0;
-			qlock.slot().pendingSendWaiters.fetch_add(1, std::memory_order_seq_cst);
+			qlock.slot().packed.fetch_add(QueueLockSlot::SEND_WAITER_INC, std::memory_order_seq_cst);
 			qlock.unlock();
 			__OSLockScheduler();
 			if (msgQueue->usedCount < msgQueue->msgCount)
 			{
-				qlock.slot().pendingSendWaiters.fetch_sub(1, std::memory_order_seq_cst);
+				qlock.slot().packed.fetch_sub(QueueLockSlot::SEND_WAITER_INC, std::memory_order_seq_cst);
 				__OSUnlockScheduler();
 				qlock.relock();
 				continue;
 			}
 			msgQueue->threadQueueSend.queueAndWait(OSGetCurrentThread());
-			qlock.slot().pendingSendWaiters.fetch_sub(1, std::memory_order_seq_cst);
+			qlock.slot().packed.fetch_sub(QueueLockSlot::SEND_WAITER_INC, std::memory_order_seq_cst);
 			__OSUnlockScheduler();
 			qlock.relock();
 		}
@@ -231,7 +244,7 @@ namespace coreinit
 			memcpy(newMsg, msg, sizeof(OSMessage));
 		}
 
-		bool maybeReceiveWaiters = qlock.slot().pendingReceiveWaiters.load(std::memory_order_seq_cst) != 0;
+		bool maybeReceiveWaiters = (qlock.slot().packed.load(std::memory_order_seq_cst) & QueueLockSlot::RECV_WAITER_MASK) != 0;
 		qlock.unlock();
 
 		if (maybeReceiveWaiters)
@@ -249,17 +262,17 @@ namespace coreinit
 		return g_systemMessageQueue.GetPtr();
 	}
 
+	// The isEmptyAcquire-before-lock shortcut was tried and reverted: it races
+	// with the slow path's pendingWaiters-bump-then-storeHeadRelease window. A
+	// receiver that bumped pendingReceiveWaiters under qlock but hasn't yet
+	// reached storeHeadRelease in queueAndWait (still in writer-lock acquire
+	// path) is invisible to a lock-free head read, so the wake gets skipped
+	// and the receiver sleeps with no waker. The JIT inline body gates on the
+	// under-qlock pendingWaiters snapshot, which IS visible across qlock's
+	// release-acquire; this helper is only ever called when that snapshot was
+	// non-zero, so taking the shard lock is justified.
 	void OSWakeOneSender(OSMessageQueue* msgQueue)
 	{
-		// Lock-free fast path: if the wait queue is observably empty, no waiter
-		// to wake. The acquire-load pairs with storeHeadRelease in the slow path
-		// addThreadByPriority. A stale-null read can only happen when no slow
-		// path has yet published a head — in that case the slow path's
-		// post-enqueue queue re-check will bail (queue is non-empty), so no one
-		// is actually sleeping waiting on us. Eliminates the shard-lock cost
-		// for the common "pendingWaiters > 0 but wait queue empty" race.
-		if (msgQueue->threadQueueSend.isEmptyAcquire())
-			return;
 		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueSend.isEmpty())
 			msgQueue->threadQueueSend.wakeupSingleThreadWaitQueueShard();
@@ -268,8 +281,6 @@ namespace coreinit
 
 	void OSWakeOneReceiver(OSMessageQueue* msgQueue)
 	{
-		if (msgQueue->threadQueueReceive.isEmptyAcquire())
-			return;
 		__OSLockSchedulerShard(msgQueue);
 		if (!msgQueue->threadQueueReceive.isEmpty())
 			msgQueue->threadQueueReceive.wakeupSingleThreadWaitQueueShard();

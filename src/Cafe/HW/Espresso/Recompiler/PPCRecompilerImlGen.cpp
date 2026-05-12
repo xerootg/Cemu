@@ -609,6 +609,63 @@ bool PPCRecompilerImlGen_CMPI(ppcImlGenContext_t* ppcImlGenContext, uint32 opcod
 	return true;
 }
 
+// Forward decl — defined below alongside the rest of the ADD-family translators.
+bool PPCRecompilerImlGen_ADDI(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+
+// Try to fold a `bl thunk` where `thunk` is a 2-instruction tail-call shim of the
+// form `addi rA, rB, IMM; b TARGET` into the caller. C++-emitted wrappers (e.g.
+// game-side message-queue helpers) tail-call into HLE import trampolines through
+// thunks of exactly this shape; inlining removes the jump-table lookup + branch
+// indirect of the bl-to-thunk hop. LR is set to the caller's resume PC so that
+// when the eventual blr inside TARGET fires we return to the right place.
+//
+// Currently restricted to the addi+b shape because that's what shows up in
+// hot game-side wrapper chains. Easy to extend later (addis, mr, ori, longer
+// straight-line bodies) — keep the predicates tight and the side-effect-free
+// instruction set explicit.
+static bool PPCRecompilerImlGen_TryInlineTailCallThunk(ppcImlGenContext_t* ppcImlGenContext, uint32 thunkAddr)
+{
+	// Thunk must live in the loaded game text region; refuse trampolines / RPL
+	// import code that the loader may rewrite.
+	if (thunkAddr < 0x02000000 || thunkAddr >= 0x0E000000)
+		return false;
+	// Don't recurse into the function currently being compiled.
+	if (ppcImlGenContext->boundaryTracker && ppcImlGenContext->boundaryTracker->ContainsAddress(thunkAddr))
+		return false;
+
+	uint32 instr1 = memory_readU32(thunkAddr);
+	uint32 instr2 = memory_readU32(thunkAddr + 4);
+
+	// instr1 must be opcode-14 (addi/li).
+	if ((instr1 >> 26) != 14)
+		return false;
+	// instr2 must be opcode-18 unconditional non-linking branch (`b TARGET`).
+	if ((instr2 >> 26) != 18)
+		return false;
+	if (instr2 & (PPC_OPC_AA | PPC_OPC_LK))
+		return false;
+
+	// Decode the branch's signed 24-bit displacement (relative to instr2's PC).
+	uint32 li2;
+	PPC_OPC_TEMPL_I(instr2, li2);
+	uint32 finalTarget = (thunkAddr + 4) + li2;
+
+	// Refuse self-targets / paths that fold back into the caller's compile unit.
+	if (finalTarget == thunkAddr || finalTarget == thunkAddr + 4)
+		return false;
+	if (ppcImlGenContext->boundaryTracker && ppcImlGenContext->boundaryTracker->ContainsAddress(finalTarget))
+		return false;
+
+	// Emit IML for the addi; PPCRecompilerImlGen_ADDI handles both `addi rA, rB, IMM`
+	// and the rA-zero `li rA, IMM` special case.
+	if (!PPCRecompilerImlGen_ADDI(ppcImlGenContext, instr1))
+		return false;
+
+	// Emit the final BL with the original caller's resume PC so blr returns correctly.
+	ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_BL, ppcImlGenContext->ppcAddressOfCurrentInstruction, finalTarget, ppcImlGenContext->cyclesSinceLastBranch, IMLREG_INVALID);
+	return true;
+}
+
 bool PPCRecompilerImlGen_B(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
 {
 	uint32 li;
@@ -620,6 +677,9 @@ bool PPCRecompilerImlGen_B(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
 	}
 	if( opcode&PPC_OPC_LK )
 	{
+		// Try to fold a 2-instruction tail-call thunk in place of the function call.
+		if (PPCRecompilerImlGen_TryInlineTailCallThunk(ppcImlGenContext, jumpAddressDest))
+			return true;
 		// function call
 		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_BL, ppcImlGenContext->ppcAddressOfCurrentInstruction, jumpAddressDest, ppcImlGenContext->cyclesSinceLastBranch, IMLREG_INVALID);
 		return true;

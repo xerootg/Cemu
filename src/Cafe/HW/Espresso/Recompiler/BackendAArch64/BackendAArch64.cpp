@@ -1024,30 +1024,30 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			mov(x9, (uint64)&coreinit::g_queueLockPool[0]);
 			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
 
-			// ===== CAS lockState 0 -> 1 (single attempt) =====
-			// casa (acquire-only) suffices — we don't need release-on-acquire since
-			// the matching unlock uses stlr (store-release). Saves a barrier vs casal.
-			mov(w10, 0);
-			mov(w11, 1);
-			casa(w10, w11, AdrNoOfs(x9));
-			cbnz(w10, slowCall);                                            // contended → C++ slow path
-
-			// ===== prepare opposite-side wait-queue head offset =====
-			// Receive wakes a send-side waiter (threadQueueSend.head at offset 0x0C),
-			// Send wakes a receive-side waiter (threadQueueReceive.head at 0x1C).
-			// We defer the actual load until after queue-lock release so it uses
-			// ldar (load-acquire), paired with storeHeadRelease in the slow-path
-			// enqueue. The old design snapshotted pendingWaiters under the queue
-			// lock and called the wake helper whenever non-zero — but the wake
-			// helper would then take the shard lock just to discover an empty
-			// wait queue (false positive from the bump-before-enqueue race
-			// window). The ldar-on-head check is lock-free and only triggers the
-			// shard lock when a real waiter is published.
-			constexpr uint32_t wakeHeadOff =
-				offsetof(coreinit::OSMessageQueue, threadQueueSend);     // .head is at +0
-			constexpr uint32_t recvHeadOff =
-				offsetof(coreinit::OSMessageQueue, threadQueueReceive);  // .head is at +0
-			const uint32_t headOff = isReceive ? wakeHeadOff : recvHeadOff;
+			// ===== atomic-OR lockState bit 0; prior value also carries waiter bits =====
+			// LDSETA = atomic load + bitwise-or with acquire ordering. One round-trip
+			// yields both the lock-acquisition outcome (was bit 0 zero?) and the
+			// opposite-side waiter snapshot (bits 1..15 for recv waiters / 16..30 for
+			// send waiters), eliminating the post-CAS dependent LDR that previously
+			// dominated cycle attribution on this path.
+			//
+			// Waiter bits are bumped by the slow path UNDER qlock before releasing —
+			// the acquire ordering here pairs with that release. We can't substitute
+			// a post-unlock atomic load on the wait-queue head pointer: the slow
+			// path's storeHeadRelease happens later under the writer lock, after
+			// the waiter bump but before the actual sleep. A peer reading head in
+			// that window would see null, skip the wake, and the slow-path waiter
+			// — having missed our enqueue at its writer-lock bail-check (racy with
+			// our non-atomic usedCount write) — would sleep with no waker. The
+			// packed waiter bits are the only signal synchronized through qlock
+			// with the enqueue, so they're the only safe wake-decision predicate.
+			mov(w11, coreinit::QueueLockSlot::LOCKED_BIT);
+			ldseta(w11, w10, AdrNoOfs(x9));                                 // w10 = prior packed
+			tbnz(w10, 0, slowCall);                                         // prior lock bit set → contended
+			// Mask opposite-side waiter bits into w16; non-zero ⇒ wake needed later.
+			and_(w16, w10,
+			     isReceive ? coreinit::QueueLockSlot::SEND_WAITER_MASK
+			               : coreinit::QueueLockSlot::RECV_WAITER_MASK);
 
 			// ===== load queue fields with ldp consolidation =====
 			// firstIndex (offset 0x34) + usedCount (offset 0x38) are adjacent — one
@@ -1064,7 +1064,9 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// empty: if BLOCK set, slow path waits; else return false
 				tbnz(w2, 0, slowUnlock);                                    // bit 0 = OS_MESSAGE_BLOCK
 				str(wzr, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-				stlr(wzr, AdrNoOfs(x9));
+				// Unlock: atomic clear of LOCKED_BIT with release, preserving waiter bits.
+				mov(w11, coreinit::QueueLockSlot::LOCKED_BIT);
+				ldclrl(w11, wzr, AdrNoOfs(x9));
 				b(fastDone);
 
 				L(dequeue);
@@ -1091,14 +1093,11 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// gpr[3] = 1 (stored before wake call so the helper's clobbers don't matter)
 				mov(w11, 1);
 				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-				stlr(wzr, AdrNoOfs(x9));                                    // release lock
-				// Lock-free wake check: ldar on threadQueueSend.head pairs with the
-				// slow-path storeHeadRelease. cbz skips the wake helper entirely
-				// when no waiter is published, avoiding the shard-lock acquire for
-				// the common false-positive case. ldar requires zero offset, so
-				// add the field offset into a temp first.
-				add_imm(x9, x0, headOff, TEMP_GPR2.XReg);
-				ldar(w16, AdrNoOfs(x9));
+				// Unlock: atomic clear of LOCKED_BIT (w11 == 1) with release. Waiters
+				// in upper bits survive untouched, so the next acquirer sees them.
+				ldclrl(w11, wzr, AdrNoOfs(x9));
+				// If a send-side waiter existed at snapshot time, wake one.
+				// x0 still holds msgQueue.
 				cbz(w16, fastDone);
 				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender);
 				blr(TEMP_GPR1.XReg);
@@ -1119,7 +1118,8 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// full: if BLOCK set, slow path waits; else return false
 				tbnz(w2, 0, slowUnlock);
 				str(wzr, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-				stlr(wzr, AdrNoOfs(x9));
+				mov(w11, coreinit::QueueLockSlot::LOCKED_BIT);
+				ldclrl(w11, wzr, AdrNoOfs(x9));
 				b(fastDone);
 
 				L(enqueue);
@@ -1147,11 +1147,9 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// gpr[3] = 1 (stored before wake call so the helper's clobbers don't matter)
 				mov(w11, 1);
 				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
-				stlr(wzr, AdrNoOfs(x9));
-				// Lock-free wake check: ldar on threadQueueReceive.head pairs with
-				// slow-path storeHeadRelease. See receive path for full rationale.
-				add_imm(x9, x0, headOff, TEMP_GPR2.XReg);
-				ldar(w16, AdrNoOfs(x9));
+				// Unlock: atomic clear of LOCKED_BIT (w11 == 1) with release.
+				ldclrl(w11, wzr, AdrNoOfs(x9));
+				// If a receive-side waiter existed at snapshot time, wake one.
 				cbz(w16, fastDone);
 				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver);
 				blr(TEMP_GPR1.XReg);
@@ -1159,7 +1157,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			}
 
 			L(slowUnlock);
-			stlr(wzr, AdrNoOfs(x9));                                        // release lock before C++ slow path
+			// Release lock before C++ slow path. Atomic clear of LOCKED_BIT only —
+			// any waiter counters in upper bits stay live for the slow path to read.
+			mov(w11, coreinit::QueueLockSlot::LOCKED_BIT);
+			ldclrl(w11, wzr, AdrNoOfs(x9));
 			// fall through
 
 			L(slowCall);

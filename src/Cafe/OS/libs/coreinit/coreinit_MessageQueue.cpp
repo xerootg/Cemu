@@ -111,7 +111,7 @@ namespace coreinit
 	{
 		auto h = reinterpret_cast<uintptr_t>(p);
 		h = (h >> 4) * 0x9E3779B97F4A7C15ULL;
-		return g_queueLockPool[(h >> 56) & (QUEUE_LOCK_POOL_SIZE - 1)];
+		return g_queueLockPool[(h >> QUEUE_LOCK_POOL_INDEX_SHIFT) & (QUEUE_LOCK_POOL_SIZE - 1)];
 	}
 	} // namespace
 

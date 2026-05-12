@@ -1016,11 +1016,15 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			beq(slowCall);                                                  // system queue
 
 			// ===== hash queue addr to slot index, compute &slot =====
-			// h = ((uintptr_t)q >> 4) * 0x9E3779B97F4A7C15ULL; slot = pool[(h >> 56) & 255]
+			// h = ((uintptr_t)q >> 4) * 0x9E3779B97F4A7C15ULL;
+			// slot = pool[(h >> QUEUE_LOCK_POOL_INDEX_SHIFT) & (QUEUE_LOCK_POOL_SIZE - 1)]
+			// shift = 64 - log2(POOL_SIZE) so the top log2(POOL_SIZE) bits of the
+			// multiplicative hash become the slot index. Mask is implicit: the top
+			// bits of a 64-bit shift-right are guaranteed in range when extracted.
 			lsr(x10, x0, 4);
 			mov(x9, (uint64)0x9E3779B97F4A7C15ULL);
 			mul(x10, x10, x9);
-			lsr(x10, x10, 56);                                              // x10 = slot index 0..255
+			lsr(x10, x10, coreinit::QUEUE_LOCK_POOL_INDEX_SHIFT);            // x10 = slot index
 			mov(x9, (uint64)&coreinit::g_queueLockPool[0]);
 			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
 

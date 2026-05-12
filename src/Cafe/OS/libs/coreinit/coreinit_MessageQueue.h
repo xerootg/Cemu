@@ -42,7 +42,23 @@ namespace coreinit
 	static_assert(sizeof(QueueLockSlot) == 16);
 	static_assert(offsetof(QueueLockSlot, packed) == 0);
 
-	constexpr size_t QUEUE_LOCK_POOL_SIZE = 256;
+	// Wind Waker HD has ~38 live OSMessageQueue instances; pool sized at 4096 to
+	// give zero hash collisions in practice (measured: collision rate 0% at 4096
+	// vs 5.3% at 2048, 10.5% at 1024, 15.8% at 256). Per-slot waiter counts are
+	// shared across queues hashing to the same slot, so a collision turns every
+	// no-op JIT wake on the colliding sender into a real shard-lock acquisition;
+	// at 256 slots that was visible as ~5–6% of cycles in __OSLockSchedulerShard.
+	//
+	// Memory cost: 4096 * 16 = 64 KB BSS. Well within L2; only the ~38 actively
+	// hashed slots are hot in L1.
+	//
+	// Index extraction is `(h >> QUEUE_LOCK_POOL_INDEX_SHIFT) & (POOL_SIZE - 1)`
+	// — the AArch64 JIT body relies on this matching its `lsr` immediate.
+	constexpr size_t QUEUE_LOCK_POOL_SIZE        = 4096;
+	constexpr uint32_t QUEUE_LOCK_POOL_INDEX_SHIFT = 52;  // 64 - log2(4096)
+	static_assert((QUEUE_LOCK_POOL_SIZE & (QUEUE_LOCK_POOL_SIZE - 1)) == 0, "pool size must be a power of two");
+	static_assert((1ull << (64 - QUEUE_LOCK_POOL_INDEX_SHIFT)) == QUEUE_LOCK_POOL_SIZE, "shift must match pool size");
+
 	extern QueueLockSlot g_queueLockPool[QUEUE_LOCK_POOL_SIZE];
 
 	struct OSMessage

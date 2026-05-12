@@ -1,7 +1,6 @@
 #pragma once
 #include "Cafe/HW/Espresso/Const.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Scheduler.h"
-#include <atomic>
 
 struct OSThread_t;
 
@@ -113,34 +112,6 @@ namespace coreinit
 		{
 			cemu_assert_debug((!head.IsNull() == !tail.IsNull()) || (head.IsNull() == tail.IsNull()));
 			return head.IsNull();
-		}
-
-		// Lock-free fast path: returns true if the wait queue's head is observably
-		// null. Acquire ordering pairs with the store_release used by head writes
-		// (addThread / addThreadByPriority / removeThread). The wake helpers
-		// (OSWakeOneSender / OSWakeOneReceiver) and the AArch64 JIT body skip the
-		// shard-lock acquire entirely when this returns true — under WW HD the
-		// pendingWaiters race window means ~half of "wake" invocations land here.
-		// Safe to call without holding any scheduler lock: a stale-null read can
-		// only happen if no slow path has yet released a head_store_release; in
-		// that case the slow path's post-enqueue queue re-check finds the message
-		// and bails out instead of sleeping. Null = 0x00000000 regardless of
-		// endianness, so no byteswap needed.
-		bool isEmptyAcquire() const noexcept
-		{
-			uint32_t* raw = const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(&head));
-			return std::atomic_ref<uint32_t>(*raw).load(std::memory_order_acquire) == 0;
-		}
-
-		// Atomic-release store of head. Pairs with isEmptyAcquire() in the
-		// lock-free wake-helper fast path. Called from addThread/
-		// addThreadByPriority/removeThread/takeFirstFromQueue in place of the
-		// plain `head = ...` assignment so any cross-shard observer that hasn't
-		// acquired the scheduler lock can still see the publication.
-		void storeHeadRelease(MEMPTR<OSThread_t> newHead) noexcept
-		{
-			uint32_t be_value = *reinterpret_cast<const uint32_t*>(&newHead);
-			std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(&head)).store(be_value, std::memory_order_release);
 		}
 
 		void addThread(OSThread_t* thread, OSThreadLink* threadLink);

@@ -1032,22 +1032,16 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			casa(w10, w11, AdrNoOfs(x9));
 			cbnz(w10, slowCall);                                            // contended → C++ slow path
 
-			// ===== prepare opposite-side wait-queue head offset =====
-			// Receive wakes a send-side waiter (threadQueueSend.head at offset 0x0C),
-			// Send wakes a receive-side waiter (threadQueueReceive.head at 0x1C).
-			// We defer the actual load until after queue-lock release so it uses
-			// ldar (load-acquire), paired with storeHeadRelease in the slow-path
-			// enqueue. The old design snapshotted pendingWaiters under the queue
-			// lock and called the wake helper whenever non-zero — but the wake
-			// helper would then take the shard lock just to discover an empty
-			// wait queue (false positive from the bump-before-enqueue race
-			// window). The ldar-on-head check is lock-free and only triggers the
-			// shard lock when a real waiter is published.
-			constexpr uint32_t wakeHeadOff =
-				offsetof(coreinit::OSMessageQueue, threadQueueSend);     // .head is at +0
-			constexpr uint32_t recvHeadOff =
-				offsetof(coreinit::OSMessageQueue, threadQueueReceive);  // .head is at +0
-			const uint32_t headOff = isReceive ? wakeHeadOff : recvHeadOff;
+			// ===== under lock: snapshot opposite-side pending waiters =====
+			// Receive snapshots pendingSendWaiters (offset 8), Send snapshots
+			// pendingReceiveWaiters (offset 4). Plain ldr is sufficient: the
+			// casa-acquire above synchronizes-with the previous holder's stlr-release
+			// on lockState, so the counter's prior fetch_add (sequenced before that
+			// stlr) is visible.
+			// w16 stays live through the body and is checked after lock release —
+			// if non-zero, we call into the wake helper. We don't bail to C++ for
+			// this case so the lock isn't immediately reacquired by the C++ entry.
+			ldr(w16, AdrUimm(x9, isReceive ? 8u : 4u));
 
 			// ===== load queue fields with ldp consolidation =====
 			// firstIndex (offset 0x34) + usedCount (offset 0x38) are adjacent — one
@@ -1092,13 +1086,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				mov(w11, 1);
 				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
 				stlr(wzr, AdrNoOfs(x9));                                    // release lock
-				// Lock-free wake check: ldar on threadQueueSend.head pairs with the
-				// slow-path storeHeadRelease. cbz skips the wake helper entirely
-				// when no waiter is published, avoiding the shard-lock acquire for
-				// the common false-positive case. ldar requires zero offset, so
-				// add the field offset into a temp first.
-				add_imm(x9, x0, headOff, TEMP_GPR2.XReg);
-				ldar(w16, AdrNoOfs(x9));
+				// If a send-side waiter existed at snapshot time, wake one. x0 still holds msgQueue.
 				cbz(w16, fastDone);
 				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender);
 				blr(TEMP_GPR1.XReg);
@@ -1148,10 +1136,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				mov(w11, 1);
 				str(w11, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
 				stlr(wzr, AdrNoOfs(x9));
-				// Lock-free wake check: ldar on threadQueueReceive.head pairs with
-				// slow-path storeHeadRelease. See receive path for full rationale.
-				add_imm(x9, x0, headOff, TEMP_GPR2.XReg);
-				ldar(w16, AdrNoOfs(x9));
+				// If a receive-side waiter existed at snapshot time, wake one.
 				cbz(w16, fastDone);
 				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver);
 				blr(TEMP_GPR1.XReg);

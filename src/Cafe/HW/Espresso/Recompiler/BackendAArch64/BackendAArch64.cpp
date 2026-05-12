@@ -175,6 +175,17 @@ struct AArch64GenContext_t : CodeGenerator
 	void call_imm(IMLInstruction* imlInstruction);
 	bool fpr_load(IMLInstruction* imlInstruction, bool indexed);
 	bool fpr_store(IMLInstruction* imlInstruction, bool indexed);
+	// Peepholes for adjacent FPR loads/stores with the same base reg and +4
+	// stride (lfs/lfs and stfs/stfs after IML expansion). PPC big-endian
+	// memory means each unfused FP single load is ldr+rev+fmov(+fcvt) — 3 or 4
+	// host instructions per access. By loading both 32-bit BE words as one
+	// 64-bit value into a NEON D, byte-swapping both lanes with a single
+	// rev32, and (for the expanding case) doing the single→double widen with
+	// one fcvtl .2d,.2s, we collapse a 6-8 instruction sequence into 5-6.
+	// Matches the heaviest static fusion candidate in WW HD (lfs→lfs is the
+	// #1 adjacent-pair pattern in the binary).
+	bool tryFuseFprLoadPair(IMLInstruction* a, IMLInstruction* b);
+	bool tryFuseFprStorePair(IMLInstruction* a, IMLInstruction* b);
 	void fpr_r_r(IMLInstruction* imlInstruction);
 	void fpr_r_r_r(IMLInstruction* imlInstruction);
 	void fpr_r_r_r_r(IMLInstruction* imlInstruction);
@@ -1438,12 +1449,16 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	{
 		if (switchEndian)
 		{
+			// ldrh zero-extends to 32b, then rev16 byte-swaps bytes within each
+			// halfword. The low halfword is now the byte-swapped value and the
+			// upper 16 bits stay 0, so for lhz this is already the final result —
+			// drops the lsr from the old ldrh+rev+lsr-16 form. lha still needs a
+			// sxth, but that's a 1-uop, low-latency fixup with no awkward shift
+			// dependency on the rev output.
 			ldrh(dataReg, adr);
-			rev(dataReg, dataReg);
+			rev16(dataReg, dataReg);
 			if (signExtend)
-				asr(dataReg, dataReg, 16);
-			else
-				lsr(dataReg, dataReg, 16);
+				sxth(dataReg, dataReg);
 		}
 		else
 		{
@@ -1568,8 +1583,12 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	{
 		if (swapEndian)
 		{
-			rev(TEMP_GPR2.WReg, dataReg);
-			lsr(TEMP_GPR2.WReg, TEMP_GPR2.WReg, 16);
+			// rev32 + lsr-16 was needed because rev swaps all 4 bytes of the
+			// register; rev16 byte-swaps within each halfword, so the low 16
+			// bits hold the byte-swapped low halfword directly. strh only reads
+			// the low 16 bits, so the upper-halfword content doesn't matter.
+			// Drops one instruction off every PPC sth.
+			rev16(TEMP_GPR2.WReg, dataReg);
 			strh(TEMP_GPR2.WReg, adr);
 		}
 		else
@@ -1813,6 +1832,143 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
 		cemuLog_log(LogType::Recompiler, "PPCRecompilerAArch64Gen_imlInstruction_fpr_store(): Unsupported mode %d\n", mode);
 		return false;
 	}
+	return true;
+}
+
+bool AArch64GenContext_t::tryFuseFprLoadPair(IMLInstruction* a, IMLInstruction* b)
+{
+	// Two adjacent non-indexed FPR loads, same base, +4 stride, SINGLE mode,
+	// matching swapEndian and notExpanded flags, distinct destination FPRs.
+	if (a->type != PPCREC_IML_TYPE_FPR_LOAD || b->type != PPCREC_IML_TYPE_FPR_LOAD)
+		return false;
+	if (a->op_storeLoad.mode != PPCREC_FPR_LD_MODE_SINGLE ||
+		b->op_storeLoad.mode != PPCREC_FPR_LD_MODE_SINGLE)
+		return false;
+	// Endian-swap mismatch is rare but possible (raw byte read paths); only fuse
+	// when both lanes need the same treatment so a single rev32 covers them.
+	if (a->op_storeLoad.flags2.swapEndian != b->op_storeLoad.flags2.swapEndian)
+		return false;
+	if (a->op_storeLoad.flags2.notExpanded != b->op_storeLoad.flags2.notExpanded)
+		return false;
+	if (a->op_storeLoad.registerMem.GetRegID() != b->op_storeLoad.registerMem.GetRegID())
+		return false;
+	sint32 offA = a->op_storeLoad.immS32;
+	sint32 offB = b->op_storeLoad.immS32;
+	if (offB != offA + 4)
+		return false;
+	// We use ldur D for the 8-byte combined load (unscaled imm9, any alignment,
+	// range [-256, +255]). PPC lfs offsets are 4-aligned, which trivially fits.
+	if (offA < -256 || offA > 255)
+		return false;
+	IMLReg dataA = a->op_storeLoad.registerData;
+	IMLReg dataB = b->op_storeLoad.registerData;
+	if (dataA.GetRegID() == dataB.GetRegID())
+		return false;
+
+	WReg wBase = gpReg<WReg>(a->op_storeLoad.registerMem);
+	size_t idxA = fpReg<SReg>(dataA).getIdx();
+	size_t idxB = fpReg<SReg>(dataB).getIdx();
+	// The destinations must not be TEMP_FPR (we use it as the load buffer).
+	if (idxA == TEMP_FPR_ID || idxB == TEMP_FPR_ID)
+		return false;
+
+	add(TEMP_GPR1.XReg, MEM_BASE_REG, wBase, ExtMod::UXTW);
+
+	if (a->op_storeLoad.flags2.swapEndian)
+	{
+		// ldur D loads both 32-bit BE singles into the low 64 bits of TEMP_FPR.
+		// rev32 on the .8b view byte-swaps each 32-bit lane in place; upper 64
+		// bits of TEMP_FPR are zeroed by the load and irrelevant after.
+		ldur(TEMP_FPR.DReg, AdrImm(TEMP_GPR1.XReg, offA));
+		rev32(TEMP_FPR.VReg.b8, TEMP_FPR.VReg.b8);
+	}
+	else
+	{
+		ldur(TEMP_FPR.DReg, AdrImm(TEMP_GPR1.XReg, offA));
+	}
+
+	::VReg vA(idxA), vB(idxB);
+	if (a->op_storeLoad.flags2.notExpanded)
+	{
+		// Keep as single. `mov S, V.s[i]` is the DUP-scalar alias and writes
+		// only the low 32 bits of the destination V, zeroing the rest — matches
+		// the semantics of the per-instruction fmov(SReg, WReg) path.
+		mov(SReg(idxA), TEMP_FPR.VReg.s2[0]);
+		mov(SReg(idxB), TEMP_FPR.VReg.s2[1]);
+	}
+	else
+	{
+		// fcvtl V.2d, V.2s widens the lower two single-precision lanes of
+		// TEMP_FPR to two double-precision lanes (the high half of the V is
+		// written too). Then DUP-scalar each .d[i] into the destination D regs,
+		// which zero-extends the upper bits of each destination V — same as
+		// the per-instruction fcvt(DReg, SReg) path.
+		fcvtl(TEMP_FPR.VReg.d2, TEMP_FPR.VReg.s2);
+		mov(DReg(idxA), TEMP_FPR.VReg.d2[0]);
+		mov(DReg(idxB), TEMP_FPR.VReg.d2[1]);
+	}
+	return true;
+}
+
+bool AArch64GenContext_t::tryFuseFprStorePair(IMLInstruction* a, IMLInstruction* b)
+{
+	// Mirror of tryFuseFprLoadPair. We pack both source FPRs (after the usual
+	// double→single down-convert when needed) into a NEON D, byte-swap each
+	// lane, and stur D — replacing two (fcvt + fmov-to-GPR + rev + str) chains
+	// with a single shuffle and store.
+	if (a->type != PPCREC_IML_TYPE_FPR_STORE || b->type != PPCREC_IML_TYPE_FPR_STORE)
+		return false;
+	if (a->op_storeLoad.mode != PPCREC_FPR_ST_MODE_SINGLE ||
+		b->op_storeLoad.mode != PPCREC_FPR_ST_MODE_SINGLE)
+		return false;
+	if (a->op_storeLoad.flags2.swapEndian != b->op_storeLoad.flags2.swapEndian)
+		return false;
+	if (a->op_storeLoad.flags2.notExpanded != b->op_storeLoad.flags2.notExpanded)
+		return false;
+	if (a->op_storeLoad.registerMem.GetRegID() != b->op_storeLoad.registerMem.GetRegID())
+		return false;
+	sint32 offA = a->op_storeLoad.immS32;
+	sint32 offB = b->op_storeLoad.immS32;
+	if (offB != offA + 4)
+		return false;
+	// stur D — unscaled imm9, [-256, +255], any alignment. PPC stfs is 4-aligned.
+	if (offA < -256 || offA > 255)
+		return false;
+	IMLReg dataA = a->op_storeLoad.registerData;
+	IMLReg dataB = b->op_storeLoad.registerData;
+	// Distinct source FPRs simplify the packing (we read each independently).
+	// Same-reg stores happen but are rare and would need an extra mov.
+	if (dataA.GetRegID() == dataB.GetRegID())
+		return false;
+
+	WReg wBase = gpReg<WReg>(a->op_storeLoad.registerMem);
+	size_t idxA = fpReg<DReg>(dataA).getIdx();
+	size_t idxB = fpReg<DReg>(dataB).getIdx();
+	if (idxA == TEMP_FPR_ID || idxB == TEMP_FPR_ID)
+		return false;
+
+	if (a->op_storeLoad.flags2.notExpanded)
+	{
+		// Sources already in single format in the low 32 bits of each FPR.
+		// Pack them into lanes 0/1 of TEMP_FPR.s2 via element-to-element ins.
+		// `mov(VRegSElem, VRegSElem)` is the INS alias and preserves the
+		// untouched lanes; that's fine here because we overwrite both.
+		mov(TEMP_FPR.VReg.s2[0], ::VReg(idxA).s4[0]);
+		mov(TEMP_FPR.VReg.s2[1], ::VReg(idxB).s4[0]);
+	}
+	else
+	{
+		// Down-convert both doubles to singles via a vector fcvtn. Pack the
+		// two source doubles into TEMP_FPR.d2 first, then fcvtn writes the two
+		// singles to TEMP_FPR.s2 (lower 64 bits) and zeroes the upper half.
+		mov(TEMP_FPR.VReg.d2[0], ::VReg(idxA).d2[0]);
+		mov(TEMP_FPR.VReg.d2[1], ::VReg(idxB).d2[0]);
+		fcvtn(TEMP_FPR.VReg.s2, TEMP_FPR.VReg.d2);
+	}
+	if (a->op_storeLoad.flags2.swapEndian)
+		rev32(TEMP_FPR.VReg.b8, TEMP_FPR.VReg.b8);
+	add(TEMP_GPR1.XReg, MEM_BASE_REG, wBase, ExtMod::UXTW);
+	stur(TEMP_FPR.DReg, AdrImm(TEMP_GPR1.XReg, offA));
 	return true;
 }
 
@@ -2168,7 +2324,21 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_FPR_LOAD)
 			{
-				if (!aarch64GenContext.fpr_load(imlInstruction, false))
+				// lfs→lfs is the single biggest adjacent-pair pattern in the
+				// game binary by static count; fuse the swap+widen into one
+				// NEON shuffle. Falls through to the scalar path on any
+				// constraint failure (mode mismatch, big offset, etc.).
+				bool fused = false;
+				if (i + 1 < segIt->imlList.size())
+				{
+					IMLInstruction* next = segIt->imlList.data() + (i + 1);
+					if (aarch64GenContext.tryFuseFprLoadPair(imlInstruction, next))
+					{
+						i++;
+						fused = true;
+					}
+				}
+				if (!fused && !aarch64GenContext.fpr_load(imlInstruction, false))
 					codeGenerationFailed = true;
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_FPR_LOAD_INDEXED)
@@ -2178,7 +2348,20 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_FPR_STORE)
 			{
-				if (!aarch64GenContext.fpr_store(imlInstruction, false))
+				// stfs→stfs mirror of the load-pair fuse — packs both singles
+				// (with optional double→single narrowing) into a NEON D,
+				// byte-swaps both lanes with one rev32, and stores.
+				bool fused = false;
+				if (i + 1 < segIt->imlList.size())
+				{
+					IMLInstruction* next = segIt->imlList.data() + (i + 1);
+					if (aarch64GenContext.tryFuseFprStorePair(imlInstruction, next))
+					{
+						i++;
+						fused = true;
+					}
+				}
+				if (!fused && !aarch64GenContext.fpr_store(imlInstruction, false))
 					codeGenerationFailed = true;
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_FPR_STORE_INDEXED)

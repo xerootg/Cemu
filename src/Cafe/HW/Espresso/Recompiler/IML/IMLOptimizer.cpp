@@ -844,6 +844,88 @@ static void IMLOptimizer_FoldLisFollowedByImmediateOp(IMLSegment& seg)
 	}
 }
 
+// Collapse a `AND regR, regSrc, #(1<<bit) ; ARM64_CMP regR, #0 ; ARM64_NZCV_JCC EQ/NEQ`
+// chain into a single ARM64_TBZ/TBNZ on regSrc. AArch64's `tbz Rn, #bit, label`
+// is a single instruction that branches on a single bit -- compared to the
+// unfused `mov tmp, #imm; and regR, regSrc, tmp; cmp regR, #0; b.cond` we save
+// ~3 host instructions per fire. Static analysis of WW HD .text counts
+// 2 485 rlwinm.+branch sites with MB==ME (single-bit isolate) per FINDINGS
+// item 2.
+//
+// Runs AFTER the cmp/branch fusion so the producer of NZCV is an ARM64_CMP.
+// Skips the fold when the AND's result is still needed after the branch.
+static void IMLOptimizerArm64_SubstituteSingleBitCmpForTBZ(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	if (!seg.HasSuffixInstruction())
+		return;
+	sint32 jccIdx = seg.GetSuffixInstructionIndex();
+	if (jccIdx < 0)
+		return;
+	IMLInstruction& jcc = seg.imlList[jccIdx];
+	if (jcc.type != PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+		return;
+	if (jcc.op_arm64_nzcv_jcc.cond != IMLCondition::EQ && jcc.op_arm64_nzcv_jcc.cond != IMLCondition::NEQ)
+		return;
+
+	// Find the producing ARM64_CMP immediately before the jcc (skipping no-ops).
+	sint32 cmpIdx = -1;
+	for (sint32 i = jccIdx - 1; i >= 0; --i)
+	{
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_NO_OP)
+			continue;
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_R_S32 &&
+		    seg.imlList[i].operation == PPCREC_IML_OP_ARM64_CMP &&
+		    seg.imlList[i].op_r_immS32.immS32 == 0)
+		{
+			cmpIdx = i;
+		}
+		break;
+	}
+	if (cmpIdx < 0)
+		return;
+	IMLReg cmpReg = seg.imlList[cmpIdx].op_r_immS32.regR;
+
+	// Find AND that writes cmpReg, immediately before cmpIdx (skipping no-ops).
+	sint32 andIdx = -1;
+	for (sint32 i = cmpIdx - 1; i >= 0; --i)
+	{
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_NO_OP)
+			continue;
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_R_R_S32 &&
+		    seg.imlList[i].operation == PPCREC_IML_OP_AND &&
+		    seg.imlList[i].op_r_r_s32.regR.GetRegID() == cmpReg.GetRegID())
+		{
+			uint32 imm = (uint32)seg.imlList[i].op_r_r_s32.immS32;
+			if (imm != 0 && (imm & (imm - 1)) == 0) // power of two = single bit
+				andIdx = i;
+		}
+		break;
+	}
+	if (andIdx < 0)
+		return;
+
+	// Bail if cmpReg is read more than once (cmp itself) before the jcc or
+	// if it's needed after the branch -- we'd have to keep the AND otherwise.
+	if (IMLUtil_CountRegisterReadsInRange(seg, andIdx + 1, jccIdx - 1, cmpReg.GetRegID()) > 1)
+		return;
+	if (regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, cmpReg.GetRegID()))
+		return;
+
+	uint32 imm = (uint32)seg.imlList[andIdx].op_r_r_s32.immS32;
+	uint8 bitIndex = (uint8)std::countr_zero(imm);
+	IMLReg regSrc = seg.imlList[andIdx].op_r_r_s32.regA;
+	// tbz fires when the bit is zero. b.eq on a tst-style result (Z=1) fires
+	// when the masked bit is zero. So for cond=EQ not-inverted: tbz.
+	//   mustBeZero == (cond == EQ) XOR inverted == false
+	bool jccEq = (jcc.op_arm64_nzcv_jcc.cond == IMLCondition::EQ);
+	bool inverted = jcc.op_arm64_nzcv_jcc.invertedCondition;
+	bool mustBeZero = (jccEq != inverted);
+
+	jcc.make_arm64_tbz(regSrc, bitIndex, mustBeZero);
+	seg.imlList[cmpIdx].make_no_op();
+	seg.imlList[andIdx].make_no_op();
+}
+
 void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
 {
 	// Fold lis+addi/ori before DCE so the dead intermediate ADD can be removed.
@@ -858,6 +940,7 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 #if defined(__aarch64__)
 	// AArch64 specific optimizations
 	IMLOptimizerArm64_SubstituteCJumpForNZCVJump(regIoAnalysis, seg); // late pass: creates invisible NZCV dependency between cmp and branch
+	IMLOptimizerArm64_SubstituteSingleBitCmpForTBZ(regIoAnalysis, seg); // even later: collapse rlwinm.+branch into a single tbz
 #endif
 }
 

@@ -253,6 +253,7 @@ enum
 
 	// AArch64 specific
 	PPCREC_IML_TYPE_ARM64_NZCV_JCC,
+	PPCREC_IML_TYPE_ARM64_TBZ, // suffix: branch if a single bit of regSrc is (zero|nonzero)
 };
 
 enum // IMLName
@@ -520,6 +521,12 @@ struct IMLInstruction
 			IMLCondition cond;
 			bool invertedCondition;
 		}op_arm64_nzcv_jcc;
+		struct
+		{
+			IMLReg regSrc;
+			uint8 bitIndex; // ARM-style: LSB=0
+			bool mustBeZero; // true→tbz, false→tbnz
+		}op_arm64_tbz;
 	};
 
 	bool IsSuffixInstruction() const
@@ -533,7 +540,8 @@ struct IMLInstruction
 			type == PPCREC_IML_TYPE_JUMP ||
 			type == PPCREC_IML_TYPE_CONDITIONAL_JUMP ||
 			type == PPCREC_IML_TYPE_X86_EFLAGS_JCC ||
-			type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+			type == PPCREC_IML_TYPE_ARM64_NZCV_JCC ||
+			type == PPCREC_IML_TYPE_ARM64_TBZ)
 			return true;
 		return false;
 	}
@@ -833,6 +841,15 @@ struct IMLInstruction
 		this->operation = -999;
 		this->op_arm64_nzcv_jcc.cond = cond;
 		this->op_arm64_nzcv_jcc.invertedCondition = invertedCondition;
+	}
+
+	void make_arm64_tbz(IMLReg regSrc, uint8 bitIndex, bool mustBeZero)
+	{
+		this->type = PPCREC_IML_TYPE_ARM64_TBZ;
+		this->operation = -999;
+		this->op_arm64_tbz.regSrc = regSrc;
+		this->op_arm64_tbz.bitIndex = bitIndex;
+		this->op_arm64_tbz.mustBeZero = mustBeZero;
 	}
 
 	void CheckRegisterUsage(IMLUsedRegisters* registersUsed) const;

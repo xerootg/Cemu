@@ -343,6 +343,10 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	{
 		// no registers read or written (except for the implicit NZCV)
 	}
+	else if (type == PPCREC_IML_TYPE_ARM64_TBZ)
+	{
+		registersUsed->readGPR1 = op_arm64_tbz.regSrc;
+	}
 	else
 	{
 		cemu_assert_unimplemented();
@@ -549,6 +553,10 @@ void IMLInstruction::RewriteGPR(const std::unordered_map<IMLRegID, IMLRegID>& tr
 	else if (type == PPCREC_IML_TYPE_ARM64_NZCV_JCC)
 	{
 		// no registers read or written (except for the implicit NZCV)
+	}
+	else if (type == PPCREC_IML_TYPE_ARM64_TBZ)
+	{
+		op_arm64_tbz.regSrc = replaceRegisterIdMultiple(op_arm64_tbz.regSrc, translationTable);
 	}
 	else
 	{

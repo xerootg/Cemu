@@ -20,6 +20,12 @@
 
 using namespace Xbyak_aarch64;
 
+// x24 holds PPCInterpreter_t::remainingCycles for the lifetime of a JIT
+// execution session. See IMLArchAArch64::PHYSREG_GPR_COUNT -- x24 is held
+// back from the IML allocator pool so the basic-block cycle decrement is a
+// single sub_imm against a live host register instead of an ldr/sub/str
+// round-trip to PPCInterpreter_t.
+constexpr uint32 REMAINING_CYCLES_REG_ID = 24;
 constexpr uint32 TEMP_GPR_1_ID = 25;
 constexpr uint32 TEMP_GPR_2_ID = 26;
 constexpr uint32 PPC_RECOMPILER_INSTANCE_DATA_REG_ID = 27;
@@ -58,6 +64,7 @@ static const XReg HCPU_REG{HCPU_REG_ID}, PPC_REC_INSTANCE_REG{PPC_RECOMPILER_INS
 static const GPReg TEMP_GPR1{TEMP_GPR_1_ID};
 static const GPReg TEMP_GPR2{TEMP_GPR_2_ID};
 static const GPReg LR{TEMP_GPR_2_ID};
+static const GPReg REMAINING_CYCLES_REG{REMAINING_CYCLES_REG_ID};
 
 static const FPReg TEMP_FPR{TEMP_FPR_ID};
 
@@ -1021,10 +1028,12 @@ void AArch64GenContext_t::jump(IMLSegment* imlSegment)
 
 void AArch64GenContext_t::conditionalJumpCycleCheck(IMLSegment* imlSegment)
 {
-	ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+	// w24 is live with PPCInterpreter_t::remainingCycles -- the test is just
+	// "did the cumulative MACRO_COUNT_CYCLES push us negative yet?". Skips
+	// the per-check ldr the legacy path needed.
 	prepareJump(NegativeRegValueJumpInfo{
 		.target = imlSegment->nextSegmentBranchTaken,
-		.regValue = TEMP_GPR1.WReg,
+		.regValue = REMAINING_CYCLES_REG.WReg,
 	});
 }
 
@@ -1111,10 +1120,11 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_COUNT_CYCLES)
 	{
 		uint32 cycleCount = imlInstruction->op_macro.param;
-		AdrUimm adrCycles = AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles));
-		ldr(TEMP_GPR1.WReg, adrCycles);
-		sub_imm(TEMP_GPR1.WReg, TEMP_GPR1.WReg, cycleCount, TEMP_GPR2.WReg);
-		str(TEMP_GPR1.WReg, adrCycles);
+		// w24 (REMAINING_CYCLES_REG) holds remainingCycles for the whole JIT
+		// session -- decrement is a single sub_imm against the live register.
+		// Was ldr + sub_imm + str against PPCInterpreter_t::remainingCycles
+		// at every basic block entry (one of the most-emitted IML macros).
+		sub_imm(REMAINING_CYCLES_REG.WReg, REMAINING_CYCLES_REG.WReg, cycleCount, TEMP_GPR1.WReg);
 		return true;
 	}
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_HLE)
@@ -1126,6 +1136,12 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		// update instruction pointer
 		mov(TEMP_GPR1.WReg, ppcAddress);
 		str(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
+		// Flush the in-register cycle counter to PPCInterpreter_t before any
+		// C++ call -- PPCRecompiler_virtualHLE reads/writes remainingCycles
+		// directly (-= 500 per HLE), and we don't want to clobber that with
+		// the cached register value on the way out. We reload below after
+		// the call returns.
+		str(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
 		// set parameters
 		str(x30, AdrPreImm(sp, -16));
 
@@ -1390,9 +1406,12 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 		ldr(x30, AdrPostImm(sp, 16));
 
-		// check if cycles where decreased beyond zero, if yes -> leave recompiler
-		ldr(TEMP_GPR1.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
-		tbz(TEMP_GPR1.WReg, 31, cyclesLeftLabel); // check if negative
+		// Refill the cycle counter cache after the HLE call: virtualHLE
+		// (or the wake-helper / native OSSend|Receive in the inline path)
+		// may have modified PPCInterpreter_t::remainingCycles. After the
+		// fiber-aware HCPU reload above this points at the correct context.
+		ldr(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
+		tbz(REMAINING_CYCLES_REG.WReg, 31, cyclesLeftLabel); // check if negative
 
 		mov(TEMP_GPR1.XReg, offsetof(PPCRecompilerInstanceData_t, ppcRecompilerDirectJumpTable));
 		ldr(TEMP_GPR1.XReg, AdrReg(PPC_REC_INSTANCE_REG, TEMP_GPR1.XReg));
@@ -2482,6 +2501,13 @@ void AArch64GenContext_t::enterRecompilerCode()
 	mov(HCPU_REG, x1); // call argument 2
 	mov(PPC_REC_INSTANCE_REG, (uint64)ppcRecompilerInstanceData);
 	mov(MEM_BASE_REG, (uint64)memory_base);
+	// Cache the cycle counter in a callee-saved host register for the whole
+	// JIT execution session. Decrements at every basic block boundary then
+	// become a one-instruction sub_imm against this register instead of an
+	// ldr/sub/str triple against PPCInterpreter_t. The matching writeback
+	// happens in leaveRecompilerCode (the universal JIT->native exit stub)
+	// and around the synchronous HLE call in MACRO_HLE.
+	ldr(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
 
 	// branch to recFunc
 	blr(x0); // call argument 1
@@ -2503,6 +2529,10 @@ void AArch64GenContext_t::enterRecompilerCode()
 
 void AArch64GenContext_t::leaveRecompilerCode()
 {
+	// Flush the in-register cycle counter back to PPCInterpreter_t. Every
+	// MACRO_LEAVE and every cycle-exhausted exit path branches through this
+	// stub, so doing the writeback once here covers all of them.
+	str(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
 	str(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
 	ret();
 }

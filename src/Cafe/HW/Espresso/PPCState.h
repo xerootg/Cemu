@@ -104,6 +104,12 @@ struct PPCInterpreter_t
 
 	// extra variables for recompiler
 	void* rspTemp;
+	// Host return address used to leave JIT execution. Set by
+	// PPCRecompiler_enterRecompilerCode just before calling into JIT code, then
+	// consumed by leaveRecompilerCode_visited/_unvisited at exit. Lets the JIT
+	// body clobber the AArch64 LR (x30) freely so MACRO_BL can use a real `blr`
+	// for hardware-RAS-predicted returns.
+	void* jitExitReturnAddr;
 };
 
 // parameter access (legacy C style)

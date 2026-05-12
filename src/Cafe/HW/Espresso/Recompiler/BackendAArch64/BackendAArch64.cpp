@@ -1145,11 +1145,24 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		// instruction index by >> 2, then load directJumpTable[index] using
 		// the LSL #3 scaling form of LDR (scale-by-8 = element size).
 		// PPC_REC_INSTANCE_REG already points at directJumpTable[0].
+		//
+		// Use AArch64 `ret Xn` instead of `br Xn` so the CPU's Return Address
+		// Stack predicts the target. Paired with `blr` in MACRO_BL below: the
+		// blr pushes the host address immediately after itself (= start of
+		// the BL's next segment, which equals directJumpTable[BL_PC+4 >> 2]
+		// because the JIT lays out segments in PPC-address order). The ret
+		// here pops that same address, so prediction succeeds whenever PPC
+		// bl/blr are balanced -- the common case. PPC bctr (switch / vtable
+		// indirect) lands here too; it mispredicts the same as `br` did
+		// before, so no regression. The CPU's RAS hint matters even though
+		// the actual jump uses Xn -- the encoding signals "this is a return"
+		// so prediction goes through RAS rather than the generic indirect
+		// predictor.
 		WReg branchDstReg = gpReg<WReg>(imlInstruction->op_macro.paramReg);
 		lsr(TEMP_GPR1.WReg, branchDstReg, 2);
 		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		mov(LR.WReg, branchDstReg);
-		br(TEMP_GPR1.XReg);
+		ret(TEMP_GPR1.XReg);
 		return true;
 	}
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_BL)
@@ -1158,6 +1171,14 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		// newLR/newIP are both compile-time constants -- materialize the
 		// instruction index (newIP >> 2) directly and skip the 64-bit
 		// lookupOffset that the legacy path had to assemble at runtime.
+		//
+		// Use AArch64 `blr` instead of `br` so the hardware RAS is fed the
+		// host return address -- see MACRO_B_TO_REG above for the pairing
+		// rationale. `blr Xn` clobbers x30; that's safe here because
+		// enterRecompilerCode stashes the JIT-exit return address in
+		// PPCInterpreter_t::jitExitReturnAddr before entering JIT code, and
+		// leaveRecompilerCode reads from there -- not x30 -- so x30 is dead
+		// across the entire JIT session.
 		uint32 newLR = imlInstruction->op_macro.param + 4;
 		mov(PPC_LR_REG.WReg, newLR);
 
@@ -1165,7 +1186,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 		mov(TEMP_GPR1.WReg, (uint32)(newIP >> 2));
 		ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
 		mov(LR.WReg, newIP);
-		br(TEMP_GPR1.XReg);
+		blr(TEMP_GPR1.XReg);
 		return true;
 	}
 	else if (imlInstruction->operation == PPCREC_IML_MACRO_B_FAR)
@@ -2610,8 +2631,18 @@ void AArch64GenContext_t::enterRecompilerCode()
 	ldr(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
 	ldr(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 
+	// Stash the post-blr return address in HCPU. leaveRecompilerCode reads
+	// this and `br`s to it on exit, so we don't depend on x30 surviving the
+	// JIT body. That lets MACRO_BL use a real `blr` (which clobbers x30) to
+	// feed the hardware Return Address Stack -- the predictor then pairs it
+	// with the matching `ret` in MACRO_B_TO_REG.
+	Label jitExitReturn;
+	adr(x9, jitExitReturn);
+	str(x9, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, jitExitReturnAddr)));
+
 	// branch to recFunc
 	blr(x0); // call argument 1
+	L(jitExitReturn);
 
 	mov(x9, sp);
 	ldp(x19, x20, AdrPostImm(x9, 16));
@@ -2637,7 +2668,11 @@ void AArch64GenContext_t::leaveRecompilerCode()
 	str(REMAINING_CYCLES_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, remainingCycles)));
 	str(PPC_LR_REG.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.LR)));
 	str(LR.WReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, instructionPointer)));
-	ret();
+	// `br` to the return address that enterRecompilerCode stashed before
+	// entering JIT code. We can't `ret X30` here because MACRO_BL's `blr`
+	// clobbers x30 mid-session -- see enterRecompilerCode for the contract.
+	ldr(TEMP_GPR1.XReg, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, jitExitReturnAddr)));
+	br(TEMP_GPR1.XReg);
 }
 
 bool initializedInterfaceFunctions = false;

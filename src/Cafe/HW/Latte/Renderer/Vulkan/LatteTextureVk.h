@@ -88,6 +88,23 @@ public:
 
 	uint32 m_collisionCheckIndex{}; // used to track if texture is being both sampled and output to during drawcall
 
+	// pending clear state — when dynamic_rendering is enabled, color/depth clears are deferred
+	// so the next render pass that uses this texture as an attachment can fold the clear into
+	// loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR. If the texture is used another way before its next
+	// render-pass attachment use, the deferred clear is flushed via a real vkCmdClear*Image.
+	struct PendingClear
+	{
+		bool active{false};
+		uint32 mip{0};
+		uint32 slice{0};
+		bool isDepth{false};
+		VkClearColorValue color{};
+		VkClearDepthStencilValue depthStencil{};
+		VkImageLayout outputLayout{VK_IMAGE_LAYOUT_GENERAL};
+		VkImageAspectFlags aspect{0}; // for depth: subset of DEPTH/STENCIL actually being cleared
+	};
+	PendingClear m_pendingClear;
+
 	// Mali BC5 workaround: per-compSel baked RGBA8 images. The Mali driver mis-handles
 	// VK_COMPONENT_SWIZZLE_G→alpha for EAC R11G11 views; we work around by decoding the BC5
 	// source CPU-side with the requested compSel baked into RGBA8 data and creating views

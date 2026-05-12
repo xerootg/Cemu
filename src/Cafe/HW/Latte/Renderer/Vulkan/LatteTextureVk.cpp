@@ -116,6 +116,9 @@ LatteTextureVk::~LatteTextureVk()
 {
 	cemu_assert_debug(views.empty());
 
+	if (m_pendingClear.active)
+		m_vkr->texture_notifyDeferredClearTracked_destroy(this);
+
 	m_vkr->surfaceCopy_notifyTextureRelease(this);
 
 	// Release Mali BC5-workaround baked images. These are independent VkImages allocated

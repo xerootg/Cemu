@@ -273,6 +273,19 @@ public:
 	void ClearColorImageRaw(VkImage image, uint32 sliceIndex, uint32 mipIndex, const VkClearColorValue& color, VkImageLayout inputLayout, VkImageLayout outputLayout);
 	void ClearColorImage(LatteTextureVk* vkTexture, uint32 sliceIndex, uint32 mipIndex, const VkClearColorValue& color, VkImageLayout outputLayout);
 
+	// flushes a pending deferred clear (issues a real vkCmdClear*Image). No-op if no pending clear.
+	void texture_flushPendingClear(LatteTextureVk* vkTexture);
+
+	// called when a texture is destroyed to drop it from the pending-clear tracking list
+	void texture_notifyDeferredClearTracked_destroy(LatteTextureVk* vkTexture);
+
+	// drains any remaining deferred clears so they take effect before vkEndCommandBuffer
+	void texture_flushAllPendingClears();
+
+private:
+	std::vector<LatteTextureVk*> m_pendingClearedTextures;
+public:
+
 	void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
 	void CreateDescriptorPool();
 	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);

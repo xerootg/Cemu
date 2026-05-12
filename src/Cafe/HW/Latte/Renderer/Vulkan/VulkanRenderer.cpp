@@ -2199,6 +2199,9 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 {
 	draw_endRenderPass();
 
+	// drain any deferred clears that didn't get folded into a render pass
+	texture_flushAllPendingClears();
+
 	occlusionQuery_notifyEndCommandBuffer();
 
 	vkEndCommandBuffer(m_state.currentCommandBuffer);
@@ -3663,16 +3666,75 @@ VkDescriptorSetInfo::~VkDescriptorSetInfo()
 	m_vkObjDescriptorSet = nullptr;
 }
 
+void VulkanRenderer::texture_notifyDeferredClearTracked_destroy(LatteTextureVk* vkTexture)
+{
+	// O(N) but the list is small in practice. Drop without flushing — the texture is going away.
+	for (auto it = m_pendingClearedTextures.begin(); it != m_pendingClearedTextures.end(); ++it)
+	{
+		if (*it == vkTexture)
+		{
+			m_pendingClearedTextures.erase(it);
+			break;
+		}
+	}
+}
+
+void VulkanRenderer::texture_flushAllPendingClears()
+{
+	if (m_pendingClearedTextures.empty())
+		return;
+	auto pending = std::move(m_pendingClearedTextures);
+	m_pendingClearedTextures.clear();
+	for (auto* tex : pending)
+		texture_flushPendingClear(tex);
+}
+
+void VulkanRenderer::texture_flushPendingClear(LatteTextureVk* vkTexture)
+{
+	if (!vkTexture->m_pendingClear.active)
+		return;
+	auto pending = vkTexture->m_pendingClear;
+	vkTexture->m_pendingClear.active = false;
+	if (pending.isDepth)
+	{
+		// reissue as a normal depth-stencil clear via the same code as texture_clearDepthSlice,
+		// but without the deferral guard (active=false above prevents recursion).
+		auto imageObj = vkTexture->GetImageObj();
+		imageObj->flagForCurrentCommandBuffer();
+
+		VkImageSubresourceLayers subresourceLayers{};
+		subresourceLayers.aspectMask = vkTexture->GetImageAspect();
+		subresourceLayers.mipLevel = pending.mip;
+		subresourceLayers.baseArrayLayer = pending.slice;
+		subresourceLayers.layerCount = 1;
+		draw_endRenderPass();
+		barrier_image<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE, ANY_TRANSFER>(vkTexture, subresourceLayers, VK_IMAGE_LAYOUT_GENERAL);
+
+		VkImageSubresourceRange range{};
+		range.baseMipLevel = pending.mip;
+		range.levelCount = 1;
+		range.baseArrayLayer = pending.slice;
+		range.layerCount = 1;
+		range.aspectMask = pending.aspect;
+		vkCmdClearDepthStencilImage(m_state.currentCommandBuffer, imageObj->m_image, VK_IMAGE_LAYOUT_GENERAL, &pending.depthStencil, 1, &range);
+
+		barrier_image<ANY_TRANSFER, ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE>(vkTexture, subresourceLayers, VK_IMAGE_LAYOUT_GENERAL);
+	}
+	else
+	{
+		ClearColorImage(vkTexture, pending.slice, pending.mip, pending.color, pending.outputLayout);
+	}
+}
+
 void VulkanRenderer::texture_clearSlice(LatteTexture* hostTexture, sint32 sliceIndex, sint32 mipIndex)
 {
-	draw_endRenderPass();
 	auto vkTexture = (LatteTextureVk*)hostTexture;
 	if (vkTexture->isDepth)
 		texture_clearDepthSlice(hostTexture, sliceIndex, mipIndex, true, vkTexture->hasStencil, 0.0f, 0);
 	else
 	{
 		cemu_assert_debug(vkTexture->dim != Latte::E_DIM::DIM_3D);
-		ClearColorImage(vkTexture, sliceIndex, mipIndex, { 0,0,0,0 }, VK_IMAGE_LAYOUT_GENERAL);
+		texture_clearColorSlice(hostTexture, sliceIndex, mipIndex, 0.0f, 0.0f, 0.0f, 0.0f);
 	}
 }
 
@@ -3683,13 +3745,36 @@ void VulkanRenderer::texture_clearColorSlice(LatteTexture* hostTexture, sint32 s
 	{
 		cemu_assert_unimplemented();
 	}
+
+	// defer the clear so the next render pass that uses this slice as a color attachment can
+	// fold it into VkRenderingAttachmentInfoKHR::loadOp = CLEAR. This is only safe under
+	// dynamic_rendering — without it, we have no way to mutate loadOp per pass.
+	if (m_featureControl.deviceExtensions.dynamic_rendering)
+	{
+		auto& pc = vkTexture->m_pendingClear;
+		bool wasInactive = !pc.active;
+		if (pc.active && (pc.mip != (uint32)mipIndex || pc.slice != (uint32)sliceIndex || pc.isDepth))
+		{
+			// different subresource still pending — flush it first so we don't lose it
+			texture_flushPendingClear(vkTexture);
+			wasInactive = true;
+		}
+		pc.active = true;
+		pc.mip = (uint32)mipIndex;
+		pc.slice = (uint32)sliceIndex;
+		pc.isDepth = false;
+		pc.color = { {r, g, b, a} };
+		pc.outputLayout = VK_IMAGE_LAYOUT_GENERAL;
+		if (wasInactive)
+			m_pendingClearedTextures.push_back(vkTexture);
+		return;
+	}
+
 	ClearColorImage(vkTexture, sliceIndex, mipIndex, {r, g, b, a}, VK_IMAGE_LAYOUT_GENERAL);
 }
 
 void VulkanRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 sliceIndex, sint32 mipIndex, bool clearDepth, bool clearStencil, float depthValue, uint32 stencilValue)
 {
-	draw_endRenderPass(); // vkCmdClearDepthStencilImage must not be inside renderpass
-
 	auto vkTexture = (LatteTextureVk*)hostTexture;
 
 	VkImageAspectFlags imageAspect = vkTexture->GetImageAspect();
@@ -3699,6 +3784,31 @@ void VulkanRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 s
 		aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
 	if (clearStencil && (imageAspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0)
 		aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+
+	// defer so the next render pass that attaches this depth slice can fold the clear
+	// into VkRenderingAttachmentInfoKHR::loadOp = CLEAR.
+	if (m_featureControl.deviceExtensions.dynamic_rendering)
+	{
+		auto& pc = vkTexture->m_pendingClear;
+		bool wasInactive = !pc.active;
+		if (pc.active && (pc.mip != (uint32)mipIndex || pc.slice != sliceIndex || !pc.isDepth))
+		{
+			texture_flushPendingClear(vkTexture);
+			wasInactive = true;
+		}
+		pc.active = true;
+		pc.mip = (uint32)mipIndex;
+		pc.slice = sliceIndex;
+		pc.isDepth = true;
+		pc.depthStencil.depth = depthValue;
+		pc.depthStencil.stencil = stencilValue;
+		pc.aspect = aspectMask;
+		if (wasInactive)
+			m_pendingClearedTextures.push_back(vkTexture);
+		return;
+	}
+
+	draw_endRenderPass(); // vkCmdClearDepthStencilImage must not be inside renderpass
 
 	auto imageObj = vkTexture->GetImageObj();
 	imageObj->flagForCurrentCommandBuffer();
@@ -3730,6 +3840,13 @@ void VulkanRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 s
 void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, void* pixelData, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize)
 {
 	auto vkTexture = (LatteTextureVk*)hostTexture;
+	// an upload replaces the slice's content — any deferred clear for this subresource is moot.
+	if (vkTexture->m_pendingClear.active &&
+		vkTexture->m_pendingClear.mip == (uint32)mipIndex &&
+		vkTexture->m_pendingClear.slice == (uint32)sliceIndex)
+	{
+		vkTexture->m_pendingClear.active = false;
+	}
 	auto vkImageObj = vkTexture->GetImageObj();
 	vkImageObj->flagForCurrentCommandBuffer();
 

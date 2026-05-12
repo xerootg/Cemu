@@ -34,6 +34,11 @@ public:
 		return &m_vkRenderingInfo;
 	}
 
+	// mutable access for per-pass loadOp/clearValue fold-in by the renderer
+	VkRenderingAttachmentInfoKHR& GetMutableColorAttachment(uint32 index) { return m_vkColorAttachments[index]; }
+	VkRenderingAttachmentInfoKHR& GetMutableDepthAttachment() { return m_vkDepthAttachment; }
+	VkRenderingAttachmentInfoKHR& GetMutableStencilAttachment() { return m_vkStencilAttachment; }
+
 
 	void TrackDependency(class PipelineInfo* pipelineInfo)
 	{

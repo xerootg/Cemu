@@ -671,6 +671,14 @@ private:
 	std::array<uint32, 128> m_cmdBufferHostMemSnapshotIndices{}; // must match kCommandBufferPoolSize
 	bool m_hostMemSnapshotBufferIsCoherent = false;
 	static constexpr uint32 kHostMemSnapshotPoolSize = 128u * 1024u * 1024u; // 128 MiB
+	// Largest descriptor range we ever bind into the snapshot pool. The uniform
+	// descriptors at VulkanRendererCore.cpp use range = 64 KiB on non-AMD vendors,
+	// and the dynamic offset can be any snapshotOffset returned by the allocator.
+	// To avoid the bound view extending past the buffer's end (Mali aggressively
+	// prefetches the bound range and faults on out-of-buffer pages, surfacing as
+	// DEVICE_LOST on a subsequent submit) the allocator wraps early enough that
+	// snapshotOffset + this constant <= kHostMemSnapshotPoolSize is always true.
+	static constexpr uint32 kHostMemSnapshotDescriptorRange = 1024u * 16u * 4u; // 64 KiB, matches uniformBufferInfo.range
 
 	// texture readback
 	VkBuffer m_textureReadbackBuffer = VK_NULL_HANDLE;

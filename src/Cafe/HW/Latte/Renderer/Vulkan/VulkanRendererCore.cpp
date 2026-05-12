@@ -1661,7 +1661,15 @@ uint32 VulkanRenderer::hostMemSnapshot_allocateAndCopy(MPTR srcAddress, uint32 s
 		}
 		WaitForNextFinishedCommandBuffer();
 	};
-	if (m_hostMemSnapshotWriteIndex + alignedSize > kHostMemSnapshotPoolSize)
+	// Wrap before the last kHostMemSnapshotDescriptorRange bytes of the pool so
+	// that a uniform-buffer descriptor with range=kHostMemSnapshotDescriptorRange,
+	// bound with dynamic-offset == snapshotOffset, never extends past the end of
+	// the buffer. If we let snapshotOffset land in [pool_size - descRange, pool_size)
+	// the GPU's bound view of the buffer would walk past the actual allocation;
+	// Mali aggressively prefetches the bound range, generates an MMU fault on the
+	// out-of-buffer bytes, and surfaces VK_ERROR_DEVICE_LOST on the NEXT submit
+	// (which is why crashes look unrelated to any specific frame).
+	if (m_hostMemSnapshotWriteIndex + alignedSize > kHostMemSnapshotPoolSize - kHostMemSnapshotDescriptorRange)
 	{
 		while (m_hostMemSnapshotReadIndex > m_hostMemSnapshotWriteIndex || m_hostMemSnapshotReadIndex == 0)
 			waitOrSubmit();

@@ -280,6 +280,7 @@ enum
 	// AArch64 specific
 	PPCREC_IML_TYPE_ARM64_NZCV_JCC,
 	PPCREC_IML_TYPE_ARM64_TBZ, // suffix: branch if a single bit of regSrc is (zero|nonzero)
+	PPCREC_IML_TYPE_ARM64_CBZ, // suffix: branch if regSrc is (zero|nonzero); collapses ARM64_CMP #0 + ARM64_NZCV_JCC EQ/NEQ
 };
 
 enum // IMLName
@@ -567,7 +568,8 @@ struct IMLInstruction
 			type == PPCREC_IML_TYPE_CONDITIONAL_JUMP ||
 			type == PPCREC_IML_TYPE_X86_EFLAGS_JCC ||
 			type == PPCREC_IML_TYPE_ARM64_NZCV_JCC ||
-			type == PPCREC_IML_TYPE_ARM64_TBZ)
+			type == PPCREC_IML_TYPE_ARM64_TBZ ||
+			type == PPCREC_IML_TYPE_ARM64_CBZ)
 			return true;
 		return false;
 	}
@@ -875,6 +877,15 @@ struct IMLInstruction
 		this->operation = -999;
 		this->op_arm64_tbz.regSrc = regSrc;
 		this->op_arm64_tbz.bitIndex = bitIndex;
+		this->op_arm64_tbz.mustBeZero = mustBeZero;
+	}
+
+	void make_arm64_cbz(IMLReg regSrc, bool mustBeZero)
+	{
+		this->type = PPCREC_IML_TYPE_ARM64_CBZ;
+		this->operation = -999;
+		this->op_arm64_tbz.regSrc = regSrc;
+		this->op_arm64_tbz.bitIndex = 0; // unused for cbz
 		this->op_arm64_tbz.mustBeZero = mustBeZero;
 	}
 

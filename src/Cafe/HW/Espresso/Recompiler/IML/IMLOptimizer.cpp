@@ -931,6 +931,54 @@ static void IMLOptimizerArm64_SubstituteSingleBitCmpForTBZ(IMLOptimizerRegIOAnal
 	seg.imlList[andIdx].make_no_op();
 }
 
+// Collapse `ARM64_CMP regA, #0; ARM64_NZCV_JCC EQ/NEQ` into a single `ARM64_CBZ regA`
+// (or CBNZ). PPC's `cmpwi r, 0; beq/bne` is the most common branch shape; the
+// NZCV fusion turns it into two host insns (cmp w, #0; b.eq) which cbz/cbnz can
+// fold into one with the same +/-1MB reach.
+//
+// Runs after SubstituteSingleBitCmpForTBZ so the single-bit AND+CMP+JCC pattern
+// gets the cheaper TBZ collapse first. If TBZ already fired, this finds nothing.
+static void IMLOptimizerArm64_SubstituteCmpZeroForCBZ(IMLSegment& seg)
+{
+	if (!seg.HasSuffixInstruction())
+		return;
+	sint32 jccIdx = seg.GetSuffixInstructionIndex();
+	if (jccIdx < 0)
+		return;
+	IMLInstruction& jcc = seg.imlList[jccIdx];
+	if (jcc.type != PPCREC_IML_TYPE_ARM64_NZCV_JCC)
+		return;
+	if (jcc.op_arm64_nzcv_jcc.cond != IMLCondition::EQ && jcc.op_arm64_nzcv_jcc.cond != IMLCondition::NEQ)
+		return;
+
+	// Find the producing ARM64_CMP, #0 immediately before the jcc (skipping no-ops).
+	sint32 cmpIdx = -1;
+	for (sint32 i = jccIdx - 1; i >= 0; --i)
+	{
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_NO_OP)
+			continue;
+		if (seg.imlList[i].type == PPCREC_IML_TYPE_R_S32 &&
+		    seg.imlList[i].operation == PPCREC_IML_OP_ARM64_CMP &&
+		    seg.imlList[i].op_r_immS32.immS32 == 0)
+		{
+			cmpIdx = i;
+		}
+		break;
+	}
+	if (cmpIdx < 0)
+		return;
+	IMLReg regSrc = seg.imlList[cmpIdx].op_r_immS32.regR;
+
+	// cbz fires when reg is zero. b.eq after cmp #0 fires when reg is zero.
+	// So for cond=EQ not-inverted: cbz.
+	bool jccEq = (jcc.op_arm64_nzcv_jcc.cond == IMLCondition::EQ);
+	bool inverted = jcc.op_arm64_nzcv_jcc.invertedCondition;
+	bool mustBeZero = (jccEq != inverted);
+
+	jcc.make_arm64_cbz(regSrc, mustBeZero);
+	seg.imlList[cmpIdx].make_no_op();
+}
+
 void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
 {
 	// Fold lis+addi/ori before DCE so the dead intermediate ADD can be removed.
@@ -946,6 +994,7 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 	// AArch64 specific optimizations
 	IMLOptimizerArm64_SubstituteCJumpForNZCVJump(regIoAnalysis, seg); // late pass: creates invisible NZCV dependency between cmp and branch
 	IMLOptimizerArm64_SubstituteSingleBitCmpForTBZ(regIoAnalysis, seg); // even later: collapse rlwinm.+branch into a single tbz
+	IMLOptimizerArm64_SubstituteCmpZeroForCBZ(seg); // last: collapse cmpwi reg,0+beq/bne into a single cbz/cbnz
 #endif
 }
 

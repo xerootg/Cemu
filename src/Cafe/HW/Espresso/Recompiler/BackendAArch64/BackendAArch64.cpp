@@ -166,12 +166,20 @@ struct TbzJumpInfo
 	bool mustBeZero;
 };
 
+struct CbzJumpInfo
+{
+	IMLSegment* target;
+	WReg regSrc;
+	bool mustBeZero;
+};
+
 using JumpInfo = std::variant<
 	UnconditionalJumpInfo,
 	ConditionalRegJumpInfo,
 	NegativeRegValueJumpInfo,
 	NZCVJumpInfo,
-	TbzJumpInfo>;
+	TbzJumpInfo,
+	CbzJumpInfo>;
 
 struct AArch64GenContext_t : CodeGenerator
 {
@@ -223,6 +231,7 @@ struct AArch64GenContext_t : CodeGenerator
 	void cjump(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
 	void cjump_nzcv(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
 	void cjump_tbz(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
+	void cjump_cbz(IMLInstruction* imlInstruction, IMLSegment* imlSegment);
 	void jump(IMLSegment* imlSegment);
 	void conditionalJumpCycleCheck(IMLSegment* imlSegment);
 
@@ -365,6 +374,33 @@ struct AArch64GenContext_t : CodeGenerator
 			tbnz(jump.regSrc, jump.bitIndex, skipJump);
 		else
 			tbz(jump.regSrc, jump.bitIndex, skipJump);
+		addressOffset -= 4;
+		if (-0x8000000 <= addressOffset && addressOffset <= 0x7ffffff)
+		{
+			b(addressOffset);
+			L(skipJump);
+			return true;
+		}
+		cemu_assert_suspicious();
+		return false;
+	}
+
+	bool handleJump(sint64 addressOffset, const CbzJumpInfo& jump)
+	{
+		// cbz/cbnz reach: +/-1MB. Falls back to inverted cbnz/cbz + b for longer.
+		if (-0x100000 <= addressOffset && addressOffset <= 0xfffff)
+		{
+			if (jump.mustBeZero)
+				cbz(jump.regSrc, addressOffset);
+			else
+				cbnz(jump.regSrc, addressOffset);
+			return true;
+		}
+		Label skipJump;
+		if (jump.mustBeZero)
+			cbnz(jump.regSrc, skipJump);
+		else
+			cbz(jump.regSrc, skipJump);
 		addressOffset -= 4;
 		if (-0x8000000 <= addressOffset && addressOffset <= 0x7ffffff)
 		{
@@ -1028,6 +1064,15 @@ void AArch64GenContext_t::cjump_tbz(IMLInstruction* imlInstruction, IMLSegment* 
 		.target = imlSegment->nextSegmentBranchTaken,
 		.regSrc = gpReg<WReg>(imlInstruction->op_arm64_tbz.regSrc),
 		.bitIndex = imlInstruction->op_arm64_tbz.bitIndex,
+		.mustBeZero = imlInstruction->op_arm64_tbz.mustBeZero,
+	});
+}
+
+void AArch64GenContext_t::cjump_cbz(IMLInstruction* imlInstruction, IMLSegment* imlSegment)
+{
+	prepareJump(CbzJumpInfo{
+		.target = imlSegment->nextSegmentBranchTaken,
+		.regSrc = gpReg<WReg>(imlInstruction->op_arm64_tbz.regSrc),
 		.mustBeZero = imlInstruction->op_arm64_tbz.mustBeZero,
 	});
 }
@@ -2346,6 +2391,10 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 			else if (imlInstruction->type == PPCREC_IML_TYPE_ARM64_TBZ)
 			{
 				aarch64GenContext.cjump_tbz(imlInstruction, segIt);
+			}
+			else if (imlInstruction->type == PPCREC_IML_TYPE_ARM64_CBZ)
+			{
+				aarch64GenContext.cjump_cbz(imlInstruction, segIt);
 			}
 			else if (imlInstruction->type == PPCREC_IML_TYPE_JUMP)
 			{

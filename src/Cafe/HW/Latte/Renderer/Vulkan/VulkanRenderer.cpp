@@ -3963,6 +3963,11 @@ void VulkanRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, 
 	LatteTextureVk* srcVk = static_cast<LatteTextureVk*>(src);
 	LatteTextureVk* dstVk = static_cast<LatteTextureVk*>(dst);
 
+	// flush any deferred clear on either side — vkCmdCopyImage reads/writes the real
+	// VkImage, which has stale (uncleared) content if a clear was deferred.
+	texture_flushPendingClear(srcVk);
+	texture_flushPendingClear(dstVk);
+
 	draw_endRenderPass(); // vkCmdCopyImage must be called outside of a renderpass
 
 	VKRObjectTexture* srcVkObj = srcVk->GetImageObj();

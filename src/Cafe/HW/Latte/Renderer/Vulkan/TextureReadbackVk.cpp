@@ -100,6 +100,7 @@ void LatteTextureReadbackInfoVk::StartTransfer()
 	cemu_assert(m_textureView);
 
 	auto* baseTexture = (LatteTextureVk*)m_textureView->baseTexture;
+	VulkanRenderer::GetInstance()->texture_flushPendingClear(baseTexture);
 	baseTexture->GetImageObj()->flagForCurrentCommandBuffer();
 
 	cemu_assert_debug(m_textureView->firstSlice == 0);

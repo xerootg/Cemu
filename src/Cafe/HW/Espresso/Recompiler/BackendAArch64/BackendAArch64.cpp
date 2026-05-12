@@ -727,18 +727,21 @@ bool AArch64GenContext_t::r_r_s32(IMLInstruction* imlInstruction)
 	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_AND)
 	{
-		mov(TEMP_GPR1.WReg, immS32);
-		and_(regR, regA, TEMP_GPR1.WReg);
+		// and_imm uses the AArch64 logical-immediate encoding when the mask
+		// fits (single host op); falls back to mov+reg-form otherwise. The
+		// old explicit mov+and_ always paid the 2-op cost, even for trivial
+		// masks like 0xFF/0xFFFF/single-bit/contiguous-run that the ISA
+		// encodes directly. Same for orr_imm/eor_imm below. rlwinm's
+		// MB..ME masks are contiguous bit ranges and almost always fit.
+		and_imm(regR, regA, (uint32_t)immS32, TEMP_GPR1.WReg);
 	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_OR)
 	{
-		mov(TEMP_GPR1.WReg, immS32);
-		orr(regR, regA, TEMP_GPR1.WReg);
+		orr_imm(regR, regA, (uint32_t)immS32, TEMP_GPR1.WReg);
 	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_XOR)
 	{
-		mov(TEMP_GPR1.WReg, immS32);
-		eor(regR, regA, TEMP_GPR1.WReg);
+		eor_imm(regR, regA, (uint32_t)immS32, TEMP_GPR1.WReg);
 	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_MULTIPLY_SIGNED)
 	{
@@ -768,6 +771,16 @@ bool AArch64GenContext_t::r_r_s32(IMLInstruction* imlInstruction)
 			bfi(regR, regA, lsb, width);
 		else
 			bfxil(regR, regA, lsb, width);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_UBFX)
+	{
+		// Same lsb/width-1 packing as BFI/BFXIL. ubfx extracts width bits
+		// starting at bit lsb of regA, places them at bit 0 of regR, zero-
+		// extends the rest. Single host op vs the assign+rotate+and-mask
+		// chain the general rlwinm path would emit otherwise.
+		uint32 lsb = (uint32)immS32 & 0x1f;
+		uint32 width = (((uint32)immS32 >> 5) & 0x1f) + 1;
+		ubfx(regR, regA, lsb, width);
 	}
 	else
 	{

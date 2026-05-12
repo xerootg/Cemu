@@ -1190,6 +1190,35 @@ bool PPCRecompilerImlGen_RLWINM(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
 		// SRWI
 		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_RIGHT_SHIFT_U, regA, regS, MB);
 	}
+	else if (SH == 0)
+	{
+		// No rotate, just an AND-mask. Skip the intermediate ASSIGN and emit
+		// a single 3-operand AND-imm so the AArch64 backend's and_imm picks
+		// the logical-immediate encoding (one host op). Top rlwinm shape in
+		// the binary by far is this `SH=0, MB<=ME` "and-mask bits k..l".
+		if (mask == 0xFFFFFFFF)
+		{
+			if (rA != rS)
+				ppcImlGenContext->emitInst().make_r_r(PPCREC_IML_OP_ASSIGN, regA, regS);
+		}
+		else
+		{
+			ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regA, regS, (sint32)mask);
+		}
+	}
+	else if (ME == 31 && MB > 0 && (SH + MB) >= 32)
+	{
+		// AArch64 UBFX shape. After rlwinm with ME=31, the kept window is a
+		// right-aligned (lsb 0) bit field of width 32-MB, sourced from regS
+		// starting at lsb (32-SH) mod 32. UBFX requires lsb+width <= 32,
+		// which is SH+MB >= 32; below that the source range wraps past bit 31
+		// and we have to fall through to the general rotate+mask path.
+		// (SRWI is the SH+MB==32 boundary; we keep its `lsr` fast path above.)
+		sint32 width = 32 - MB;
+		sint32 srcLsb = (32 - SH) & 0x1f;
+		sint32 imm = (srcLsb & 0x1f) | (((width - 1) & 0x1f) << 5);
+		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_ARM64_UBFX, regA, regS, imm);
+	}
 	else
 	{
 		// general handler

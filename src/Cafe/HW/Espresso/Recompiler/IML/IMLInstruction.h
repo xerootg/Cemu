@@ -175,6 +175,12 @@ enum
 	PPCREC_IML_OP_BFI,
 	PPCREC_IML_OP_BFXIL,
 
+	// Unsigned bitfield extract. R_R_S32: regR := zero-extend(regA[lsb+width-1:lsb]).
+	// regR is only written; immS32 uses the same lsb/width-1 packing as BFI/BFXIL.
+	// Lowers to one AArch64 ubfx; catches PPC rlwinm shapes with ME==31 that the
+	// SRWI fast path doesn't cover (SH != 32-MB, so plain LSR can't represent it).
+	PPCREC_IML_OP_ARM64_UBFX,
+
 	PPCREC_IML_OP_INVALID
 };
 

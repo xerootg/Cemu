@@ -2,9 +2,14 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Misc.h"
 #include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
 #include "Cafe/OS/libs/coreinit/coreinit_OSScreen.h"
+#include "Cafe/HW/Espresso/PPCCallback.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/Filesystem/fsc.h"
 #include <pugixml.hpp>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 namespace coreinit
 {
@@ -776,69 +781,198 @@ namespace coreinit
 		return 0;
 	}
 
-	void OSReleaseForeground()
+	// Driver registry. Drivers (GX2, snd_core, etc.) register here on library load and
+	// receive onAcquireForeground / onReleaseForeground callbacks on lifecycle transitions.
+	// Real coreinit sorts by priority ascending and dispatches in that order; we do the same.
+	struct RegisteredDriver
 	{
-		cemuLog_logDebug(LogType::Force, "OSReleaseForeground not implemented");
+		uint32 moduleHandle;
+		sint32 priority;
+		MEMPTR<OSDriverInterface> driverInterface;
+		sint32 driverId;
+	};
+	static std::mutex s_registeredDriversMutex;
+	static std::vector<RegisteredDriver> s_registeredDrivers;
+
+	static void InvokeDriverCallback(MEMPTR<void> fn, const char* phase, uint32 moduleHandle, sint32 priority)
+	{
+		if (!fn)
+			return;
+		cemuLog_log(LogType::Force, "Dispatching {} for driver (module=0x{:08x}, priority={})", phase, moduleHandle, priority);
+		PPCCoreCallback(fn.GetMPTR());
 	}
 
-	bool s_transitionToBackground = false;
-	bool s_transitionToForeground = false;
+	void DispatchOSDriverOnAcquireForeground()
+	{
+		// Snapshot the list under the lock so the actual PPC callbacks run without holding it.
+		std::vector<RegisteredDriver> snapshot;
+		{
+			std::lock_guard lock(s_registeredDriversMutex);
+			snapshot = s_registeredDrivers;
+		}
+		for (auto& drv : snapshot)
+		{
+			if (!drv.driverInterface)
+				continue;
+			InvokeDriverCallback(drv.driverInterface->onAcquireForeground, "onAcquireForeground", drv.moduleHandle, drv.priority);
+		}
+	}
+
+	void DispatchOSDriverOnReleaseForeground()
+	{
+		std::vector<RegisteredDriver> snapshot;
+		{
+			std::lock_guard lock(s_registeredDriversMutex);
+			snapshot = s_registeredDrivers;
+		}
+		for (auto& drv : snapshot)
+		{
+			if (!drv.driverInterface)
+				continue;
+			InvokeDriverCallback(drv.driverInterface->onReleaseForeground, "onReleaseForeground", drv.moduleHandle, drv.priority);
+		}
+	}
+
+	void OSReleaseForeground()
+	{
+		cemuLog_log(LogType::Force, "OSReleaseForeground called");
+		// Real userspace OSReleaseForeground performs a 3-core rendezvous, posts MsgExit for
+		// deferred-exit titles, then issues sc 0x2800 to hand off to the kernel. Cemu's HLE skips
+		// the rendezvous (single emulator thread per PPC core) and routes through the same
+		// trigger as the external "Pause game" debug toggle. Driver dispatch happens on the
+		// receiver side in HandleReceivedSystemMessage so it runs in PPC context.
+		TriggerReleaseForegroundTransition();
+	}
+
+	void OSSavesDone_ReadyToRelease()
+	{
+		// Hardware: sc 0x4900 — kernel sets a "saves flushed" flag the OS waits on before
+		// completing release. Cemu has no kernel-side waiter, so this is effectively a no-op
+		// beyond the log. Games still call it to satisfy the protocol.
+		cemuLog_log(LogType::Force, "OSSavesDone_ReadyToRelease called");
+	}
+
+	std::atomic<bool> s_foregroundReleased{false}; // tracks Cemu-side "released" state
+
+	void TriggerReleaseForegroundTransition()
+	{
+		// Post MsgReleaseForeground directly. This wakes any thread blocked in OSReceiveMessage
+		// on the system queue — including the game's ProcUI loop which expects this message
+		// to arrive asynchronously (not via a polling-style flag check, which is what the old
+		// "set s_transitionToBackground=true" approach effectively was).
+		// Driver onReleaseForeground callbacks are NOT dispatched here because we may be on
+		// the UI thread (no PPC context); dispatch happens in HandleReceivedSystemMessage on
+		// the receiving PPC thread, where PPCCoreCallback can run.
+		//
+		// Idempotent: real games call OSReleaseForeground from inside their own RELEASE callback
+		// (it's the canonical user-side entry point — the OS posts the message in response). If
+		// we re-post on every call we get a feedback loop where the game and our HLE keep
+		// re-triggering release dispatch. Compare-exchange ensures only one message gets queued
+		// per release cycle.
+		bool expected = false;
+		if (!s_foregroundReleased.compare_exchange_strong(expected, true))
+			return;
+		OSMessage msg{};
+		msg.data0 = stdx::to_underlying(SysMessageId::MsgReleaseForeground);
+		msg.data1 = 0; // 1 = system shutting down, 0 = normal background transition
+		OSSendMessage(coreinit::OSGetSystemMessageQueue(), &msg, 0);
+	}
+
+	void TriggerAcquireForegroundTransition()
+	{
+		// Same idempotency story on the acquire side, though in practice games don't have a
+		// corresponding `OSAcquireForeground()` they call directly — the OS posts ACQUIRE on its
+		// own when the title is brought back. Still cheap to guard.
+		bool expected = true;
+		if (!s_foregroundReleased.compare_exchange_strong(expected, false))
+			return;
+		OSMessage msg{};
+		msg.data0 = stdx::to_underlying(SysMessageId::MsgAcquireForeground);
+		msg.data1 = 1;
+		msg.data2 = 1;
+		OSSendMessage(coreinit::OSGetSystemMessageQueue(), &msg, 0);
+	}
 
 	void StartBackgroundForegroundTransition()
 	{
-		s_transitionToBackground = true;
-		s_transitionToForeground = true;
+		// Legacy entry point: fires both transitions back-to-back. Callers (sysapp.cpp,
+		// nn_olv.cpp) use this when they only want to round-trip through ProcUI dispatch
+		// without leaving the title backgrounded.
+		TriggerReleaseForegroundTransition();
+		TriggerAcquireForegroundTransition();
 	}
 
-	// called at the beginning of OSReceiveMessage if the queue is the system message queue
+	bool IsForegroundReleased()
+	{
+		return s_foregroundReleased.load();
+	}
+
+	// called at the beginning of OSReceiveMessage if the queue is the system message queue.
+	// Now a no-op — the old flag-based deferred-post mechanism is replaced by direct posts in
+	// the Trigger* functions above. Kept as a hook in case future code needs to lazily inject
+	// system messages.
 	void UpdateSystemMessageQueue()
 	{
-		if(!OSIsInterruptEnabled())
-			return;
-		cemu_assert_debug(!__OSHasSchedulerLock());
-		// normally syscall 0x2E is used to get the next message
-		// for now we just have some preliminary logic here to allow a fake transition to background & foreground
-		if(s_transitionToBackground)
-		{
-			// add transition to background message
-			OSMessage msg{};
-			msg.data0 = stdx::to_underlying(SysMessageId::MsgReleaseForeground);
-			msg.data1 = 0; // 1 -> System is shutting down 0 -> Begin transitioning to background
-			OSMessageQueue* systemMessageQueue = coreinit::OSGetSystemMessageQueue();
-			if(OSSendMessage(systemMessageQueue, &msg, 0))
-				s_transitionToBackground = false;
-			return;
-		}
-		if(s_transitionToForeground)
-		{
-			// add transition to foreground message
-			OSMessage msg{};
-			msg.data0 = stdx::to_underlying(SysMessageId::MsgAcquireForeground);
-			msg.data1 = 1; // ?
-			msg.data2 = 1; // ?
-			OSMessageQueue* systemMessageQueue = coreinit::OSGetSystemMessageQueue();
-			if(OSSendMessage(systemMessageQueue, &msg, 0))
-				s_transitionToForeground = false;
-			return;
-		}
 	}
 
-	// called when OSReceiveMessage returns a message from the system message queue
+	// called when OSReceiveMessage returns a message from the system message queue.
+	// Runs on the receiving (game) PPC thread context after the message is dequeued, which
+	// is the correct place to invoke OSDriver callbacks via PPCCoreCallback.
 	void HandleReceivedSystemMessage(OSMessage* msg)
 	{
 		cemu_assert_debug(!__OSHasSchedulerLock());
-		cemuLog_log(LogType::Force, "Receiving message: {:08x}", (uint32)msg->data0);
+		const uint32 msgType = msg->data0;
+		cemuLog_log(LogType::Force, "Receiving message: {:08x}", msgType);
+		if (msgType == stdx::to_underlying(SysMessageId::MsgReleaseForeground))
+		{
+			// Drivers go first: GX2 drains the GPU + saves frames, snd_core starts transition audio,
+			// etc. ProcUI's dispatcher will fire the game's own RELEASE callbacks after we return.
+			DispatchOSDriverOnReleaseForeground();
+		}
+		else if (msgType == stdx::to_underlying(SysMessageId::MsgAcquireForeground))
+		{
+			DispatchOSDriverOnAcquireForeground();
+		}
 	}
 
 	uint32 OSDriver_Register(uint32 moduleHandle, sint32 priority, OSDriverInterface* driverCallbacks, sint32 driverId, uint32be* outUkn1, uint32be* outUkn2, uint32be* outUkn3)
 	{
-		cemuLog_logDebug(LogType::Force, "OSDriver_Register stubbed");
+		if (!driverCallbacks)
+		{
+			cemuLog_log(LogType::Force, "OSDriver_Register called with null driverCallbacks");
+			return 0;
+		}
+		std::lock_guard lock(s_registeredDriversMutex);
+		// Replace any existing entry with the same {moduleHandle, driverId} so re-registration
+		// doesn't accumulate duplicates.
+		s_registeredDrivers.erase(
+			std::remove_if(s_registeredDrivers.begin(), s_registeredDrivers.end(),
+				[&](const RegisteredDriver& d) {
+					return d.moduleHandle == moduleHandle && d.driverId == driverId;
+				}),
+			s_registeredDrivers.end());
+		s_registeredDrivers.push_back({moduleHandle, priority, MEMPTR<OSDriverInterface>(driverCallbacks), driverId});
+		std::stable_sort(s_registeredDrivers.begin(), s_registeredDrivers.end(),
+			[](const RegisteredDriver& a, const RegisteredDriver& b) {
+				return a.priority < b.priority;
+			});
+		cemuLog_log(LogType::Force, "OSDriver_Register: module=0x{:08x} priority={} driverId={} total_drivers={}",
+			moduleHandle, priority, driverId, (uint32)s_registeredDrivers.size());
 		return 0;
 	}
 
 	uint32 OSDriver_Deregister(uint32 moduleHandle, sint32 driverId)
 	{
-		cemuLog_logDebug(LogType::Force, "OSDriver_Deregister stubbed");
+		std::lock_guard lock(s_registeredDriversMutex);
+		auto before = s_registeredDrivers.size();
+		s_registeredDrivers.erase(
+			std::remove_if(s_registeredDrivers.begin(), s_registeredDrivers.end(),
+				[&](const RegisteredDriver& d) {
+					return d.moduleHandle == moduleHandle && d.driverId == driverId;
+				}),
+			s_registeredDrivers.end());
+		cemuLog_log(LogType::Force, "OSDriver_Deregister: module=0x{:08x} driverId={} removed={}",
+			moduleHandle, driverId, (uint32)(before - s_registeredDrivers.size()));
 		return 0;
 	}
 
@@ -846,8 +980,11 @@ namespace coreinit
 	{
 		s_currentTitleId = CafeSystem::GetForegroundTitleId();
 		s_sdkVersion = CafeSystem::GetForegroundTitleSDKVersion();
-		s_transitionToBackground = false;
-		s_transitionToForeground = false;
+		s_foregroundReleased.store(false);
+		{
+			std::lock_guard lock(s_registeredDriversMutex);
+			s_registeredDrivers.clear();
+		}
 
 		cafeExportRegister("coreinit", __os_snprintf, LogType::Placeholder);
 
@@ -873,6 +1010,7 @@ namespace coreinit
 		cafeExportRegister("coreinit", OSRestartGame, LogType::Placeholder);
 
 		cafeExportRegister("coreinit", OSReleaseForeground, LogType::Placeholder);
+		cafeExportRegister("coreinit", OSSavesDone_ReadyToRelease, LogType::Placeholder);
 
 		cafeExportRegister("coreinit", OSDriver_Register, LogType::Placeholder);
 		cafeExportRegister("coreinit", OSDriver_Deregister, LogType::Placeholder);

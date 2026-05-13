@@ -401,3 +401,29 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulation_resumeTitle([[maybe_unused]]
 {
 	CafeSystem::ResumeTitle();
 }
+
+// Forward-declarations from coreinit_Misc.h (full header pulls in OSCommon.h baggage we don't need).
+namespace coreinit
+{
+	void TriggerReleaseForegroundTransition();
+	void TriggerAcquireForegroundTransition();
+	bool IsForegroundReleased();
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_triggerReleaseForeground([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	coreinit::TriggerReleaseForegroundTransition();
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_triggerAcquireForeground([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	coreinit::TriggerAcquireForegroundTransition();
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT jboolean JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_isForegroundReleased([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return coreinit::IsForegroundReleased() ? JNI_TRUE : JNI_FALSE;
+}

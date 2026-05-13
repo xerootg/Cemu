@@ -18,6 +18,15 @@
 #endif
 #include "Cafe/OS/libs/nfc/nfc.h"
 #include "Cafe/OS/libs/swkbd/swkbd.h"
+
+// Forward-declare the three foreground-lifecycle hooks the debug menu uses.
+// coreinit_Misc.h pulls in ppc_va_list which we don't need here.
+namespace coreinit
+{
+	void TriggerReleaseForegroundTransition();
+	void TriggerAcquireForegroundTransition();
+	bool IsForegroundReleased();
+}
 #include "wxgui/debugger/DebuggerWindow2.h"
 #include "util/helpers/helpers.h"
 #include "config/CemuConfig.h"
@@ -150,6 +159,7 @@ enum
 	MAINFRAME_MENU_ID_DEBUG_AUDIO_AUX_ONLY,
 	MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS,
 	MAINFRAME_MENU_ID_DEBUG_GPU_CAPTURE,
+	MAINFRAME_MENU_ID_DEBUG_TOGGLE_FOREGROUND_RELEASE,
 
 	// debug->logging
 	MAINFRAME_MENU_ID_DEBUG_LOGGING_MESSAGE = 21499,
@@ -233,6 +243,7 @@ EVT_MENU(MAINFRAME_MENU_ID_DEBUG_RENDER_UPSIDE_DOWN, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_AUDIO_AUX_ONLY, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_GPU_CAPTURE, MainWindow::OnDebugSetting)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TOGGLE_FOREGROUND_RELEASE, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_RAM, MainWindow::OnDebugSetting)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_FST, MainWindow::OnDebugSetting)
 // debug -> View ...
@@ -1031,6 +1042,13 @@ void MainWindow::OnDebugSetting(wxCommandEvent& event)
 {
 	if (event.GetId() == MAINFRAME_MENU_ID_DEBUG_RENDER_UPSIDE_DOWN)
 		GetConfig().render_upside_down = event.IsChecked();
+	else if (event.GetId() == MAINFRAME_MENU_ID_DEBUG_TOGGLE_FOREGROUND_RELEASE)
+	{
+		if (event.IsChecked())
+			coreinit::TriggerReleaseForegroundTransition();
+		else
+			coreinit::TriggerAcquireForegroundTransition();
+	}
 	else if (event.GetId() == MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS)
 	{
 		GetConfig().vk_accurate_barriers = event.IsChecked();
@@ -2367,6 +2385,9 @@ void MainWindow::RecreateMenu()
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_VIEW_AUDIO_DEBUGGER, _("&View audio debugger"));
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_VIEW_TEXTURE_RELATIONS, _("&View texture cache info"));
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_DUMP_RAM, _("&Dump current RAM"));
+
+	auto foregroundReleaseToggle = debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TOGGLE_FOREGROUND_RELEASE, _("&Pause game (release foreground)"));
+	foregroundReleaseToggle->Check(coreinit::IsForegroundReleased());
 	// debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_DUMP_FST, _("&Dump WUD filesystem"))->Enable(false);
 
 	m_menuBar->Append(debugMenu, _("&Debug"));

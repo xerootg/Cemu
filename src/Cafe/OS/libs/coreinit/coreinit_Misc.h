@@ -10,8 +10,25 @@ namespace coreinit
 	uint32 OSRestartGame(uint32 argc, MEMPTR<char>* argv);
 
 	void OSReleaseForeground();
+	void OSSavesDone_ReadyToRelease();
 
+	// Queue a release-foreground transition (game gets MsgReleaseForeground on next system-queue
+	// receive). Use TriggerAcquireForegroundTransition() to bring it back. The combined
+	// StartBackgroundForegroundTransition() fires both, useful only when you don't actually want
+	// to leave the title backgrounded.
+	void TriggerReleaseForegroundTransition();
+	void TriggerAcquireForegroundTransition();
 	void StartBackgroundForegroundTransition();
+
+	// Returns true if the title is currently in the released-foreground state from Cemu's POV
+	// (between TriggerReleaseForegroundTransition and the next TriggerAcquireForegroundTransition).
+	bool IsForegroundReleased();
+
+	// Invokes the onAcquireForeground / onReleaseForeground callback on each registered
+	// OSDriver (GX2, snd_core, etc.) in priority order. Called from UpdateSystemMessageQueue
+	// and from OSReleaseForeground itself.
+	void DispatchOSDriverOnAcquireForeground();
+	void DispatchOSDriverOnReleaseForeground();
 
 	struct OSDriverInterface
 	{

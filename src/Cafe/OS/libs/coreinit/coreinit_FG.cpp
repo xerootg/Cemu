@@ -181,11 +181,160 @@ namespace coreinit
 		osLib_returnFromFunction(hCPU, r ? 1 : 0);
 	}
 
+	// -------------------------------------------------------------------------
+	// Saved frame API (used by GX2's onReleaseForeground to deposit the last rendered
+	// TV+DRC frame so the Home Menu can show them as static "paused" images while the
+	// title is backgrounded). Cemu doesn't emulate the Home Menu, so a real-hardware
+	// faithful implementation isn't needed — these stubs let GX2's driver callback take
+	// its "no frame to save" branch cleanly without crashing.
+	//
+	// Real layout uses bucket areas 2-5 (TV-A, DRC-A, TV-B, DRC-B). If we ever want to
+	// actually display the saved frames (e.g. on Android as a "frozen" placeholder),
+	// upgrade these to write into the bucket regions defined above.
+
+	void __OSSetSavedFrame(uint32 screen, MEMPTR<void> gx2Texture)
+	{
+		cemuLog_logDebug(LogType::Force, "__OSSetSavedFrame(screen={}, tex=0x{:08x}) stubbed", screen, gx2Texture.GetMPTR());
+	}
+
+	void __OSClearSavedFrame(uint32 screen)
+	{
+		cemuLog_logDebug(LogType::Force, "__OSClearSavedFrame(screen={}) stubbed", screen);
+	}
+
+	void __OSResetSavedFrame(uint32 screen)
+	{
+		cemuLog_logDebug(LogType::Force, "__OSResetSavedFrame(screen={}) stubbed", screen);
+	}
+
+	uint32 __OSGetSavedFrame(uint32 screen, MEMPTR<void> /*outTexture*/)
+	{
+		// 0 = no saved frame available. Drives GX2's onReleaseForeground to disable the output.
+		return 0;
+	}
+
+	uint32 __OSGetSavedFrameA(uint32 screen, MEMPTR<void> /*outTexture*/)
+	{
+		return 0;
+	}
+
+	uint32 __OSGetSavedFrameB(uint32 screen, MEMPTR<void> /*outTexture*/)
+	{
+		return 0;
+	}
+
+	uint32 __OSGetSavedFrames(uint32 screen)
+	{
+		return 0;
+	}
+
+	uint32 __OSGetSavedFramesA(uint32 screen)
+	{
+		return 0;
+	}
+
+	uint32 __OSGetSavedFramesB(uint32 screen)
+	{
+		return 0;
+	}
+
+	MEMPTR<void> __OSGetSavedFramePtr(uint32 screen)
+	{
+		return nullptr;
+	}
+
+	MEMPTR<void> __OSGetSavedFramePtrForRead(uint32 screen)
+	{
+		return nullptr;
+	}
+
+	MEMPTR<void> __OSGetSavedFramePtrForWrite(uint32 screen)
+	{
+		return nullptr;
+	}
+
+	void __OSSetSavedFrameGamma(uint32 screen, float gamma)
+	{
+		cemuLog_logDebug(LogType::Force, "__OSSetSavedFrameGamma(screen={}, gamma={}) stubbed", screen, gamma);
+	}
+
+	float __OSGetSavedFrameGammaA(uint32 screen)
+	{
+		return 0.0f;
+	}
+
+	float __OSGetSavedFrameGammaB(uint32 screen)
+	{
+		return 0.0f;
+	}
+
+	// -------------------------------------------------------------------------
+	// Transition audio API. Used by snd_core during foreground→background to seed a DSP
+	// task that plays "bridge" audio so the silence isn't abrupt. The buffer lives in
+	// FG_BUCKET_AREA_AUDIO_TRANSITION (id=1) which is already reserved in the bucket layout.
+
+	static uint32be s_savedAudioFlags = 0;
+	static uint32be s_transitionAudioSize = 0;
+
+	uint32 __OSGetSavedAudioFlags()
+	{
+		return s_savedAudioFlags;
+	}
+
+	void __OSSetSavedAudioFlags(uint32 flags)
+	{
+		s_savedAudioFlags = flags;
+	}
+
+	uint32 __OSGetTransitionAudioBuffer(MEMPTR<void>* outBuffer, uint32be* outSize)
+	{
+		MEMPTR<uint8> area = GetFGMemByArea(FG_BUCKET_AREA_AUDIO_TRANSITION);
+		if (outBuffer)
+			*outBuffer = MEMPTR<void>(area.GetPtr());
+		if (outSize)
+			*outSize = s_transitionAudioSize;
+		return s_transitionAudioSize > 0 ? 1 : 0;
+	}
+
+	void __OSSetTransitionAudioSize(uint32 size)
+	{
+		s_transitionAudioSize = size;
+	}
+
+	uint32 __OSGetTransitionAudioSize()
+	{
+		return s_transitionAudioSize;
+	}
+
 	void InitializeFG()
 	{
 		osLib_addFunction("coreinit", "OSGetForegroundBucket", coreinitExport_OSGetForegroundBucket);
 		cafeExportRegister("coreinit", OSGetForegroundBucket, LogType::CoreinitMem);
 		cafeExportRegister("coreinit", OSGetForegroundBucketFreeArea, LogType::CoreinitMem);
 		osLib_addFunction("coreinit", "OSCopyFromClipboard", coreinitExport_OSCopyFromClipboard);
+
+		// Saved-frame API
+		cafeExportRegister("coreinit", __OSSetSavedFrame, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSClearSavedFrame, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSResetSavedFrame, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrame, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrameA, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrameB, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrames, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFramesA, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFramesB, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFramePtr, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFramePtrForRead, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFramePtrForWrite, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSSetSavedFrameGamma, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrameGammaA, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetSavedFrameGammaB, LogType::Placeholder);
+
+		// Transition audio API
+		cafeExportRegister("coreinit", __OSGetSavedAudioFlags, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSSetSavedAudioFlags, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetTransitionAudioBuffer, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSSetTransitionAudioSize, LogType::Placeholder);
+		cafeExportRegister("coreinit", __OSGetTransitionAudioSize, LogType::Placeholder);
 	}
 }

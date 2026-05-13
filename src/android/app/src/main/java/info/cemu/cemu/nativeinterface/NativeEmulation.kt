@@ -46,6 +46,15 @@ object NativeEmulation {
     external fun resumeTitle()
 
     @JvmStatic
+    external fun triggerReleaseForeground()
+
+    @JvmStatic
+    external fun triggerAcquireForeground()
+
+    @JvmStatic
+    external fun isForegroundReleased(): Boolean
+
+    @JvmStatic
     external fun initializeSystems()
 
     @JvmStatic

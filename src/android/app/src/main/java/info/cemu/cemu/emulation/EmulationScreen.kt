@@ -87,6 +87,7 @@ fun EmulationScreen(
     var showQuitConfirmationDialog by remember { mutableStateOf(false) }
     var inputOverlayInputMode by rememberSaveable { mutableStateOf(DEFAULT) }
     var showEmulatedUSBDevices by remember { mutableStateOf(false) }
+    var showInputSettings by remember { mutableStateOf(false) }
 
     val emulationError by viewModel.emulationError.collectAsState()
     val isEmulationInitialized by viewModel.isEmulationInitialized.collectAsState()
@@ -122,8 +123,8 @@ fun EmulationScreen(
         }
     }
 
-    LaunchedEffect(drawerState.isClosed) {
-        setInputListeningEnabled(drawerState.isClosed)
+    LaunchedEffect(drawerState.isClosed, showInputSettings) {
+        setInputListeningEnabled(drawerState.isClosed && !showInputSettings)
     }
 
     LaunchedEffect(Unit) {
@@ -171,6 +172,15 @@ fun EmulationScreen(
                         onShowEmulatedUSBDevices = {
                             showEmulatedUSBDevices = true
                             closeDrawer()
+                        },
+                        onShowInputSettings = {
+                            showInputSettings = true
+                            closeDrawer()
+                        },
+                        isForegroundReleased = { NativeEmulation.isForegroundReleased() },
+                        onToggleForegroundRelease = { newChecked ->
+                            if (newChecked) NativeEmulation.triggerReleaseForeground()
+                            else NativeEmulation.triggerAcquireForeground()
                         },
                     )
                 }
@@ -241,6 +251,12 @@ fun EmulationScreen(
         )
     }
 
+    if (showInputSettings) {
+        EmulationInputSettingsDialog(
+            onDismiss = { showInputSettings = false },
+        )
+    }
+
     EmulationTextInputDialog()
 }
 
@@ -287,10 +303,26 @@ private fun EmulationSideMenuContent(
     sideMenuState: SideMenuState,
     updateState: (SideMenuState) -> Unit,
     onShowEmulatedUSBDevices: () -> Unit,
+    onShowInputSettings: () -> Unit,
     onEditInputOverlay: () -> Unit,
     onResetInputOverlay: () -> Unit,
     onQuit: () -> Unit,
+    isForegroundReleased: () -> Boolean,
+    onToggleForegroundRelease: (Boolean) -> Unit,
 ) {
+    // Local UI state reflecting the foreground-released latch. We read the native state once
+    // when the side menu composes (i.e. when the user opens the drawer), which is "good enough"
+    // for testing — the drawer dismisses on close and re-reads on open.
+    var foregroundReleased by remember { mutableStateOf(isForegroundReleased()) }
+    CheckboxItem(
+        label = tr("Pause game (test foreground release)"),
+        checked = foregroundReleased,
+        onCheckedChange = {
+            foregroundReleased = it
+            onToggleForegroundRelease(it)
+        },
+    )
+
     CheckboxItem(
         label = tr("Enable motion"),
         checked = sideMenuState.isMotionEnabled,
@@ -312,6 +344,11 @@ private fun EmulationSideMenuContent(
     TextButtonItem(
         label = tr("Emulated USB Devices"),
         onClick = onShowEmulatedUSBDevices,
+    )
+
+    TextButtonItem(
+        label = tr("Input settings"),
+        onClick = onShowInputSettings,
     )
 
     CheckboxItem(

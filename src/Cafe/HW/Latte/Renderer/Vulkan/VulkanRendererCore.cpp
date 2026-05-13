@@ -1685,6 +1685,11 @@ uint32 VulkanRenderer::hostMemSnapshot_allocateAndCopy(MPTR srcAddress, uint32 s
 
 	uint32 snapshotOffset = m_hostMemSnapshotWriteIndex;
 	m_hostMemSnapshotWriteIndex += alignedSize;
+	// Drain pending invalidations from other cores' coherent snoops before reading
+	// the source range. Pairs with the DMB ISH emitted by the producer's DC*Range
+	// HLE (coreinit_Memory.cpp). Without this, AArch64 weak-memory lets the snapshot
+	// see stale data even after the producer has issued DCFlushRange.
+	std::atomic_thread_fence(std::memory_order_seq_cst);
 	memcpy(m_hostMemSnapshotBufferPtr + snapshotOffset, memory_getPointerFromVirtualOffset(srcAddress), size);
 	if (!m_hostMemSnapshotBufferIsCoherent)
 	{

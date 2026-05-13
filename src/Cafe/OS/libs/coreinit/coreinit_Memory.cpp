@@ -5,11 +5,21 @@
 #include "Cafe/GraphicPack/GraphicPack2.h"
 #include "Cafe/CafeSystem.h"
 
+#include <atomic>
+
 namespace coreinit
 {
 
+	// PPC DC{Flush,Store,Invalidate}Range are the game-side promise that prior
+	// CPU writes are visible to other observers (other PPC cores, GPU/DMA).
+	// On AArch64 hosts, without an explicit DMB the producer's stores can sit
+	// in its store buffer past the moment a consumer thread (LatteThread doing
+	// the host-mem snapshot, or GPU command processing) reads the same range,
+	// producing torn / stale reads. emit seq_cst (DMB ISH) on each call.
+
 	void DCInvalidateRange(MPTR addr, uint32 size)
 	{
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		MPTR addrEnd = (addr + size + 0x1F) & ~0x1F;
 		addr &= ~0x1F;
 		//LatteBufferCache_notifyDCFlush(addr, addrEnd - addr);
@@ -17,6 +27,7 @@ namespace coreinit
 
 	void DCFlushRange(MPTR addr, uint32 size)
 	{
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		MPTR addrEnd = (addr + size + 0x1F) & ~0x1F;
 		addr &= ~0x1F;
 		LatteBufferCache_notifyDCFlush(addr, addrEnd - addr);
@@ -24,6 +35,7 @@ namespace coreinit
 
 	void DCFlushRangeNoSync(MPTR addr, uint32 size)
 	{
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		MPTR addrEnd = (addr + size + 0x1F) & ~0x1F;
 		addr &= ~0x1F;
 		LatteBufferCache_notifyDCFlush(addr, addrEnd - addr);
@@ -31,6 +43,7 @@ namespace coreinit
 
 	void DCStoreRange(MPTR addr, uint32 size)
 	{
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		MPTR addrEnd = (addr + size + 0x1F) & ~0x1F;
 		addr &= ~0x1F;
 		//LatteBufferCache_notifyDCFlush(addr, addrEnd - addr);
@@ -38,6 +51,7 @@ namespace coreinit
 
 	void DCStoreRangeNoSync(MPTR addr, uint32 size)
 	{
+		std::atomic_thread_fence(std::memory_order_seq_cst);
 		MPTR addrEnd = (addr + size + 0x1F) & ~0x1F;
 		addr &= ~0x1F;
 		LatteBufferCache_notifyDCFlush(addr, addrEnd - addr);

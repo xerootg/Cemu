@@ -16,6 +16,28 @@ AudioAPIPtr g_padAudio;
 AudioAPIPtr g_portalAudio;
 std::atomic_int32_t g_padVolume = 0;
 
+void AudioPauseForForegroundRelease()
+{
+	std::shared_lock lock(g_audioMutex);
+	if (g_tvAudio)
+		g_tvAudio->Stop();
+	if (g_padAudio)
+		g_padAudio->Stop();
+	if (g_portalAudio)
+		g_portalAudio->Stop();
+}
+
+void AudioResumeForForegroundAcquire()
+{
+	std::shared_lock lock(g_audioMutex);
+	if (g_tvAudio)
+		g_tvAudio->Play();
+	if (g_padAudio)
+		g_padAudio->Play();
+	if (g_portalAudio)
+		g_portalAudio->Play();
+}
+
 uint32 IAudioAPI::s_audioDelay = 2;
 std::array<bool, IAudioAPI::AudioAPIEnd> IAudioAPI::s_availableApis{};
 

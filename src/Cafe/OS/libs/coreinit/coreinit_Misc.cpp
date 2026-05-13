@@ -11,6 +11,11 @@
 #include <mutex>
 #include <vector>
 
+// Defined in src/audio/IAudioAPI.cpp. Forward-declared instead of including the
+// header so we don't pull the audio subsystem types into coreinit's translation unit.
+void AudioPauseForForegroundRelease();
+void AudioResumeForForegroundAcquire();
+
 namespace coreinit
 {
 	sint32 ppc_vcprintf_pad(char* strOut, sint32 maxLength, sint32 padLength, char padChar)
@@ -928,10 +933,16 @@ namespace coreinit
 			// Drivers go first: GX2 drains the GPU + saves frames, snd_core starts transition audio,
 			// etc. ProcUI's dispatcher will fire the game's own RELEASE callbacks after we return.
 			DispatchOSDriverOnReleaseForeground();
+			// Cemu's snd_core HLE doesn't register an OSDriver in practice (verified via
+			// OSDriver_Register logs on Wind Waker HD — only GX2 registers). So the
+			// dispatch above silences GPU but not audio. Pause the host audio backend
+			// (Cubeb/Oboe streams) directly here as a backstop.
+			AudioPauseForForegroundRelease();
 		}
 		else if (msgType == stdx::to_underlying(SysMessageId::MsgAcquireForeground))
 		{
 			DispatchOSDriverOnAcquireForeground();
+			AudioResumeForForegroundAcquire();
 		}
 	}
 

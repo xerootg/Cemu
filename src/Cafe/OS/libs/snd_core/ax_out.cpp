@@ -5,6 +5,12 @@
 //#include "ax.h"
 #include "config/CemuConfig.h"
 
+// Forward-declared so we don't pull coreinit_Misc.h (which has unrelated dependencies).
+// Returns true while the title is in the foreground-released state; the AX update loop
+// uses this to skip its 3ms "force Play()" cycle, otherwise our AudioPauseForForegroundRelease()
+// Stop() gets undone on the very next AX tick.
+namespace coreinit { bool IsForegroundReleased(); }
+
 namespace snd_core
 {
 	uint32 numProcessedFrames = 0;
@@ -448,6 +454,12 @@ namespace snd_core
 
 	void AXOut_updateDevicePlayState(bool isPlaying)
 	{
+		// If the title has released the foreground, do not let the AX update loop
+		// reanimate the host audio streams. coreinit::HandleReceivedSystemMessage has
+		// already called Stop() on the backends; this guard makes that sticky.
+		// Stop requests are always honored so an explicit teardown still works.
+		if (isPlaying && coreinit::IsForegroundReleased())
+			return;
 		std::shared_lock lock(g_audioMutex);
 		if (g_tvAudio)
 		{

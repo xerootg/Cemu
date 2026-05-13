@@ -105,3 +105,12 @@ extern AudioAPIPtr g_padAudio;
 extern std::atomic_int32_t g_padVolume;
 
 extern AudioAPIPtr g_portalAudio;
+
+// Stop / resume the host audio output streams when the title is backgrounded /
+// foregrounded by coreinit's foreground-release lifecycle. Calls Stop()/Play() on
+// every active output (TV, PAD, portal) under g_audioMutex. Real snd_core would
+// drive this via its own OSDriver onRelease/onAcquire callback, but Cemu's
+// snd_core HLE doesn't currently register one — so coreinit's HandleReceivedSystemMessage
+// gates the host backend directly instead.
+void AudioPauseForForegroundRelease();
+void AudioResumeForForegroundAcquire();

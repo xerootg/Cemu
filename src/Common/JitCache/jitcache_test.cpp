@@ -1,20 +1,31 @@
-// Standalone unit tests for the JitCache library (Phase 1a).
+// Standalone unit tests for the JitCache library.
 //
-// Build + run (from the repo root):
+// Build + run (from the repo root, requires system xxhash):
 //   g++ -std=c++20 -Wall -Wextra -O2
 //       -Isrc/Common/JitCache
 //       src/Common/JitCache/JitCache.cpp
 //       src/Common/JitCache/jitcache_test.cpp
-//       -o /tmp/jitcache_test
+//       -lxxhash -o /tmp/jitcache_test
 //   /tmp/jitcache_test
 //
 // Exit status 0 = all tests passed.
 
 #include "JitCache.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <unordered_map>
+
+#if defined(_WIN32)
+	#include <process.h>
+	#define jc_test_getpid() (static_cast<int>(_getpid()))
+#else
+	#include <unistd.h>
+	#define jc_test_getpid() (static_cast<int>(getpid()))
+#endif
 
 namespace
 {
@@ -279,6 +290,272 @@ void test_symbol_interning()
 	CHECK(*cache.symbolName(b) == "bar");
 }
 
+// ---- persistence helpers ------------------------------------------------
+
+namespace fs = std::filesystem;
+
+fs::path makeTempCacheDir()
+{
+	// Use a process-id+counter-derived subdir so concurrent test runs
+	// don't trample each other. Deletes any previous contents.
+	static std::atomic<unsigned> counter{0};
+	unsigned id = counter.fetch_add(1, std::memory_order_relaxed);
+	fs::path p = fs::temp_directory_path() / ("jitcache_test_" + std::to_string(jc_test_getpid()) + "_" + std::to_string(id));
+	std::error_code ec;
+	fs::remove_all(p, ec);
+	fs::create_directories(p, ec);
+	return p;
+}
+
+// Helper: build an EmittedCode with a 4-insn movz/movk sequence + one
+// EmbeddedValue reloc targeting `target`. Used by persistence tests.
+jitcache::EmittedCode makeEmbeddedValueEntry(uint64_t target)
+{
+	jitcache::EmittedCode e;
+	e.hostBytes.resize(16, 0);
+	uint32_t ops[4] = {0xD2800009, 0xF2A00009, 0xF2C00009, 0xF2E00009};
+	std::memcpy(e.hostBytes.data(), ops, sizeof(ops));
+	jitcache::Reloc r{};
+	r.codeOffset = 0;
+	r.kind = jitcache::RelocKind::Aarch64_MovzMovk_Abs64;
+	r.targetKind = jitcache::TargetKind::EmbeddedValue;
+	r.targetId = target;
+	e.relocs.push_back(r);
+	return e;
+}
+
+void test_persistence_roundtrip_basic()
+{
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc1 = {0x60, 0x00, 0x00, 0x00};
+	std::vector<uint8_t> ppc2 = {0x4E, 0x80, 0x00, 0x20};
+	std::vector<uint8_t> ppc3 = {0x38, 0x60, 0x00, 0x00, 0x4E, 0x80, 0x00, 0x20};
+
+	jitcache::FunctionKey k1{}, k2{}, k3{};
+	k1.codegenVersion = 1; k1.moduleId = 0xAAAA; k1.ppcEntryAddr = 0x100;
+	k1.ppcBytes = ppc1.data(); k1.ppcLen = ppc1.size();
+	k2.codegenVersion = 1; k2.moduleId = 0xAAAA; k2.ppcEntryAddr = 0x200;
+	k2.ppcBytes = ppc2.data(); k2.ppcLen = ppc2.size();
+	k3.codegenVersion = 1; k3.moduleId = 0xAAAA; k3.ppcEntryAddr = 0x300;
+	k3.ppcBytes = ppc3.data(); k3.ppcLen = ppc3.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		CHECK(c.entryCount() == 0);
+		c.insert(k1, makeEmbeddedValueEntry(0x1111111122222222ULL));
+		c.insert(k2, makeEmbeddedValueEntry(0x3333333344444444ULL));
+		c.insert(k3, makeEmbeddedValueEntry(0x5555555566666666ULL));
+		CHECK(c.flush());
+	}
+
+	// Fresh Cache reading the same dir should see all three entries.
+	jitcache::Cache c2;
+	c2.load(dir);
+	CHECK(c2.entryCount() == 3);
+
+	NullResolver r;
+	jitcache::EmittedCode out;
+	CHECK(c2.lookup(k1, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0x1111111122222222ULL);
+	CHECK(c2.lookup(k2, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0x3333333344444444ULL);
+	CHECK(c2.lookup(k3, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0x5555555566666666ULL);
+
+	fs::remove_all(dir);
+}
+
+void test_persistence_symbol_table_roundtrip()
+{
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc = {0x60, 0x00, 0x00, 0x00};
+	jitcache::FunctionKey k{};
+	k.codegenVersion = 1; k.moduleId = 0xBEEF; k.ppcEntryAddr = 0x1000;
+	k.ppcBytes = ppc.data(); k.ppcLen = ppc.size();
+
+	uint64_t symA = 0, symB = 0;
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		symA = c.internSymbol("OSWakeOneSender");
+		symB = c.internSymbol("OSWakeOneReceiver");
+		CHECK(symA != 0);
+		CHECK(symB != 0);
+		CHECK(symA != symB);
+
+		jitcache::EmittedCode e;
+		e.hostBytes.resize(16, 0);
+		uint32_t ops[4] = {0xD2800009, 0xF2A00009, 0xF2C00009, 0xF2E00009};
+		std::memcpy(e.hostBytes.data(), ops, sizeof(ops));
+		jitcache::Reloc r{};
+		r.codeOffset = 0;
+		r.kind = jitcache::RelocKind::Aarch64_MovzMovk_Abs64;
+		r.targetKind = jitcache::TargetKind::RuntimeSymbol;
+		r.targetId = symA;
+		e.relocs.push_back(r);
+
+		c.insert(k, e);
+		CHECK(c.flush());
+	}
+
+	jitcache::Cache c2;
+	c2.load(dir);
+
+	// Symbol ids should round-trip; their string contents must match.
+	const std::string* nameA = c2.symbolName(symA);
+	const std::string* nameB = c2.symbolName(symB);
+	CHECK(nameA != nullptr);
+	CHECK(nameB != nullptr);
+	CHECK(*nameA == "OSWakeOneSender");
+	CHECK(*nameB == "OSWakeOneReceiver");
+
+	// Re-interning the same names returns the same ids.
+	CHECK(c2.internSymbol("OSWakeOneSender") == symA);
+	CHECK(c2.internSymbol("OSWakeOneReceiver") == symB);
+
+	// Lookup with a resolver that maps symA to a known host pointer.
+	MapResolver resolver;
+	const uint64_t kHostAddr = 0xCAFEBABEDEADBEEFULL;
+	resolver.symbols[symA] = kHostAddr;
+	jitcache::EmittedCode out;
+	CHECK(c2.lookup(k, resolver, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == kHostAddr);
+
+	fs::remove_all(dir);
+}
+
+void test_persistence_version_mismatch_wipes()
+{
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc = {0x60, 0x00, 0x00, 0x00};
+	jitcache::FunctionKey k{};
+	k.codegenVersion = 1; k.moduleId = 0xC0DE; k.ppcEntryAddr = 0x2000;
+	k.ppcBytes = ppc.data(); k.ppcLen = ppc.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		c.insert(k, makeEmbeddedValueEntry(0x7777777788888888ULL));
+		CHECK(c.flush());
+	}
+	CHECK(fs::exists(dir / "manifest.bin"));
+	CHECK(fs::exists(dir / "code.bin"));
+
+	// Corrupt the manifest version field. The on-disk layout puts
+	// cacheFormatVersion at byte offset 8 (right after the 8-byte magic).
+	{
+		std::fstream f(dir / "manifest.bin", std::ios::binary | std::ios::in | std::ios::out);
+		CHECK(f.is_open());
+		f.seekp(8);
+		uint32_t bogus = 0xDEADBEEF;
+		f.write(reinterpret_cast<const char*>(&bogus), sizeof(bogus));
+	}
+
+	jitcache::Cache c2;
+	c2.load(dir);
+	CHECK(c2.entryCount() == 0);
+	CHECK(!fs::exists(dir / "manifest.bin"));
+	CHECK(!fs::exists(dir / "code.bin"));
+
+	fs::remove_all(dir);
+}
+
+void test_persistence_bad_magic_wipes()
+{
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc = {0x60, 0x00, 0x00, 0x00};
+	jitcache::FunctionKey k{};
+	k.codegenVersion = 1; k.moduleId = 0xC0DE; k.ppcEntryAddr = 0x3000;
+	k.ppcBytes = ppc.data(); k.ppcLen = ppc.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		c.insert(k, makeEmbeddedValueEntry(0xAAAAAAAA00000000ULL));
+		CHECK(c.flush());
+	}
+	{
+		std::fstream f(dir / "manifest.bin", std::ios::binary | std::ios::in | std::ios::out);
+		CHECK(f.is_open());
+		f.seekp(0);
+		const char bogus[8] = {'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X'};
+		f.write(bogus, sizeof(bogus));
+	}
+
+	jitcache::Cache c2;
+	c2.load(dir);
+	CHECK(c2.entryCount() == 0);
+	CHECK(!fs::exists(dir / "manifest.bin"));
+
+	fs::remove_all(dir);
+}
+
+void test_persistence_orphan_file_wipes()
+{
+	// If only manifest.bin or only code.bin exists, treat that as a
+	// half-written state and wipe.
+	fs::path dir = makeTempCacheDir();
+	{
+		std::ofstream f(dir / "manifest.bin", std::ios::binary);
+		f << "anything";
+	}
+	jitcache::Cache c;
+	c.load(dir);
+	CHECK(c.entryCount() == 0);
+	CHECK(!fs::exists(dir / "manifest.bin"));
+	CHECK(!fs::exists(dir / "code.bin"));
+	fs::remove_all(dir);
+}
+
+void test_persistence_flush_is_deterministic()
+{
+	fs::path dirA = makeTempCacheDir();
+	fs::path dirB = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc1 = {0x60, 0x00, 0x00, 0x00};
+	std::vector<uint8_t> ppc2 = {0x4E, 0x80, 0x00, 0x20};
+
+	jitcache::FunctionKey k1{}, k2{};
+	k1.codegenVersion = 1; k1.moduleId = 0xDEAD; k1.ppcEntryAddr = 0x100;
+	k1.ppcBytes = ppc1.data(); k1.ppcLen = ppc1.size();
+	k2.codegenVersion = 1; k2.moduleId = 0xDEAD; k2.ppcEntryAddr = 0x200;
+	k2.ppcBytes = ppc2.data(); k2.ppcLen = ppc2.size();
+
+	{
+		jitcache::Cache a;
+		a.load(dirA);
+		a.insert(k1, makeEmbeddedValueEntry(0x1ULL));
+		a.insert(k2, makeEmbeddedValueEntry(0x2ULL));
+		CHECK(a.flush());
+	}
+	{
+		jitcache::Cache b;
+		b.load(dirB);
+		b.insert(k2, makeEmbeddedValueEntry(0x2ULL)); // reverse insert order
+		b.insert(k1, makeEmbeddedValueEntry(0x1ULL));
+		CHECK(b.flush());
+	}
+
+	auto readBytes = [](const fs::path& p) {
+		std::ifstream f(p, std::ios::binary);
+		return std::vector<char>(std::istreambuf_iterator<char>(f), {});
+	};
+	auto manA = readBytes(dirA / "manifest.bin");
+	auto manB = readBytes(dirB / "manifest.bin");
+	auto codA = readBytes(dirA / "code.bin");
+	auto codB = readBytes(dirB / "code.bin");
+	CHECK(manA == manB);
+	CHECK(codA == codB);
+
+	fs::remove_all(dirA);
+	fs::remove_all(dirB);
+}
+
 void test_insert_lookup_with_relocs_full_pipeline()
 {
 	jitcache::Cache cache;
@@ -345,6 +622,13 @@ int main()
 	test_reloc_codeOffset_bounds_check();
 	test_symbol_interning();
 	test_insert_lookup_with_relocs_full_pipeline();
+
+	test_persistence_roundtrip_basic();
+	test_persistence_symbol_table_roundtrip();
+	test_persistence_version_mismatch_wipes();
+	test_persistence_bad_magic_wipes();
+	test_persistence_orphan_file_wipes();
+	test_persistence_flush_is_deterministic();
 
 	std::printf("jitcache_test: %d assertions, %d failures\n",
 	            g_assertions, g_failures);

@@ -173,6 +173,7 @@ find_package(OpenSSL COMPONENTS Crypto SSL REQUIRED)
 find_package(glm REQUIRED)
 find_package(fmt 9 REQUIRED)
 find_package(PNG REQUIRED)
+find_package(xxHash CONFIG REQUIRED)
 
 # glslang versions older than 11.11.0 define targets without a namespace
 if (NOT TARGET glslang::SPIRV AND TARGET SPIRV)

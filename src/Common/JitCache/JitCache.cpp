@@ -1,7 +1,29 @@
 #include "JitCache.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <unordered_map>
+#include <utility>
+
+#include <xxhash.h>
+
+#if defined(_WIN32)
+	#include <io.h>
+	#define jc_fileno _fileno
+	#define jc_fsync(fd) _commit(fd)
+#else
+	#include <unistd.h>
+	#define jc_fileno fileno
+	#define jc_fsync(fd) fsync(fd)
+#endif
+
+// Local fs alias -- mirror of the one in Cemu's precompiled.h, but defined
+// here too so the library is buildable standalone (no Cemu precompiled
+// header required).
+namespace fs = std::filesystem;
 
 namespace jitcache
 {
@@ -9,90 +31,56 @@ namespace jitcache
 namespace
 {
 
-// FNV-1a 128. Placeholder; Phase 1b swaps in XXH3-128 from xxhash and bumps
-// kCacheFormatVersion. Chosen now only because it has no external deps and
-// is straightforward to verify by hand against the spec.
+// --- On-disk layout -------------------------------------------------------
 //
-// offset_basis = 0x6c62272e07bb014262b821756295c58d
-// prime        = 0x0000000001000000000000000000013b
-struct Fnv1a128
+// Two files under the attached directory: manifest.bin and code.bin.
+//
+// manifest.bin:
+//   ManifestHeader
+//   FunctionRecord[entryCount]           (sorted by fingerprint)
+//   symbol table:
+//     for each symbol: uint32 nameLen, char name[nameLen]
+//   (symbol id 0 is implicit and not stored.)
+//
+// code.bin: concatenation of, per entry (in the same order as manifest):
+//   uint8 hostBytes[codeSize]
+//   Reloc  relocs[relocCount]
+//
+// Both files are written atomically: write to .tmp, fsync, rename. The
+// rename targets are stable so a partial state on disk is never readable
+// by a subsequent load.
+//
+// Bumping kCacheFormatVersion (or its prefix string below) invalidates
+// every on-disk cache.
+
+constexpr char kManifestMagic[8] = {'J', 'I', 'T', 'C', 'A', 'C', 'H', '1'};
+
+struct ManifestHeader
 {
-	uint64_t lo = 0x62b821756295c58dULL;
-	uint64_t hi = 0x6c62272e07bb0142ULL;
-
-	void update(const void* data, size_t len) noexcept
-	{
-		auto* p = static_cast<const uint8_t*>(data);
-		for (size_t i = 0; i < len; ++i)
-		{
-			lo ^= static_cast<uint64_t>(p[i]);
-			mulPrime();
-		}
-	}
-
-	// (hi:lo) *= prime, where prime = (0x01000000 << 64) | 0x13B.
-	// Expanded:
-	//   new_lo = lo * 0x13B
-	//   new_hi = hi * 0x13B + lo * 0x01000000 (the contribution that crosses
-	//            the boundary; the high-half multiplications above bit 96
-	//            wrap and vanish modulo 2^128).
-	// We also need the carry from lo * 0x13B's high 64 bits into hi.
-	void mulPrime() noexcept
-	{
-		constexpr uint64_t LOW_PRIME = 0x13BULL;
-		// lo * LOW_PRIME -> 128-bit intermediate (carry_lo : new_lo)
-		uint64_t new_lo;
-		uint64_t carry_lo;
-		mul64(lo, LOW_PRIME, new_lo, carry_lo);
-		// hi * LOW_PRIME contributes to the new hi; we don't need its high
-		// half because anything above bit 128 is discarded modulo 2^128.
-		uint64_t hi_low_contrib = hi * LOW_PRIME;
-		// lo * (1 << 88) contributes lo's bits to hi (specifically, lo's
-		// low 40 bits land in hi[63:24]). Bits above that wrap past 2^128.
-		uint64_t lo_high_contrib = lo << 24;
-		hi = hi_low_contrib + carry_lo + lo_high_contrib;
-		lo = new_lo;
-	}
-
-	// 64x64 -> 128 unsigned multiply, returning (low, high).
-	static void mul64(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) noexcept
-	{
-#if defined(__SIZEOF_INT128__)
-		__uint128_t r = static_cast<__uint128_t>(a) * static_cast<__uint128_t>(b);
-		lo = static_cast<uint64_t>(r);
-		hi = static_cast<uint64_t>(r >> 64);
-#else
-		uint64_t a0 = a & 0xFFFFFFFFULL, a1 = a >> 32;
-		uint64_t b0 = b & 0xFFFFFFFFULL, b1 = b >> 32;
-		uint64_t ll = a0 * b0;
-		uint64_t lh = a0 * b1;
-		uint64_t hl = a1 * b0;
-		uint64_t hh = a1 * b1;
-		uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFULL) + (hl & 0xFFFFFFFFULL);
-		lo = (ll & 0xFFFFFFFFULL) | (mid << 32);
-		hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
-#endif
-	}
+	char magic[8];
+	uint32_t cacheFormatVersion;
+	uint32_t reserved;
+	uint64_t entryCount;
+	uint64_t symbolCount;
+	uint64_t symbolTableOffset; // byte offset within manifest.bin
+	uint64_t symbolTableSize;   // bytes
+	uint64_t codeBinSize;       // expected size of code.bin in bytes
 };
+static_assert(sizeof(ManifestHeader) == 56, "ManifestHeader layout is part of the on-disk format");
 
-struct FingerprintHash
+struct FunctionRecord
 {
-	size_t operator()(const Fingerprint& fp) const noexcept
-	{
-		// XOR-fold the 128-bit fingerprint into a size_t. The fingerprint
-		// is already well-distributed; further mixing here adds nothing.
-		return static_cast<size_t>(fp.lo ^ fp.hi);
-	}
+	Fingerprint fingerprint; // 16 bytes
+	uint64_t codeOffset;     // offset within code.bin
+	uint64_t codeSize;
+	uint64_t relocOffset;    // offset within code.bin (immediately after code)
+	uint32_t relocCount;
+	uint32_t reserved;
 };
+static_assert(sizeof(FunctionRecord) == 48, "FunctionRecord layout is part of the on-disk format");
 
-// AArch64 move-wide immediate field layout, applied to a uint32 instruction:
-//   bits [31]     sf  (1 = 64-bit)
-//   bits [30:29]  opc (10 = movz, 11 = movk)
-//   bits [28:23]  100101
-//   bits [22:21]  hw  (shift = hw*16)
-//   bits [20:5]   imm16
-//   bits [4:0]    Rd
-// Patching imm16 = clear bits 20..5, OR in the new 16-bit immediate << 5.
+// --- AArch64 movz/movk patching ------------------------------------------
+
 constexpr uint32_t kMovWideImm16Mask = 0x001FFFE0u;
 
 void patchMovzMovkAbs64(uint8_t* code, uint64_t value) noexcept
@@ -105,6 +93,60 @@ void patchMovzMovkAbs64(uint8_t* code, uint64_t value) noexcept
 		insn = (insn & ~kMovWideImm16Mask) | (static_cast<uint32_t>(imm16) << 5);
 		std::memcpy(code + chunk * 4, &insn, sizeof(insn));
 	}
+}
+
+// --- Fingerprint hash ----------------------------------------------------
+
+struct XXH3StateGuard
+{
+	XXH3_state_t* s;
+	XXH3StateGuard() : s(XXH3_createState()) {}
+	~XXH3StateGuard()
+	{
+		if (s)
+			XXH3_freeState(s);
+	}
+	XXH3StateGuard(const XXH3StateGuard&) = delete;
+	XXH3StateGuard& operator=(const XXH3StateGuard&) = delete;
+};
+
+struct FingerprintHash
+{
+	size_t operator()(const Fingerprint& fp) const noexcept
+	{
+		return static_cast<size_t>(fp.lo ^ fp.hi);
+	}
+};
+
+// --- I/O helpers ---------------------------------------------------------
+
+struct FileCloser
+{
+	void operator()(FILE* f) const noexcept
+	{
+		if (f)
+			std::fclose(f);
+	}
+};
+using FileHandle = std::unique_ptr<FILE, FileCloser>;
+
+bool writeAll(FILE* f, const void* data, size_t bytes)
+{
+	return std::fwrite(data, 1, bytes, f) == bytes;
+}
+
+bool readAll(FILE* f, void* data, size_t bytes)
+{
+	return std::fread(data, 1, bytes, f) == bytes;
+}
+
+void wipeCacheFiles(const fs::path& dir) noexcept
+{
+	std::error_code ec;
+	fs::remove(dir / "manifest.bin", ec);
+	fs::remove(dir / "code.bin", ec);
+	fs::remove(dir / "manifest.bin.tmp", ec);
+	fs::remove(dir / "code.bin.tmp", ec);
 }
 
 } // namespace
@@ -139,7 +181,6 @@ bool applyRelocs(uint8_t* hostBytes, size_t hostSize,
 		switch (r.kind)
 		{
 		case RelocKind::Aarch64_MovzMovk_Abs64:
-			// 4 instructions x 4 bytes; codeOffset is the first movz.
 			if (static_cast<size_t>(r.codeOffset) + 16 > hostSize)
 				return false;
 			patchMovzMovkAbs64(hostBytes + r.codeOffset, value);
@@ -151,44 +192,312 @@ bool applyRelocs(uint8_t* hostBytes, size_t hostSize,
 	return true;
 }
 
+// --- Cache::Impl ---------------------------------------------------------
+
 struct Cache::Impl
 {
 	std::unordered_map<Fingerprint, EmittedCode, FingerprintHash> entries;
 	std::vector<std::string> symbolNames; // index 0 reserved (empty)
 	std::unordered_map<std::string, uint64_t> symbolIds;
+	fs::path cacheDir; // empty -> not attached
 
 	Impl()
 	{
 		symbolNames.emplace_back(); // id 0 -> ""
 	}
+
+	// Load on-disk state from cacheDir into in-memory tables. Returns
+	// false if the cache was missing, version-mismatched, or corrupt --
+	// in which case both files are wiped and the cache stays empty but
+	// usable. Never throws.
+	bool loadFromDisk() noexcept
+	{
+		const fs::path manifestPath = cacheDir / "manifest.bin";
+		const fs::path codePath = cacheDir / "code.bin";
+
+		FileHandle manifest(std::fopen(manifestPath.string().c_str(), "rb"));
+		FileHandle codeFile(std::fopen(codePath.string().c_str(), "rb"));
+		if (!manifest || !codeFile)
+		{
+			// Missing is not an error -- a freshly-attached cache is empty.
+			// But if exactly one of the two files exists, treat that as
+			// corrupt and wipe both for consistency.
+			if (static_cast<bool>(manifest) != static_cast<bool>(codeFile))
+				wipeCacheFiles(cacheDir);
+			return false;
+		}
+
+		ManifestHeader header{};
+		if (!readAll(manifest.get(), &header, sizeof(header)))
+		{
+			wipeCacheFiles(cacheDir);
+			return false;
+		}
+		if (std::memcmp(header.magic, kManifestMagic, sizeof(kManifestMagic)) != 0
+		    || header.cacheFormatVersion != kCacheFormatVersion)
+		{
+			wipeCacheFiles(cacheDir);
+			return false;
+		}
+
+		// Verify code.bin's size matches what the manifest expects --
+		// catches a half-written code.bin paired with a stale manifest.
+		std::error_code ec;
+		const uint64_t codeBinSize = static_cast<uint64_t>(fs::file_size(codePath, ec));
+		if (ec || codeBinSize != header.codeBinSize)
+		{
+			wipeCacheFiles(cacheDir);
+			return false;
+		}
+
+		std::vector<FunctionRecord> records(header.entryCount);
+		if (header.entryCount
+		    && !readAll(manifest.get(), records.data(),
+		                records.size() * sizeof(FunctionRecord)))
+		{
+			wipeCacheFiles(cacheDir);
+			return false;
+		}
+
+		// Read the symbol table.
+		if (std::fseek(manifest.get(),
+		               static_cast<long>(header.symbolTableOffset),
+		               SEEK_SET) != 0)
+		{
+			wipeCacheFiles(cacheDir);
+			return false;
+		}
+		std::vector<std::string> loadedSymbols;
+		loadedSymbols.reserve(header.symbolCount + 1);
+		loadedSymbols.emplace_back(); // id 0
+		for (uint64_t i = 0; i < header.symbolCount; ++i)
+		{
+			uint32_t nameLen = 0;
+			if (!readAll(manifest.get(), &nameLen, sizeof(nameLen)))
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
+			std::string name(nameLen, '\0');
+			if (nameLen && !readAll(manifest.get(), name.data(), nameLen))
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
+			loadedSymbols.push_back(std::move(name));
+		}
+
+		// Read every entry's code + relocs from code.bin.
+		std::unordered_map<Fingerprint, EmittedCode, FingerprintHash> loadedEntries;
+		loadedEntries.reserve(records.size());
+		for (const FunctionRecord& rec : records)
+		{
+			if (std::fseek(codeFile.get(),
+			               static_cast<long>(rec.codeOffset),
+			               SEEK_SET) != 0)
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
+			EmittedCode ec_local;
+			ec_local.hostBytes.resize(rec.codeSize);
+			if (rec.codeSize
+			    && !readAll(codeFile.get(), ec_local.hostBytes.data(), rec.codeSize))
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
+			ec_local.relocs.resize(rec.relocCount);
+			if (rec.relocCount
+			    && !readAll(codeFile.get(), ec_local.relocs.data(),
+			                rec.relocCount * sizeof(Reloc)))
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
+			loadedEntries.emplace(rec.fingerprint, std::move(ec_local));
+		}
+
+		// Commit -- swap loaded data into the live tables.
+		entries = std::move(loadedEntries);
+		symbolNames = std::move(loadedSymbols);
+		symbolIds.clear();
+		for (size_t i = 1; i < symbolNames.size(); ++i)
+			symbolIds.emplace(symbolNames[i], i);
+		return true;
+	}
+
+	bool flushToDisk() noexcept
+	{
+		if (cacheDir.empty())
+			return false;
+
+		std::error_code ec;
+		fs::create_directories(cacheDir, ec);
+		// create_directories can fail on permission issues; continue anyway --
+		// fopen below will produce the actual diagnostic on the temp paths.
+
+		const fs::path manifestPath = cacheDir / "manifest.bin";
+		const fs::path codePath = cacheDir / "code.bin";
+		const fs::path manifestTmp = cacheDir / "manifest.bin.tmp";
+		const fs::path codeTmp = cacheDir / "code.bin.tmp";
+
+		// Sort entries by fingerprint for deterministic layout. Two flushes
+		// with the same in-memory state produce byte-identical manifest +
+		// code files.
+		std::vector<std::pair<Fingerprint, const EmittedCode*>> ordered;
+		ordered.reserve(entries.size());
+		for (const auto& [fp, code] : entries)
+			ordered.emplace_back(fp, &code);
+		std::sort(ordered.begin(), ordered.end(),
+		          [](const auto& a, const auto& b) {
+			          if (a.first.hi != b.first.hi)
+				          return a.first.hi < b.first.hi;
+			          return a.first.lo < b.first.lo;
+		          });
+
+		FileHandle codeFile(std::fopen(codeTmp.string().c_str(), "wb"));
+		if (!codeFile)
+			return false;
+
+		std::vector<FunctionRecord> records;
+		records.reserve(ordered.size());
+		uint64_t cursor = 0;
+		for (const auto& [fp, codePtr] : ordered)
+		{
+			FunctionRecord rec{};
+			rec.fingerprint = fp;
+			rec.codeOffset = cursor;
+			rec.codeSize = codePtr->hostBytes.size();
+			cursor += codePtr->hostBytes.size();
+			rec.relocOffset = cursor;
+			rec.relocCount = static_cast<uint32_t>(codePtr->relocs.size());
+			cursor += codePtr->relocs.size() * sizeof(Reloc);
+
+			if (rec.codeSize
+			    && !writeAll(codeFile.get(), codePtr->hostBytes.data(), rec.codeSize))
+				return false;
+			if (rec.relocCount
+			    && !writeAll(codeFile.get(), codePtr->relocs.data(),
+			                 rec.relocCount * sizeof(Reloc)))
+				return false;
+			records.push_back(rec);
+		}
+		if (std::fflush(codeFile.get()) != 0)
+			return false;
+		if (jc_fsync(jc_fileno(codeFile.get())) != 0)
+			return false;
+		codeFile.reset();
+
+		// --- Write manifest.tmp ---
+		FileHandle manifestFile(std::fopen(manifestTmp.string().c_str(), "wb"));
+		if (!manifestFile)
+			return false;
+
+		ManifestHeader header{};
+		std::memcpy(header.magic, kManifestMagic, sizeof(kManifestMagic));
+		header.cacheFormatVersion = kCacheFormatVersion;
+		header.reserved = 0;
+		header.entryCount = records.size();
+		header.symbolCount = symbolNames.size() > 0 ? symbolNames.size() - 1 : 0;
+		// header + records, then symbol table.
+		const uint64_t recordsSize = records.size() * sizeof(FunctionRecord);
+		header.symbolTableOffset = sizeof(ManifestHeader) + recordsSize;
+		// symbolTableSize computed below as we serialize.
+		header.codeBinSize = cursor;
+
+		// Write a zero header first; we'll seek back and rewrite it once
+		// symbolTableSize is known.
+		if (!writeAll(manifestFile.get(), &header, sizeof(header)))
+			return false;
+		if (!records.empty()
+		    && !writeAll(manifestFile.get(), records.data(), recordsSize))
+			return false;
+
+		uint64_t symbolTableSize = 0;
+		for (size_t i = 1; i < symbolNames.size(); ++i)
+		{
+			const std::string& name = symbolNames[i];
+			uint32_t nameLen = static_cast<uint32_t>(name.size());
+			if (!writeAll(manifestFile.get(), &nameLen, sizeof(nameLen)))
+				return false;
+			if (nameLen && !writeAll(manifestFile.get(), name.data(), nameLen))
+				return false;
+			symbolTableSize += sizeof(uint32_t) + nameLen;
+		}
+		header.symbolTableSize = symbolTableSize;
+
+		// Rewrite the header with the final symbolTableSize.
+		if (std::fseek(manifestFile.get(), 0, SEEK_SET) != 0)
+			return false;
+		if (!writeAll(manifestFile.get(), &header, sizeof(header)))
+			return false;
+
+		if (std::fflush(manifestFile.get()) != 0)
+			return false;
+		if (jc_fsync(jc_fileno(manifestFile.get())) != 0)
+			return false;
+		manifestFile.reset();
+
+		// --- Atomic rename of both files. Rename code.bin first so a
+		// reader observing the new manifest is guaranteed to see a
+		// matching code.bin. fs::rename is atomic on the same filesystem.
+		fs::rename(codeTmp, codePath, ec);
+		if (ec)
+			return false;
+		fs::rename(manifestTmp, manifestPath, ec);
+		if (ec)
+			return false;
+
+		return true;
+	}
 };
+
+// --- Cache public methods -----------------------------------------------
 
 Cache::Cache() : m_impl(std::make_unique<Impl>()) {}
 Cache::~Cache() = default;
 
 Fingerprint Cache::fingerprint(const FunctionKey& key) const
 {
-	Fnv1a128 h;
-	// Magic constant ties the fingerprint format to this library version.
-	// Bumping kCacheFormatVersion only is not enough -- if the fingerprint
-	// algorithm itself changes, change this string too so old fingerprints
-	// from the old algo can't match by accident.
-	static constexpr char kMagic[] = "jitcache-v1";
-	h.update(kMagic, sizeof(kMagic) - 1);
-	h.update(&key.codegenVersion, sizeof(key.codegenVersion));
-	h.update(&key.hostCpuFeatureBits, sizeof(key.hostCpuFeatureBits));
-	h.update(&key.moduleId, sizeof(key.moduleId));
-	h.update(&key.ppcEntryAddr, sizeof(key.ppcEntryAddr));
-	h.update(&key.ppcLen, sizeof(key.ppcLen));
+	XXH3StateGuard state;
+	XXH3_128bits_reset(state.s);
+
+	// Magic prefix ties the fingerprint to this library version. Changing
+	// the algorithm (e.g. swapping in a different hash) MUST change this
+	// string -- bumping kCacheFormatVersion alone is not enough, since the
+	// on-disk wipe is keyed on the version field but the fingerprint
+	// values stored *inside* a cache would silently collide otherwise.
+	static constexpr char kMagic[] = "jitcache-v2";
+	XXH3_128bits_update(state.s, kMagic, sizeof(kMagic) - 1);
+	XXH3_128bits_update(state.s, &key.codegenVersion, sizeof(key.codegenVersion));
+	XXH3_128bits_update(state.s, &key.hostCpuFeatureBits, sizeof(key.hostCpuFeatureBits));
+	XXH3_128bits_update(state.s, &key.moduleId, sizeof(key.moduleId));
+	XXH3_128bits_update(state.s, &key.ppcEntryAddr, sizeof(key.ppcEntryAddr));
+	XXH3_128bits_update(state.s, &key.ppcLen, sizeof(key.ppcLen));
 	if (key.ppcBytes && key.ppcLen)
-		h.update(key.ppcBytes, key.ppcLen);
-	return Fingerprint{h.lo, h.hi};
+		XXH3_128bits_update(state.s, key.ppcBytes, key.ppcLen);
+
+	XXH128_hash_t h = XXH3_128bits_digest(state.s);
+	return Fingerprint{h.low64, h.high64};
+}
+
+void Cache::load(const fs::path& dir)
+{
+	m_impl->cacheDir = dir;
+	std::error_code ec;
+	fs::create_directories(dir, ec);
+	(void)m_impl->loadFromDisk(); // best-effort; failure leaves cache empty
 }
 
 void Cache::insert(const FunctionKey& key, const EmittedCode& emitted)
 {
-	const Fingerprint fp = fingerprint(key);
-	m_impl->entries[fp] = emitted;
+	m_impl->entries[fingerprint(key)] = emitted;
+}
+
+bool Cache::flush()
+{
+	return m_impl->flushToDisk();
 }
 
 bool Cache::lookup(const FunctionKey& key, const Resolver& resolver, EmittedCode& out) const

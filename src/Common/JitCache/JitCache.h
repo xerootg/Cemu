@@ -9,7 +9,7 @@
 // which applies any pending relocations via a consumer-supplied Resolver.
 //
 // Phase 1a: in-memory only, placeholder 128-bit hash (FNV-1a). No disk yet.
-// Phase 1b: adds XXH3-128 and on-disk manifest + code blob.
+// Phase 1b: XXH3-128 fingerprint + on-disk manifest + code blob + atomic flush.
 // Phase 2:  wires the producer side into Cemu.
 // Phase 3:  read path behind a flag with JITCACHE_VERIFY=1 in debug builds.
 //
@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,8 +26,12 @@ namespace jitcache
 {
 
 // Cache format version. Bump on any binary-incompatible change to either
-// the manifest layout or the wire format of stored relocs / strings.
-constexpr uint32_t kCacheFormatVersion = 1;
+// the manifest layout, the fingerprint algorithm, or the wire format of
+// stored relocs / strings. Mismatched value on disk -> wipe + start empty.
+//
+// v1: FNV-1a 128, in-memory only (phase 1a -- never written to disk).
+// v2: XXH3-128 fingerprint, manifest.bin + code.bin on disk (phase 1b).
+constexpr uint32_t kCacheFormatVersion = 2;
 
 // Relocation kinds applied to host code bytes at lookup time.
 // Phase 0 (commit b2a5b789) confirmed Aarch64_MovzMovk_Abs64 is the only
@@ -155,9 +160,26 @@ public:
 	// share a cache entry by accident.
 	Fingerprint fingerprint(const FunctionKey& key) const;
 
+	// Attach to an on-disk cache rooted at `dir`. Creates the directory
+	// if absent. On magic/version mismatch or any I/O error the two cache
+	// files (manifest.bin and code.bin) are wiped and the cache stays
+	// empty. Always safe to call; never throws.
+	//
+	// Symbol ids are preserved across a load/insert/flush/load cycle when
+	// internSymbol is called with the same strings in the same order.
+	// Mixing symbol-id namespaces across runs is the caller's
+	// responsibility -- intern up front, before any insert/lookup.
+	void load(const std::filesystem::path& dir);
+
 	// Insert a function's compiled output. Replaces any existing entry
-	// for the same fingerprint. Phase 1a stores entries in memory only.
+	// for the same fingerprint. The new entry is dirty until flush().
 	void insert(const FunctionKey& key, const EmittedCode& emitted);
+
+	// Write all entries + symbol table to disk atomically (.tmp + fsync
+	// + rename for both files). No-op if not attached to a directory.
+	// Returns true on success, false if any I/O step failed (in which
+	// case the on-disk cache is left as it was before flush()).
+	bool flush();
 
 	// Look up an entry by FunctionKey. On hit, applies relocs in place
 	// using `resolver` and returns the patched host bytes via `out`.

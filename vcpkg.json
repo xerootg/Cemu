@@ -81,7 +81,8 @@
         "zip"
       ]
     },
-    "libusb"
+    "libusb",
+    "xxhash"
   ],
   "overrides": [
     {

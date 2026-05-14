@@ -73,6 +73,7 @@ target_include_directories(CemuCommon PUBLIC "../")
 
 target_link_libraries(CemuCommon PRIVATE
 	glm::glm
+	xxHash::xxhash
 )
 
 if(ANDROID)

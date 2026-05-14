@@ -306,4 +306,19 @@ object NativeInput {
 
     @JvmStatic
     external fun saveInputs()
+
+    @JvmStatic
+    external fun getControllerProfiles(): Array<String>
+
+    @JvmStatic
+    external fun loadControllerProfile(index: Int, profileName: String): Boolean
+
+    @JvmStatic
+    external fun saveControllerProfile(index: Int, profileName: String): Boolean
+
+    @JvmStatic
+    external fun deleteControllerProfile(profileName: String): Boolean
+
+    @JvmStatic
+    external fun getCurrentProfileName(index: Int): String
 }

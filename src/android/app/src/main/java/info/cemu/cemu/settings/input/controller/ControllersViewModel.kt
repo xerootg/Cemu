@@ -4,6 +4,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -11,9 +12,15 @@ import info.cemu.cemu.common.android.inputdevice.hasMotion
 import info.cemu.cemu.common.android.inputdevice.hasRumble
 import info.cemu.cemu.common.android.inputdevice.listGameControllers
 import info.cemu.cemu.common.android.inputdevice.toControllerInfo
+import info.cemu.cemu.common.settings.AppSettingsStore
+import info.cemu.cemu.common.settings.ControllerProfileBinding
 import info.cemu.cemu.nativeinterface.NativeInput
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 
 data class ButtonInfo(
     val name: String,
@@ -141,6 +148,73 @@ class ControllersViewModel(val controllerIndex: Int) : ViewModel() {
     private val _activeController = MutableStateFlow<ActiveController?>(null)
     val activeController = _activeController.asStateFlow()
 
+    private val _profiles = MutableStateFlow<List<String>>(emptyList())
+    val profiles = _profiles.asStateFlow()
+
+    private val _currentProfileName = MutableStateFlow("")
+    val currentProfileName = _currentProfileName.asStateFlow()
+
+    val controllerBindings = AppSettingsStore.dataStore.data
+        .map { it.controllerBindings }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
+    fun refreshProfiles() {
+        _profiles.value = NativeInput.getControllerProfiles().toList().sorted()
+        _currentProfileName.value = NativeInput.getCurrentProfileName(controllerIndex)
+    }
+
+    fun loadProfile(name: String): Boolean {
+        if (!NativeInput.loadControllerProfile(controllerIndex, name)) {
+            return false
+        }
+        _controllerType.value = NativeInput.getControllerType(controllerIndex)
+        refreshControllerData()
+        refreshAvailableControllers()
+        _currentProfileName.value = NativeInput.getCurrentProfileName(controllerIndex)
+        return true
+    }
+
+    fun saveProfile(name: String): Boolean {
+        if (!NativeInput.saveControllerProfile(controllerIndex, name)) {
+            return false
+        }
+        _currentProfileName.value = NativeInput.getCurrentProfileName(controllerIndex)
+        refreshProfiles()
+        return true
+    }
+
+    fun deleteProfile(name: String): Boolean {
+        if (!NativeInput.deleteControllerProfile(name)) {
+            return false
+        }
+        if (_currentProfileName.value == name) {
+            _currentProfileName.value = ""
+        }
+        viewModelScope.launch {
+            AppSettingsStore.dataStore.updateData { settings ->
+                val cleaned = settings.controllerBindings.filterValues { it.profileName != name }
+                if (cleaned.size == settings.controllerBindings.size) settings
+                else settings.copy(controllerBindings = cleaned)
+            }
+        }
+        refreshProfiles()
+        return true
+    }
+
+    fun bindProfileToDevice(descriptor: String, profileName: String, autoLoad: Boolean) {
+        viewModelScope.launch {
+            AppSettingsStore.dataStore.updateData { settings ->
+                val map = settings.controllerBindings.toMutableMap()
+                if (autoLoad && profileName.isNotEmpty()) {
+                    map[descriptor] = ControllerProfileBinding(controllerIndex, profileName)
+                } else {
+                    map.remove(descriptor)
+                }
+                settings.copy(controllerBindings = map)
+            }
+        }
+    }
+
     fun setActiveController(controller: InputController?) {
         if (controller == null) {
             _activeController.value = null
@@ -174,6 +248,7 @@ class ControllersViewModel(val controllerIndex: Int) : ViewModel() {
 
     init {
         refreshControllerData()
+        refreshProfiles()
     }
 
     companion object {

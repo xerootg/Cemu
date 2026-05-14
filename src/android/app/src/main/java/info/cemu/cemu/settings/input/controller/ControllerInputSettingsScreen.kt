@@ -27,6 +27,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -92,9 +93,13 @@ fun ControllerInputSettingsScreen(
     val controllerType by viewModel.controllerType.collectAsState()
     val controls by viewModel.controls.collectAsState()
     val activeController by viewModel.activeController.collectAsState()
+    val profiles by viewModel.profiles.collectAsState()
+    val currentProfileName by viewModel.currentProfileName.collectAsState()
+    val controllerBindings by viewModel.controllerBindings.collectAsState()
 
     var showMapAllInputsDialog by rememberSaveable { mutableStateOf(false) }
     var showControllerSettingsDialog by rememberSaveable { mutableStateOf(false) }
+    var showPresetsDialog by rememberSaveable { mutableStateOf(false) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
@@ -152,6 +157,17 @@ fun ControllerInputSettingsScreen(
                 refreshControllers { showControllerSettingsDialog = true }
             }) {
                 Text(tr("Controller settings"))
+            }
+
+            Button(onClick = {
+                viewModel.refreshProfiles()
+                viewModel.refreshAvailableControllers()
+                showPresetsDialog = true
+            }) {
+                Text(
+                    if (currentProfileName.isEmpty()) tr("Presets")
+                    else tr("Preset: {0}", currentProfileName)
+                )
             }
         }
 
@@ -222,6 +238,34 @@ fun ControllerInputSettingsScreen(
             onSetActiveController = viewModel::setActiveController,
             onSetControllerSettings = viewModel::setControllerSettings,
             onDismissRequest = { showControllerSettingsDialog = false })
+    }
+
+    if (showPresetsDialog) {
+        PresetsDialog(
+            controllerIndex = controllerIndex,
+            profiles = profiles,
+            currentProfileName = currentProfileName,
+            controllers = controllers,
+            controllerBindings = controllerBindings,
+            onLoad = { name ->
+                if (!viewModel.loadProfile(name))
+                    snackbarHostState.showMessage(coroutineScope, tr("Failed to load preset"))
+                else
+                    snackbarHostState.showMessage(coroutineScope, tr("Loaded preset {0}", name))
+            },
+            onSave = { name ->
+                if (!viewModel.saveProfile(name))
+                    snackbarHostState.showMessage(coroutineScope, tr("Failed to save preset (name reserved or invalid)"))
+                else
+                    snackbarHostState.showMessage(coroutineScope, tr("Saved preset {0}", name))
+            },
+            onDelete = { name ->
+                if (viewModel.deleteProfile(name))
+                    snackbarHostState.showMessage(coroutineScope, tr("Deleted preset {0}", name))
+            },
+            onBindDevice = viewModel::bindProfileToDevice,
+            onDismissRequest = { showPresetsDialog = false },
+        )
     }
 }
 
@@ -413,6 +457,204 @@ private fun ControllerSelectDialog(
                     .align(Alignment.End),
             ) {
                 Text(tr("Cancel"))
+            }
+        }
+    }
+}
+
+@Composable
+private fun PresetsDialog(
+    controllerIndex: Int,
+    profiles: List<String>,
+    currentProfileName: String,
+    controllers: List<InputController>,
+    controllerBindings: Map<String, info.cemu.cemu.common.settings.ControllerProfileBinding>,
+    onLoad: (String) -> Unit,
+    onSave: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onBindDevice: (descriptor: String, profileName: String, autoLoad: Boolean) -> Unit,
+    onDismissRequest: () -> Unit,
+) {
+    var newName by rememberSaveable { mutableStateOf("") }
+    var pendingDelete by rememberSaveable { mutableStateOf<String?>(null) }
+
+    Dialog(
+        onDismissRequest = onDismissRequest,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onDismissRequest) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_close),
+                        contentDescription = null,
+                    )
+                }
+                Text(
+                    text = tr("Presets"),
+                    fontSize = 18.sp,
+                )
+            }
+
+            HorizontalDivider()
+
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    text = if (currentProfileName.isEmpty())
+                        tr("Current mapping is not saved as a named preset.")
+                    else
+                        tr("Current preset: {0}", currentProfileName),
+                    fontSize = 14.sp,
+                )
+
+                Header(tr("Save current mapping"))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it.trim() },
+                        placeholder = { Text(tr("Preset name")) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(
+                        enabled = newName.isNotEmpty(),
+                        onClick = {
+                            onSave(newName)
+                            newName = ""
+                        },
+                    ) {
+                        Text(tr("Save"))
+                    }
+                }
+                if (currentProfileName.isNotEmpty()) {
+                    Button(onClick = { onSave(currentProfileName) }) {
+                        Text(tr("Update \"{0}\"", currentProfileName))
+                    }
+                }
+
+                Header(tr("Saved presets"))
+                if (profiles.isEmpty()) {
+                    Text(
+                        text = tr("No saved presets yet."),
+                        fontSize = 14.sp,
+                    )
+                } else {
+                    profiles.forEach { name ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = name,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { onLoad(name) }
+                                    .padding(vertical = 12.dp),
+                            )
+                            TextButton(onClick = { onLoad(name) }) {
+                                Text(tr("Load"))
+                            }
+                            IconButton(onClick = { pendingDelete = name }) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_delete),
+                                    contentDescription = tr("Delete"),
+                                )
+                            }
+                        }
+                        HorizontalDivider()
+                    }
+                }
+
+                Header(tr("Auto-load on device connect"))
+                Text(
+                    text = tr("When a connected gamepad matches, its preset is loaded into controller {0}.", controllerIndex + 1),
+                    fontSize = 12.sp,
+                )
+
+                if (controllers.isEmpty()) {
+                    Text(
+                        text = tr("No gamepads currently connected."),
+                        fontSize = 14.sp,
+                    )
+                } else {
+                    val presetChoices = listOf("") + profiles
+                    controllers.forEach { ctrl ->
+                        val binding = controllerBindings[ctrl.descriptor]
+                        val currentChoice =
+                            if (binding != null && binding.controllerIndex == controllerIndex) binding.profileName
+                            else ""
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                        ) {
+                            Text(
+                                text = ctrl.name,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp,
+                            )
+                            SingleSelection(
+                                label = tr("Auto-load preset"),
+                                choice = currentChoice,
+                                choices = presetChoices,
+                                choiceToString = { if (it.isEmpty()) tr("None") else it },
+                                onChoiceChanged = { picked ->
+                                    onBindDevice(
+                                        ctrl.descriptor,
+                                        picked,
+                                        picked.isNotEmpty(),
+                                    )
+                                },
+                            )
+                        }
+                        HorizontalDivider()
+                    }
+                }
+            }
+        }
+    }
+
+    pendingDelete?.let { name ->
+        Dialog(onDismissRequest = { pendingDelete = null }) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                modifier = Modifier
+                    .sizeIn(maxWidth = 420.dp)
+                    .padding(16.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = tr("Delete preset \"{0}\"?", name),
+                        fontSize = 16.sp,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        TextButton(onClick = { pendingDelete = null }) { Text(tr("Cancel")) }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        TextButton(onClick = {
+                            onDelete(name)
+                            pendingDelete = null
+                        }) { Text(tr("Delete")) }
+                    }
+                }
             }
         }
     }

@@ -40,11 +40,18 @@ data class InputOverlaySettings(
 )
 
 @Serializable
+data class ControllerProfileBinding(
+    val controllerIndex: Int,
+    val profileName: String,
+)
+
+@Serializable
 data class AppSettings(
     val guiSettings: GuiSettings = GuiSettings(),
     val emulationSettings: EmulationSettings = EmulationSettings(),
     val inputOverlaySettings: InputOverlaySettings = InputOverlaySettings(),
     val hotkeySettings: Map<HotkeyAction, HotkeyCombo> = emptyMap(),
+    val controllerBindings: Map<String, ControllerProfileBinding> = emptyMap(),
 )
 
 object AppSettingsSerializer : Serializer<AppSettings> {

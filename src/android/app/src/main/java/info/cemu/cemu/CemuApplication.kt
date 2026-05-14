@@ -52,6 +52,7 @@ class CemuApplication : Application() {
 
     private fun saveDataFiles() {
         val dataFolder = File(internalCemuDataFolder)
+        val userFolder = File(internalCemuUserFolder)
 
         if (!dataFolder.exists() && !dataFolder.mkdirs()) {
             return
@@ -90,21 +91,27 @@ class CemuApplication : Application() {
             }
         }
 
-        val filePatterns = arrayOf(
+        // Files matching dataFolderPatterns land in the just-wiped dataFolder.
+        // Files matching userFolderPatterns land in userFolder and OVERWRITE in
+        // place -- they must not be inside dataFolder so the deleteRecursively
+        // above can't blow them away, and they sit alongside any user-installed
+        // packs in graphicPacks/. The userFolder copy means a bundled pack is
+        // the source of truth across re-installs and external clobbers.
+        val dataFolderPatterns = arrayOf(
             Pattern.compile("gameProfiles/.*"),
             Pattern.compile("resources/.*"),
         )
-
-        fun isFileValid(file: String): Boolean {
-            return filePatterns.any { pattern -> pattern.matcher(file).matches() }
-        }
+        val userFolderPatterns = arrayOf(
+            Pattern.compile("graphicPacks/.*"),
+        )
 
         for (assetFile in traverseAssets()) {
-            if (!isFileValid(assetFile)) {
-                continue
+            val destFolder = when {
+                dataFolderPatterns.any { it.matcher(assetFile).matches() } -> dataFolder
+                userFolderPatterns.any { it.matcher(assetFile).matches() } -> userFolder
+                else -> continue
             }
-
-            val outFile = dataFolder.resolve(assetFile)
+            val outFile = destFolder.resolve(assetFile)
             outFile.parentFile?.mkdirs()
             assets.open(assetFile)
                 .use { asset -> outFile.outputStream().use { out -> asset.copyTo(out) } }

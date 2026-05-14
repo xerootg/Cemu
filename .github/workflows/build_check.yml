@@ -13,7 +13,6 @@ on:
       - "*.md"
     branches:
       - main
-      - android-port
 
 jobs:
   build:

@@ -34,6 +34,7 @@ import info.cemu.cemu.emulation.input.HotkeyManager
 import info.cemu.cemu.emulation.input.InputHandler
 import info.cemu.cemu.emulation.input.NativeInputDeviceListener
 import info.cemu.cemu.nativeinterface.NativeEmulation
+import info.cemu.cemu.savebackup.SaveBackupService
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -206,6 +207,16 @@ class EmulationActivity : AppCompatActivity() {
         inputManager.onPause()
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Session-end signal: user backgrounded the game (Home, app switcher, screen off,
+        // swipe-away). Saves are flushed by the native side during pause/release, so this
+        // is the right moment to capture them. The Service is in a separate :backup process
+        // so it survives the exitProcess() that follows an explicit Quit. Settings gate +
+        // debounce on the receiving side mean it's safe to fire on every onStop.
+        SaveBackupService.start(this)
+    }
+
     override fun onResume() {
         super.onResume()
 
@@ -280,6 +291,10 @@ class EmulationActivity : AppCompatActivity() {
     }
 
     private fun onQuit() {
+        // Kick the backup ahead of the kill switch. The service lives in :backup process
+        // so AMS routes the start intent there even though exitProcess will tear the main
+        // process down a moment later.
+        SaveBackupService.start(this)
         EmulationForegroundService.stop(this)
         finish()
         exitProcess(0)

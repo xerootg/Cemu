@@ -15,6 +15,7 @@ fun SettingsHomeScreen(
     goToAudioSettings: () -> Unit,
     goToAccountSettings: () -> Unit,
     goToOverlaySettings: () -> Unit,
+    goToSaveBackupSettings: () -> Unit,
     navigateBack: () -> Unit
 ) {
     ScreenContent(
@@ -48,6 +49,10 @@ fun SettingsHomeScreen(
         Button(
             label = tr("Account settings"),
             onClick = dropUnlessResumed(block = goToAccountSettings)
+        )
+        Button(
+            label = tr("Save backup"),
+            onClick = dropUnlessResumed(block = goToSaveBackupSettings)
         )
     }
 }

@@ -21,6 +21,7 @@ import info.cemu.cemu.settings.input.hotkeys.HotkeySettingsScreen
 import info.cemu.cemu.settings.input.InputSettingsScreen
 import info.cemu.cemu.settings.inputoverlay.InputOverlaySettingsScreen
 import info.cemu.cemu.settings.overlay.OverlaySettingsScreen
+import info.cemu.cemu.savebackup.SaveBackupSettingsScreen
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -79,6 +80,9 @@ private object SettingsRoutes {
 
     @Serializable
     object AccountSettingsScreenRoute
+
+    @Serializable
+    object SaveBackupSettingsScreenRoute
 }
 
 fun NavGraphBuilder.settingsNavigation(navController: NavHostController) {
@@ -93,6 +97,12 @@ fun NavGraphBuilder.settingsNavigation(navController: NavHostController) {
                 goToOverlaySettings = { navController.navigate(SettingsRoutes.OverlaySettingsScreenRoute) },
                 goToAccountSettings = { navController.navigate(SettingsRoutes.AccountSettingsScreenRoute) },
                 goToEmulatedUSBDevicesSettings = { navController.navigate(SettingsRoutes.EmulatedUSBDevicesSettingsScreenRoute) },
+                goToSaveBackupSettings = { navController.navigate(SettingsRoutes.SaveBackupSettingsScreenRoute) },
+            )
+        }
+        composable<SettingsRoutes.SaveBackupSettingsScreenRoute> {
+            SaveBackupSettingsScreen(
+                navigateBack = { navController.popBackStack() },
             )
         }
         composable<SettingsRoutes.AudioSettingsScreenRoute> {

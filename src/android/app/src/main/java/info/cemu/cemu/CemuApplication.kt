@@ -29,7 +29,17 @@ class CemuApplication : Application() {
 
         configureExceptionHandler()
 
+        // DataStore is multi-process-safe (see Settings.kt) and is read by SaveBackupService
+        // from the :backup process — init it on both sides.
         AppSettingsStore.init(this)
+
+        // The :backup process exists solely to host SaveBackupService across an exitProcess()
+        // in the main process. It needs the DataStore + the loaded JVM, but none of the
+        // emulator boot or asset extraction. Bail out before we touch native or unpack
+        // assets so backup mode stays cheap.
+        if (isBackupProcess()) {
+            return
+        }
 
         NativeFiles.initialize(contentResolver)
 
@@ -38,6 +48,11 @@ class CemuApplication : Application() {
         initializeCemu()
 
         saveDataFiles()
+    }
+
+    private fun isBackupProcess(): Boolean {
+        // getProcessName() requires API 28; minSdk for this app is 30, so unconditional.
+        return getProcessName().endsWith(":backup")
     }
 
     private fun initializeTranslations() {

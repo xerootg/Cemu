@@ -46,12 +46,27 @@ data class ControllerProfileBinding(
 )
 
 @Serializable
+data class SaveBackupSettings(
+    val enabled: Boolean = false,
+    // Tree URI from ACTION_OPEN_DOCUMENT_TREE. Persisted across reboots via takePersistableUriPermission.
+    // String form (Uri.toString()) because androidx.datastore + kotlinx.serialization can't serialize Uri.
+    val destinationUri: String? = null,
+    // Human-readable name of the picked tree, e.g. "Drive > backups > cemu". Display only.
+    val destinationDisplayName: String? = null,
+    val keepCount: Int = 5,
+    // Skip another backup if one ran within this window. Stops thrashing on quick app-switch cycles.
+    val minIntervalMinutes: Int = 5,
+    val lastBackupEpochMillis: Long = 0L,
+)
+
+@Serializable
 data class AppSettings(
     val guiSettings: GuiSettings = GuiSettings(),
     val emulationSettings: EmulationSettings = EmulationSettings(),
     val inputOverlaySettings: InputOverlaySettings = InputOverlaySettings(),
     val hotkeySettings: Map<HotkeyAction, HotkeyCombo> = emptyMap(),
     val controllerBindings: Map<String, ControllerProfileBinding> = emptyMap(),
+    val saveBackupSettings: SaveBackupSettings = SaveBackupSettings(),
 )
 
 object AppSettingsSerializer : Serializer<AppSettings> {

@@ -9,7 +9,7 @@
 #include <cstddef>
 
 #include "../PPCRecompiler.h"
-#include "RelocTaxonomy.h"
+#include "../JitCacheBridge.h"
 #include "Common/precompiled.h"
 #include "Common/cpu_features.h"
 #include "HW/Espresso/Interpreter/PPCInterpreterInternal.h"
@@ -188,16 +188,29 @@ struct AArch64GenContext_t : CodeGenerator
 	void enterRecompilerCode();
 	void leaveRecompilerCode();
 
-	// Phase 0 reloc-taxonomy hook: every absolute 64-bit pointer that ends up
-	// inside a per-PPC-function host code body must go through this helper.
-	// It records (codeOffset, value, kind) before emitting the standard
-	// xbyak_aarch64 mov(XReg, uint64) which lowers to up to 4 movz/movk insns.
-	// Used by macro() and call_imm(); intentionally NOT used by
-	// enterRecompilerCode/leaveRecompilerCode (those are the one-time
-	// trampolines, not cached). See RelocTaxonomy.h.
-	void emitAbsoluteImm64(const XReg& reg, uint64 value, JitRelocTaxonomy::AbsImm64Kind kind)
+	// JIT-cache reloc hook: every absolute 64-bit pointer that ends up inside
+	// a per-PPC-function host code body must go through one of these helpers.
+	// They record a reloc into the active JitCacheBridge function buffer
+	// before emitting the standard xbyak_aarch64 mov(XReg, uint64) (which
+	// lowers to up to 4 movz/movk insns). Used by macro() and call_imm();
+	// intentionally NOT used by enterRecompilerCode/leaveRecompilerCode --
+	// those are one-time trampolines, never cached. See JitCacheBridge.h.
+	//
+	// _Symbol variant: target is an interned RuntimeSymbol id. The actual
+	// host pointer is process-specific (ASLR / module load address); the
+	// cache load path will re-resolve via the bridge's symbol table.
+	//
+	// _Embedded variant: target is a literal 64-bit value baked at compile
+	// time. The value is stored inside the cache entry and replayed on hit
+	// without any runtime resolution.
+	void emitAbsoluteImm64Symbol(const XReg& reg, uint64 value, uint64 symbolId)
 	{
-		JitRelocTaxonomy::recordAbsImm64(getSize(), value, kind);
+		JitCacheBridge::recordRuntimeSymbolReloc(static_cast<uint32_t>(getSize()), symbolId);
+		mov(reg, value);
+	}
+	void emitAbsoluteImm64Embedded(const XReg& reg, uint64 value)
+	{
+		JitCacheBridge::recordEmbeddedValueReloc(static_cast<uint32_t>(getSize()), value);
 		mov(reg, value);
 	}
 
@@ -1292,7 +1305,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 			// ===== bail-out conditions before locking =====
 			cbz(x0, slowCall);                                              // NULL queue
-			emitAbsoluteImm64(x9, (uint64)&coreinit::g_systemMessageQueuePtr, JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
+			emitAbsoluteImm64Symbol(x9, (uint64)&coreinit::g_systemMessageQueuePtr, JitCacheBridge::SYM_g_systemMessageQueuePtr);
 			ldr(x9, AdrNoOfs(x9));
 			cmp(x0, x9);
 			beq(slowCall);                                                  // system queue
@@ -1304,10 +1317,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// multiplicative hash become the slot index. Mask is implicit: the top
 			// bits of a 64-bit shift-right are guaranteed in range when extracted.
 			lsr(x10, x0, 4);
-			emitAbsoluteImm64(x9, (uint64)0x9E3779B97F4A7C15ULL, JitRelocTaxonomy::AbsImm64Kind::LITERAL_CONST);
+			emitAbsoluteImm64Embedded(x9, (uint64)0x9E3779B97F4A7C15ULL);
 			mul(x10, x10, x9);
 			lsr(x10, x10, coreinit::QUEUE_LOCK_POOL_INDEX_SHIFT);            // x10 = slot index
-			emitAbsoluteImm64(x9, (uint64)&coreinit::g_queueLockPool[0], JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
+			emitAbsoluteImm64Symbol(x9, (uint64)&coreinit::g_queueLockPool[0], JitCacheBridge::SYM_g_queueLockPool);
 			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
 
 			// ===== atomic-OR lockState bit 0; prior value also carries waiter bits =====
@@ -1385,7 +1398,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// If a send-side waiter existed at snapshot time, wake one.
 				// x0 still holds msgQueue.
 				cbz(w16, fastDone);
-				emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
+				emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender, JitCacheBridge::SYM_OSWakeOneSender);
 				blr(TEMP_GPR1.XReg);
 				b(fastDone);
 			}
@@ -1437,7 +1450,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				ldclrl(w11, wzr, AdrNoOfs(x9));
 				// If a receive-side waiter existed at snapshot time, wake one.
 				cbz(w16, fastDone);
-				emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
+				emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver, JitCacheBridge::SYM_OSWakeOneReceiver);
 				blr(TEMP_GPR1.XReg);
 				b(fastDone);
 			}
@@ -1453,7 +1466,9 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			{
 				uint64 target = isReceive ? (uint64)&coreinit::OSReceiveMessage
 				                          : (uint64)&coreinit::OSSendMessage;
-				emitAbsoluteImm64(TEMP_GPR1.XReg, target, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
+				uint64 targetSym = isReceive ? JitCacheBridge::SYM_OSReceiveMessage
+				                             : JitCacheBridge::SYM_OSSendMessage;
+				emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, target, targetSym);
 				blr(TEMP_GPR1.XReg);
 				str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
 			}
@@ -1486,7 +1501,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// owner-check; bypassing the C++ wrapper avoids the host-ptr<->MPTR
 			// conversion overhead in cafeExportCallWrapper.
 			ldr(w10, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.UPIR)));
-			emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::__currentCoreThread[0], JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
+			emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, (uint64)&coreinit::__currentCoreThread[0], JitCacheBridge::SYM_currentCoreThread);
 			ldr(x11, AdrExt(TEMP_GPR1.XReg, w10, ExtMod::UXTW, 3));        // host ptr (sizeof OSThread_t* == 8)
 			cmp(x11, 0);
 			sub(x12, x11, MEM_BASE_REG);                                    // guest MPTR
@@ -1516,7 +1531,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			mov(w1, funcId);
 			// call HLE function
 
-			emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE, JitRelocTaxonomy::AbsImm64Kind::RECOMPILER_HELPER_PTR);
+			emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE, JitCacheBridge::SYM_PPCRecompiler_virtualHLE);
 			blr(TEMP_GPR1.XReg);
 
 			mov(HCPU_REG, x0);
@@ -2346,7 +2361,11 @@ void AArch64GenContext_t::fpr_compare(IMLInstruction* imlInstruction)
 void AArch64GenContext_t::call_imm(IMLInstruction* imlInstruction)
 {
 	str(x30, AdrPreImm(sp, -16));
-	emitAbsoluteImm64(TEMP_GPR1.XReg, imlInstruction->op_call_imm.callAddress, JitRelocTaxonomy::AbsImm64Kind::PPC_CALL_IMM_TARGET);
+	// op_call_imm.callAddress is an IML-time host pointer (see ppcImlGen
+	// callsites that set it). Phase 2 stores it inline as an embedded
+	// value -- when the read path lands we may need to revisit this if
+	// the address proves to be process-specific.
+	emitAbsoluteImm64Embedded(TEMP_GPR1.XReg, imlInstruction->op_call_imm.callAddress);
 	blr(TEMP_GPR1.XReg);
 	ldr(x30, AdrPostImm(sp, 16));
 }
@@ -2356,10 +2375,10 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	AArch64Allocator allocator;
 	AArch64GenContext_t aarch64GenContext{&allocator};
 
-	// Phase 0: open a reloc-taxonomy recording window around the body
-	// codegen. emitAbsoluteImm64 sites will log into the active window;
-	// endFunction closes it. See RelocTaxonomy.h.
-	JitRelocTaxonomy::beginFunction(PPCRecFunction->ppcAddress);
+	// Open the per-function reloc buffer for the JIT cache. emit*Imm64
+	// sites append into this buffer; endFunction below assembles the full
+	// EmittedCode and hands it to the cache. See JitCacheBridge.h.
+	JitCacheBridge::beginFunction(PPCRecFunction->ppcAddress, PPCRecFunction->ppcSize);
 
 	// generate iml instruction code
 	bool codeGenerationFailed = false;
@@ -2590,14 +2609,14 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// handle failed code generation
 	if (codeGenerationFailed)
 	{
-		JitRelocTaxonomy::endFunction(0);
+		JitCacheBridge::endFunction(nullptr, 0);
 		return false;
 	}
 
 	if (!aarch64GenContext.processAllJumps())
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompiler_generateAArch64Code(): some jumps exceeded the +/-128MB offset.");
-		JitRelocTaxonomy::endFunction(0);
+		JitCacheBridge::endFunction(nullptr, 0);
 		return false;
 	}
 
@@ -2606,7 +2625,11 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// set code
 	PPCRecFunction->x86Code = aarch64GenContext.getCode<void*>();
 	PPCRecFunction->x86Size = aarch64GenContext.getMaxSize();
-	JitRelocTaxonomy::endFunction(PPCRecFunction->x86Size);
+	// Cache stores only the emitted instruction bytes, not the rest of the
+	// xbyak allocation page. getSize() is the actual code length; the trailing
+	// bytes up to getMaxSize() are uninitialized padding the recompiler never
+	// branches into.
+	JitCacheBridge::endFunction(static_cast<const uint8_t*>(PPCRecFunction->x86Code), aarch64GenContext.getSize());
 	// set free disabled to skip freeing the code from the CodeGenerator destructor
 	allocator.setFreeDisabled(true);
 	return true;

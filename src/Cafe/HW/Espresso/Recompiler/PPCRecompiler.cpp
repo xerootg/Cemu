@@ -2,6 +2,8 @@
 #include "PPCFunctionBoundaryTracker.h"
 #include "PPCRecompiler.h"
 #include "PPCRecompilerIml.h"
+#include "JitCacheBridge.h"
+#include "Cafe/CafeSystem.h"
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/OS/common/OSCommon.h"
 #include "util/containers/RangeStore.h"
@@ -842,7 +844,14 @@ void PPCRecompiler_init()
     PPCRecompiler_allocateRange(mmuRange_CODECAVE.getBase(), mmuRange_CODECAVE.getSize());
 
     PPCRecompiler_initPlatform();
-    
+
+#if defined(__aarch64__)
+	// Attach the JIT translation cache (write path) for the foreground
+	// title. Cemu-side glue interns the well-known symbols and starts
+	// catching every successful AArch64 codegen via JitCacheBridge::*.
+	JitCacheBridge::initialize(static_cast<uint64_t>(CafeSystem::GetForegroundTitleId()));
+#endif
+
 	cemuLog_log(LogType::Force, "Recompiler initialized");
 
 	ppcRecompilerEnabled = true;
@@ -858,6 +867,11 @@ void PPCRecompiler_Shutdown()
     s_recompilerThreadStopSignal = true;
     if(s_threadRecompiler.joinable())
         s_threadRecompiler.join();
+#if defined(__aarch64__)
+    // Flush any pending JIT-cache entries to disk before tearing down.
+    // Safe to call even if initialize was never invoked.
+    JitCacheBridge::shutdown();
+#endif
     // clean up queues
     while(!PPCRecompilerState.targetQueue.empty())
         PPCRecompilerState.targetQueue.pop();

@@ -12,6 +12,8 @@ add_library(CemuCommon
   GLInclude/glxext.h
   GLInclude/khrplatform.h
   GLInclude/wglext.h
+  JitCache/JitCache.cpp
+  JitCache/JitCache.h
   MemPtr.h
   platform.h
   precompiled.cpp

@@ -269,6 +269,22 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
 		entryPointsOut.emplace_back(ppcEnterOffset, x64Offset);
 	}
 
+#if defined(__aarch64__)
+	// Commit the just-emitted function to the JIT cache. Entry points were
+	// collected just above; the bridge accumulated relocs during codegen.
+	// Has to be after the entry-point collection -- the cache stores entry
+	// points so a phase-3 read path can rebuild the dispatcher table on hit.
+	std::vector<JitCacheBridge::EntryPoint> bridgeEntries;
+	bridgeEntries.reserve(entryPointsOut.size());
+	for (const auto& ep : entryPointsOut)
+		bridgeEntries.push_back({static_cast<uint32_t>(ep.first), ep.second});
+	JitCacheBridge::endFunction(
+	    static_cast<const uint8_t*>(ppcRecFunc->x86Code),
+	    ppcRecFunc->x86CodeLen,
+	    bridgeEntries.data(),
+	    bridgeEntries.size());
+#endif
+
 #if PPCREC_LOG_RECOMPILATION_RESULTS
 	bt.Stop();
 	uint32 codeHash = 0;

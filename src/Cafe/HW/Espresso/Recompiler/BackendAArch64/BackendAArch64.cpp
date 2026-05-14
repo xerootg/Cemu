@@ -2609,14 +2609,14 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// handle failed code generation
 	if (codeGenerationFailed)
 	{
-		JitCacheBridge::endFunction(nullptr, 0);
+		JitCacheBridge::abortFunction();
 		return false;
 	}
 
 	if (!aarch64GenContext.processAllJumps())
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompiler_generateAArch64Code(): some jumps exceeded the +/-128MB offset.");
-		JitCacheBridge::endFunction(nullptr, 0);
+		JitCacheBridge::abortFunction();
 		return false;
 	}
 
@@ -2625,11 +2625,11 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// set code
 	PPCRecFunction->x86Code = aarch64GenContext.getCode<void*>();
 	PPCRecFunction->x86Size = aarch64GenContext.getMaxSize();
-	// Cache stores only the emitted instruction bytes, not the rest of the
-	// xbyak allocation page. getSize() is the actual code length; the trailing
-	// bytes up to getMaxSize() are uninitialized padding the recompiler never
-	// branches into.
-	JitCacheBridge::endFunction(static_cast<const uint8_t*>(PPCRecFunction->x86Code), aarch64GenContext.getSize());
+	// Cache commit happens in PPCRecompiler_recompileFunction after the IML
+	// driver collects entry points from the now-complete codegen output.
+	// The emitted-byte length (getSize(), not getMaxSize()) is what the
+	// cache stores -- see commit 86514016 for the 29x size win.
+	PPCRecFunction->x86CodeLen = aarch64GenContext.getSize();
 	// set free disabled to skip freeing the code from the CodeGenerator destructor
 	allocator.setFreeDisabled(true);
 	return true;

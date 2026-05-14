@@ -556,6 +556,77 @@ void test_persistence_flush_is_deterministic()
 	fs::remove_all(dirB);
 }
 
+void test_entry_points_roundtrip_memory_only()
+{
+	jitcache::Cache cache;
+	KeyBuf k{{0x12, 0x34}, {}};
+	k.key.codegenVersion = 1;
+	k.key.moduleId = 0xEEEE;
+	k.bind();
+
+	jitcache::EmittedCode e;
+	e.hostBytes = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
+	e.entryPoints = {
+	    {0x02000000, 0},
+	    {0x02000010, 4},
+	    {0x02000020, 8},
+	};
+	cache.insert(k.key, e);
+
+	NullResolver r;
+	jitcache::EmittedCode out;
+	CHECK(cache.lookup(k.key, r, out));
+	CHECK(out.entryPoints.size() == 3);
+	CHECK(out.entryPoints[0].ppcAddr == 0x02000000);
+	CHECK(out.entryPoints[0].hostOffset == 0);
+	CHECK(out.entryPoints[1].ppcAddr == 0x02000010);
+	CHECK(out.entryPoints[1].hostOffset == 4);
+	CHECK(out.entryPoints[2].ppcAddr == 0x02000020);
+	CHECK(out.entryPoints[2].hostOffset == 8);
+}
+
+void test_entry_points_persistence_roundtrip()
+{
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc1 = {0x60, 0x00, 0x00, 0x00};
+	std::vector<uint8_t> ppc2 = {0x4E, 0x80, 0x00, 0x20};
+	jitcache::FunctionKey k1{}, k2{};
+	k1.codegenVersion = 1; k1.moduleId = 0xCAFE; k1.ppcEntryAddr = 0x1000;
+	k1.ppcBytes = ppc1.data(); k1.ppcLen = ppc1.size();
+	k2.codegenVersion = 1; k2.moduleId = 0xCAFE; k2.ppcEntryAddr = 0x2000;
+	k2.ppcBytes = ppc2.data(); k2.ppcLen = ppc2.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		jitcache::EmittedCode e1;
+		e1.hostBytes = {0xAA, 0xBB, 0xCC, 0xDD};
+		e1.entryPoints = { {0x1000, 0}, {0x1020, 4} };
+		c.insert(k1, e1);
+
+		jitcache::EmittedCode e2;
+		e2.hostBytes = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+		// e2 deliberately has no entry points -- the unenterable bookkeeping case
+		c.insert(k2, e2);
+		CHECK(c.flush());
+	}
+
+	jitcache::Cache c2;
+	c2.load(dir);
+	NullResolver r;
+	jitcache::EmittedCode out;
+	CHECK(c2.lookup(k1, r, out));
+	CHECK(out.entryPoints.size() == 2);
+	CHECK(out.entryPoints[0].ppcAddr == 0x1000);
+	CHECK(out.entryPoints[1].hostOffset == 4);
+
+	CHECK(c2.lookup(k2, r, out));
+	CHECK(out.entryPoints.empty());
+
+	fs::remove_all(dir);
+}
+
 void test_insert_lookup_with_relocs_full_pipeline()
 {
 	jitcache::Cache cache;
@@ -629,6 +700,9 @@ int main()
 	test_persistence_bad_magic_wipes();
 	test_persistence_orphan_file_wipes();
 	test_persistence_flush_is_deterministic();
+
+	test_entry_points_roundtrip_memory_only();
+	test_entry_points_persistence_roundtrip();
 
 	std::printf("jitcache_test: %d assertions, %d failures\n",
 	            g_assertions, g_failures);

@@ -70,14 +70,15 @@ static_assert(sizeof(ManifestHeader) == 56, "ManifestHeader layout is part of th
 
 struct FunctionRecord
 {
-	Fingerprint fingerprint; // 16 bytes
-	uint64_t codeOffset;     // offset within code.bin
+	Fingerprint fingerprint;   // 16 bytes
+	uint64_t codeOffset;       // offset within code.bin
 	uint64_t codeSize;
-	uint64_t relocOffset;    // offset within code.bin (immediately after code)
+	uint64_t relocOffset;      // offset within code.bin (immediately after code)
 	uint32_t relocCount;
-	uint32_t reserved;
+	uint32_t entryPointCount;
+	uint64_t entryPointOffset; // offset within code.bin (immediately after relocs)
 };
-static_assert(sizeof(FunctionRecord) == 48, "FunctionRecord layout is part of the on-disk format");
+static_assert(sizeof(FunctionRecord) == 56, "FunctionRecord layout is part of the on-disk format");
 
 // --- AArch64 movz/movk patching ------------------------------------------
 
@@ -315,6 +316,14 @@ struct Cache::Impl
 				wipeCacheFiles(cacheDir);
 				return false;
 			}
+			ec_local.entryPoints.resize(rec.entryPointCount);
+			if (rec.entryPointCount
+			    && !readAll(codeFile.get(), ec_local.entryPoints.data(),
+			                rec.entryPointCount * sizeof(EntryPoint)))
+			{
+				wipeCacheFiles(cacheDir);
+				return false;
+			}
 			loadedEntries.emplace(rec.fingerprint, std::move(ec_local));
 		}
 
@@ -373,6 +382,9 @@ struct Cache::Impl
 			rec.relocOffset = cursor;
 			rec.relocCount = static_cast<uint32_t>(codePtr->relocs.size());
 			cursor += codePtr->relocs.size() * sizeof(Reloc);
+			rec.entryPointOffset = cursor;
+			rec.entryPointCount = static_cast<uint32_t>(codePtr->entryPoints.size());
+			cursor += codePtr->entryPoints.size() * sizeof(EntryPoint);
 
 			if (rec.codeSize
 			    && !writeAll(codeFile.get(), codePtr->hostBytes.data(), rec.codeSize))
@@ -380,6 +392,10 @@ struct Cache::Impl
 			if (rec.relocCount
 			    && !writeAll(codeFile.get(), codePtr->relocs.data(),
 			                 rec.relocCount * sizeof(Reloc)))
+				return false;
+			if (rec.entryPointCount
+			    && !writeAll(codeFile.get(), codePtr->entryPoints.data(),
+			                 rec.entryPointCount * sizeof(EntryPoint)))
 				return false;
 			records.push_back(rec);
 		}

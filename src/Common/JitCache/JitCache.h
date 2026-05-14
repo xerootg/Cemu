@@ -31,7 +31,9 @@ namespace jitcache
 //
 // v1: FNV-1a 128, in-memory only (phase 1a -- never written to disk).
 // v2: XXH3-128 fingerprint, manifest.bin + code.bin on disk (phase 1b).
-constexpr uint32_t kCacheFormatVersion = 2;
+// v3: EntryPoint array per entry; FunctionRecord grew from 48 to 56 bytes
+//     (phase 3a, prerequisite for the read path).
+constexpr uint32_t kCacheFormatVersion = 3;
 
 // Relocation kinds applied to host code bytes at lookup time.
 // Phase 0 (commit b2a5b789) confirmed Aarch64_MovzMovk_Abs64 is the only
@@ -61,6 +63,19 @@ enum class TargetKind : uint8_t
 	// future direct-branch reloc kind; currently unused.
 	PpcCodeAddr = 2,
 };
+
+// A guest -> host entry point. Multiple entry points per cached function
+// are common: PPC functions are reached by any `bl <addr>` from elsewhere
+// in the binary, and the recompiler discovers each enterable IML segment.
+// On a cache hit the consumer rebuilds the dispatcher jump table from this
+// array; without it, control flow into the cached body would be stuck at
+// the leading entry only.
+struct EntryPoint
+{
+	uint32_t ppcAddr;     // PPC address that, when called, lands here
+	uint32_t hostOffset;  // byte offset within hostBytes
+};
+static_assert(sizeof(EntryPoint) == 8, "EntryPoint layout is part of the on-disk format");
 
 struct Reloc
 {
@@ -136,11 +151,13 @@ struct Fingerprint
 };
 
 // Host code emitted for one PPC function, plus the relocs to apply at
-// load time before the function is callable.
+// load time before the function is callable, plus the set of guest entry
+// points the consumer can dispatch into.
 struct EmittedCode
 {
 	std::vector<uint8_t> hostBytes;
 	std::vector<Reloc> relocs;
+	std::vector<EntryPoint> entryPoints;
 };
 
 // Public Cache interface. Construction is cheap; all real work happens

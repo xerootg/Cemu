@@ -40,14 +40,34 @@ void initialize(uint64_t titleId);
 // Safe to call without a prior initialize() -- no-op in that case.
 void shutdown();
 
-// Per-function lifecycle. Called by the AArch64 backend.
-// beginFunction resets the per-function reloc buffer; endFunction
-// inserts an EmittedCode entry into the cache and may trigger a flush.
+// Per-function lifecycle. Called around AArch64 codegen.
+// beginFunction resets the per-function reloc buffer; abortFunction
+// discards it (codegen failed); endFunction commits an EmittedCode entry
+// into the cache and may trigger a flush.
 //
-// All three are no-ops if initialize() has not been called.
+// The caller drives the order:
+//   1. beginFunction(ppcAddr, ppcSize)
+//   2. ... record*Reloc(...) per emitted absolute pointer ...
+//   3a. (failure)   abortFunction()
+//   3b. (success)   endFunction(hostBytes, hostSize, entryPoints,
+//                               entryPointCount)
+//
+// endFunction has to come after the IML phase has collected entry points
+// from the codegen result, so it is invoked from the PPCRecompiler driver
+// rather than from inside generateAArch64Code itself.
+//
+// All four are no-ops if initialize() has not been called.
+struct EntryPoint
+{
+	uint32_t ppcAddr;
+	uint32_t hostOffset;
+};
+
 void beginFunction(uint32_t ppcAddr, uint32_t ppcSize);
 void recordRuntimeSymbolReloc(uint32_t codeOffset, uint64_t symbolId);
 void recordEmbeddedValueReloc(uint32_t codeOffset, uint64_t value);
-void endFunction(const uint8_t* hostBytes, size_t hostSize);
+void abortFunction();
+void endFunction(const uint8_t* hostBytes, size_t hostSize,
+                 const EntryPoint* entryPoints, size_t entryPointCount);
 
 } // namespace JitCacheBridge

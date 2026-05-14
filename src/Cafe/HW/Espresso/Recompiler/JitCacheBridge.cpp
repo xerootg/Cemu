@@ -148,7 +148,17 @@ void recordEmbeddedValueReloc(uint32_t codeOffset, uint64_t value)
 	g_totalRelocs.fetch_add(1, std::memory_order_relaxed);
 }
 
-void endFunction(const uint8_t* hostBytes, size_t hostSize)
+void abortFunction()
+{
+	std::lock_guard<std::mutex> lk(g_mutex);
+	if (!g_initialized || !g_inFunction)
+		return;
+	g_inFunction = false;
+	g_currentRelocs.clear();
+}
+
+void endFunction(const uint8_t* hostBytes, size_t hostSize,
+                 const EntryPoint* entryPoints, size_t entryPointCount)
 {
 	std::lock_guard<std::mutex> lk(g_mutex);
 	if (!g_initialized || !g_inFunction)
@@ -178,6 +188,12 @@ void endFunction(const uint8_t* hostBytes, size_t hostSize)
 	emitted.hostBytes.assign(hostBytes, hostBytes + hostSize);
 	emitted.relocs = std::move(g_currentRelocs);
 	g_currentRelocs.clear();
+	emitted.entryPoints.resize(entryPointCount);
+	for (size_t i = 0; i < entryPointCount; ++i)
+	{
+		emitted.entryPoints[i].ppcAddr = entryPoints[i].ppcAddr;
+		emitted.entryPoints[i].hostOffset = entryPoints[i].hostOffset;
+	}
 
 	g_cache.insert(key, emitted);
 	g_totalInserts.fetch_add(1, std::memory_order_relaxed);

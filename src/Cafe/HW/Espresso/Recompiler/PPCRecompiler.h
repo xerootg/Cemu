@@ -20,7 +20,12 @@ struct PPCRecFunction_t
 	uint32 ppcAddress;
 	uint32 ppcSize; // ppc code size of function
 	void*  x86Code; // pointer to x86 code
-	size_t x86Size;
+	size_t x86Size; // size of the underlying code allocation (xbyak page),
+	                // passed to PPCRecompiler_cleanupAArch64Code at free
+	size_t x86CodeLen; // length in bytes of the actual emitted code; <=
+	                   // x86Size. The trailing x86Size - x86CodeLen bytes
+	                   // are uninitialized padding that branches never
+	                   // reach. The JIT cache stores only x86CodeLen bytes.
 	std::vector<ppcRecRange_t> list_ranges;
 };
 

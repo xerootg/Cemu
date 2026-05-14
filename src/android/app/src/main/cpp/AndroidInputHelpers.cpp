@@ -49,6 +49,25 @@ void EmulatedControllerManager::SetAxisValue(uint64 mappingId, float value)
 	m_emulatedController->setAxisValue(mappingId, value);
 }
 
+void EmulatedControllerManager::SetAxisValues4(uint64 upMapping, float upValue,
+											   uint64 downMapping, float downValue,
+											   uint64 leftMapping, float leftValue,
+											   uint64 rightMapping, float rightValue)
+{
+	if (!m_emulatedController)
+	{
+		return;
+	}
+
+	const std::array<std::pair<uint64, float>, 4> values{{
+		{upMapping, upValue},
+		{downMapping, downValue},
+		{leftMapping, leftValue},
+		{rightMapping, rightValue},
+	}};
+	m_emulatedController->setAxisValues(values);
+}
+
 void EmulatedControllerManager::SetType(EmulatedController::Type type)
 {
 	if (m_emulatedController && m_emulatedController->type() == type)

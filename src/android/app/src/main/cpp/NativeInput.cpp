@@ -358,6 +358,21 @@ Java_info_cemu_cemu_nativeinterface_NativeInput_onOverlayAxis([[maybe_unused]] J
 }
 
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeInput_onOverlayJoystickAxes(
+	[[maybe_unused]] JNIEnv* env,
+	[[maybe_unused]] jclass clazz,
+	jint controllerIndex,
+	jint upMapping, jint downMapping, jint leftMapping, jint rightMapping,
+	jfloat up, jfloat down, jfloat left, jfloat right)
+{
+	EmulatedControllerManager::GetController(controllerIndex).SetAxisValues4(
+		static_cast<uint64>(upMapping), up,
+		static_cast<uint64>(downMapping), down,
+		static_cast<uint64>(leftMapping), left,
+		static_cast<uint64>(rightMapping), right);
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeInput_setControllerCallbacks(JNIEnv* env, [[maybe_unused]] jclass clazz, jobject callbacks)
 {
 	ControllerManager::instance().set_controller_callbacks(callbacks == nullptr ? nullptr : std::make_shared<NativeInput::AndroidControllerCallbacks>(env, callbacks));

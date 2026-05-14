@@ -21,6 +21,11 @@ class EmulatedControllerManager
 
 	void SetAxisValue(uint64 mappingId, float value);
 
+	void SetAxisValues4(uint64 upMapping, float upValue,
+						uint64 downMapping, float downValue,
+						uint64 leftMapping, float leftValue,
+						uint64 rightMapping, float rightValue);
+
 	void SetType(EmulatedController::Type type);
 
 	void SetMapping(uint64 mappingId, ControllerPtr controller, uint64 buttonId);

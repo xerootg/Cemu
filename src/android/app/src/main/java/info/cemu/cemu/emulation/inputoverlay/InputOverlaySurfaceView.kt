@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.DisplayMetrics
+import android.view.Choreographer
 import android.view.MotionEvent
 import android.view.SurfaceView
 import android.view.View
@@ -32,8 +33,8 @@ import info.cemu.cemu.emulation.inputoverlay.inputs.innerdrawing.TextButtonInner
 import info.cemu.cemu.nativeinterface.NativeInput
 import info.cemu.cemu.nativeinterface.NativeInput.getControllerType
 import info.cemu.cemu.nativeinterface.NativeInput.isControllerDisabled
-import info.cemu.cemu.nativeinterface.NativeInput.onOverlayAxis
 import info.cemu.cemu.nativeinterface.NativeInput.onOverlayButton
+import info.cemu.cemu.nativeinterface.NativeInput.onOverlayJoystickAxes
 import kotlin.math.roundToInt
 
 class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchListener {
@@ -64,6 +65,18 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
     private val currentAlpha get() = settings.alpha
     private val isVibrateOnTouchEnabled: Boolean
         get() = settings.isVibrateOnTouchEnabled && vibrator.hasVibrator()
+
+    private var invalidateScheduled = false
+    private val invalidateFrameCallback = Choreographer.FrameCallback {
+        invalidateScheduled = false
+        invalidate()
+    }
+
+    private fun scheduleInvalidate() {
+        if (invalidateScheduled) return
+        invalidateScheduled = true
+        Choreographer.getInstance().postFrameCallback(invalidateFrameCallback)
+    }
 
     init {
         visibility = GONE
@@ -221,8 +234,27 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         onOverlayButton(controllerIndex, nativeButtonId, state)
     }
 
-    private fun onOverlayAxis(axis: Int, value: Float) {
-        onOverlayAxis(controllerIndex, axis, value)
+    private fun emitJoystickAxes(
+        upMapping: Int,
+        downMapping: Int,
+        leftMapping: Int,
+        rightMapping: Int,
+        up: Float,
+        down: Float,
+        left: Float,
+        right: Float,
+    ) {
+        onOverlayJoystickAxes(
+            controllerIndex,
+            upMapping,
+            downMapping,
+            leftMapping,
+            rightMapping,
+            up,
+            down,
+            left,
+            right,
+        )
     }
 
     private fun onVPADJoystickStateChange(
@@ -233,15 +265,21 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         right: Float,
     ) {
         if (joystick == OverlayJoystick.LEFT) {
-            onOverlayAxis(NativeInput.VPADButton.STICKL_UP, up)
-            onOverlayAxis(NativeInput.VPADButton.STICKL_DOWN, down)
-            onOverlayAxis(NativeInput.VPADButton.STICKL_LEFT, left)
-            onOverlayAxis(NativeInput.VPADButton.STICKL_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.VPADButton.STICKL_UP,
+                NativeInput.VPADButton.STICKL_DOWN,
+                NativeInput.VPADButton.STICKL_LEFT,
+                NativeInput.VPADButton.STICKL_RIGHT,
+                up, down, left, right,
+            )
         } else if (joystick == OverlayJoystick.RIGHT) {
-            onOverlayAxis(NativeInput.VPADButton.STICKR_UP, up)
-            onOverlayAxis(NativeInput.VPADButton.STICKR_DOWN, down)
-            onOverlayAxis(NativeInput.VPADButton.STICKR_LEFT, left)
-            onOverlayAxis(NativeInput.VPADButton.STICKR_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.VPADButton.STICKR_UP,
+                NativeInput.VPADButton.STICKR_DOWN,
+                NativeInput.VPADButton.STICKR_LEFT,
+                NativeInput.VPADButton.STICKR_RIGHT,
+                up, down, left, right,
+            )
         }
     }
 
@@ -253,15 +291,21 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         right: Float,
     ) {
         if (joystick == OverlayJoystick.LEFT) {
-            onOverlayAxis(NativeInput.ProButton.STICKL_UP, up)
-            onOverlayAxis(NativeInput.ProButton.STICKL_DOWN, down)
-            onOverlayAxis(NativeInput.ProButton.STICKL_LEFT, left)
-            onOverlayAxis(NativeInput.ProButton.STICKL_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.ProButton.STICKL_UP,
+                NativeInput.ProButton.STICKL_DOWN,
+                NativeInput.ProButton.STICKL_LEFT,
+                NativeInput.ProButton.STICKL_RIGHT,
+                up, down, left, right,
+            )
         } else if (joystick == OverlayJoystick.RIGHT) {
-            onOverlayAxis(NativeInput.ProButton.STICKR_UP, up)
-            onOverlayAxis(NativeInput.ProButton.STICKR_DOWN, down)
-            onOverlayAxis(NativeInput.ProButton.STICKR_LEFT, left)
-            onOverlayAxis(NativeInput.ProButton.STICKR_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.ProButton.STICKR_UP,
+                NativeInput.ProButton.STICKR_DOWN,
+                NativeInput.ProButton.STICKR_LEFT,
+                NativeInput.ProButton.STICKR_RIGHT,
+                up, down, left, right,
+            )
         }
     }
 
@@ -273,15 +317,21 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         right: Float,
     ) {
         if (joystick == OverlayJoystick.LEFT) {
-            onOverlayAxis(NativeInput.ClassicButton.STICKL_UP, up)
-            onOverlayAxis(NativeInput.ClassicButton.STICKL_DOWN, down)
-            onOverlayAxis(NativeInput.ClassicButton.STICKL_LEFT, left)
-            onOverlayAxis(NativeInput.ClassicButton.STICKL_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.ClassicButton.STICKL_UP,
+                NativeInput.ClassicButton.STICKL_DOWN,
+                NativeInput.ClassicButton.STICKL_LEFT,
+                NativeInput.ClassicButton.STICKL_RIGHT,
+                up, down, left, right,
+            )
         } else if (joystick == OverlayJoystick.RIGHT) {
-            onOverlayAxis(NativeInput.ClassicButton.STICKR_UP, up)
-            onOverlayAxis(NativeInput.ClassicButton.STICKR_DOWN, down)
-            onOverlayAxis(NativeInput.ClassicButton.STICKR_LEFT, left)
-            onOverlayAxis(NativeInput.ClassicButton.STICKR_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.ClassicButton.STICKR_UP,
+                NativeInput.ClassicButton.STICKR_DOWN,
+                NativeInput.ClassicButton.STICKR_LEFT,
+                NativeInput.ClassicButton.STICKR_RIGHT,
+                up, down, left, right,
+            )
         }
     }
 
@@ -293,10 +343,13 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         right: Float,
     ) {
         if (joystick == OverlayJoystick.RIGHT) {
-            onOverlayAxis(NativeInput.WiimoteButton.NUNCHUCK_UP, up)
-            onOverlayAxis(NativeInput.WiimoteButton.NUNCHUCK_DOWN, down)
-            onOverlayAxis(NativeInput.WiimoteButton.NUNCHUCK_LEFT, left)
-            onOverlayAxis(NativeInput.WiimoteButton.NUNCHUCK_RIGHT, right)
+            emitJoystickAxes(
+                NativeInput.WiimoteButton.NUNCHUCK_UP,
+                NativeInput.WiimoteButton.NUNCHUCK_DOWN,
+                NativeInput.WiimoteButton.NUNCHUCK_LEFT,
+                NativeInput.WiimoteButton.NUNCHUCK_RIGHT,
+                up, down, left, right,
+            )
         }
     }
 
@@ -553,10 +606,18 @@ class InputOverlaySurfaceView(context: Context) : SurfaceView(context), OnTouchL
         }
 
         if (touchEventProcessed) {
-            invalidate()
+            scheduleInvalidate()
         }
 
         return touchEventProcessed
+    }
+
+    override fun onDetachedFromWindow() {
+        if (invalidateScheduled) {
+            Choreographer.getInstance().removeFrameCallback(invalidateFrameCallback)
+            invalidateScheduled = false
+        }
+        super.onDetachedFromWindow()
     }
 
     companion object {

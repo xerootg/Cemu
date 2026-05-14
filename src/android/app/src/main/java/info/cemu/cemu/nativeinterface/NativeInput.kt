@@ -258,6 +258,19 @@ object NativeInput {
     @JvmStatic
     external fun onOverlayAxis(controllerIndex: Int, mappingId: Int, value: Float)
 
+    @JvmStatic
+    external fun onOverlayJoystickAxes(
+        controllerIndex: Int,
+        upMapping: Int,
+        downMapping: Int,
+        leftMapping: Int,
+        rightMapping: Int,
+        up: Float,
+        down: Float,
+        left: Float,
+        right: Float,
+    )
+
     @Keep
     interface ControllerCallbacks {
         fun vibrateController(descriptor: String, milliseconds: Long, amplitude: Int)

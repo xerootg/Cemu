@@ -103,6 +103,7 @@ public:
 	virtual bool set_default_mapping(const std::shared_ptr<ControllerBase>& controller) { return false; }
 	void setButtonValue(uint64 mapping, bool value);
 	void setAxisValue(uint64 mapping, float value);
+	void setAxisValues(std::span<const std::pair<uint64, float>> values);
 protected:
 	size_t m_player_index;
 	std::string m_profile_name = "default";

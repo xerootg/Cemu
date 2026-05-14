@@ -282,14 +282,21 @@ float EmulatedController::get_axis_value(uint64 mapping) const
 
 void EmulatedController::setButtonValue(uint64 mapping, bool value)
 {
-	std::shared_lock lock(m_mutex);
+	std::scoped_lock lock(m_mutex);
 	m_overriddenButtonMappings[mapping] = value;
 
 }
 void EmulatedController::setAxisValue(uint64 mapping, float value)
 {
-	std::shared_lock lock(m_mutex);
+	std::scoped_lock lock(m_mutex);
 	m_overriddenAxisMappings[mapping] = value;
+}
+
+void EmulatedController::setAxisValues(std::span<const std::pair<uint64, float>> values)
+{
+	std::scoped_lock lock(m_mutex);
+	for (const auto& [mapping, value] : values)
+		m_overriddenAxisMappings[mapping] = value;
 }
 
 bool EmulatedController::is_mapping_down(uint64 mapping) const

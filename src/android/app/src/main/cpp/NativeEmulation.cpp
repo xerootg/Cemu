@@ -427,3 +427,15 @@ Java_info_cemu_cemu_nativeinterface_NativeEmulation_isForegroundReleased([[maybe
 {
 	return coreinit::IsForegroundReleased() ? JNI_TRUE : JNI_FALSE;
 }
+
+// Returns the current TV/main canvas dimensions packed as (width << 32) | (height & 0xFFFFFFFF).
+// 0 means no surface set yet. Used by the foreground-service notification for "nerd stats"
+// — it's the dimensions the SurfaceView reports, not the internal render target.
+extern "C" [[maybe_unused]] JNIEXPORT jlong JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_getCurrentRenderResolutionPacked([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	auto& windowInfo = WindowSystem::GetWindowInfo();
+	jlong w = static_cast<jlong>(windowInfo.width) & 0xFFFFFFFFLL;
+	jlong h = static_cast<jlong>(windowInfo.height) & 0xFFFFFFFFLL;
+	return (w << 32) | h;
+}

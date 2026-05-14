@@ -54,6 +54,14 @@ object NativeEmulation {
     @JvmStatic
     external fun isForegroundReleased(): Boolean
 
+    /**
+     * Returns the current TV/main canvas dimensions packed into a single Long:
+     * `(width << 32) | (height & 0xFFFFFFFF)`. Returns 0 if no surface has been set yet.
+     * Used by the foreground-service nerd-stats notification; sample on a slow loop.
+     */
+    @JvmStatic
+    external fun getCurrentRenderResolutionPacked(): Long
+
     @JvmStatic
     external fun initializeSystems()
 

@@ -8,6 +8,15 @@
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
 
+    <!-- Foreground service: keeps the emulator process alive across backgrounding so the LMK
+         doesn't reclaim long-running game sessions. mediaPlayback is the appropriate type for
+         a game that emits audio; the FOREGROUND_SERVICE_MEDIA_PLAYBACK runtime permission is
+         required on Android 14 (API 34) and up. POST_NOTIFICATIONS is for the persistent
+         notification on Android 13+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature
         android:name="android.hardware.vulkan.version"
         android:required="true"
@@ -69,5 +78,10 @@
                 <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
             </intent-filter>
         </provider>
+
+        <service
+            android:name=".emulation.EmulationForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

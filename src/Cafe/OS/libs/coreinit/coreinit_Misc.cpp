@@ -841,12 +841,14 @@ namespace coreinit
 	void OSReleaseForeground()
 	{
 		cemuLog_log(LogType::Force, "OSReleaseForeground called");
-		// Real userspace OSReleaseForeground performs a 3-core rendezvous, posts MsgExit for
-		// deferred-exit titles, then issues sc 0x2800 to hand off to the kernel. Cemu's HLE skips
-		// the rendezvous (single emulator thread per PPC core) and routes through the same
-		// trigger as the external "Pause game" debug toggle. Driver dispatch happens on the
-		// receiver side in HandleReceivedSystemMessage so it runs in PPC context.
-		TriggerReleaseForegroundTransition();
+		// No-op. On real Wii U this issues sc 0x2800 (ProcCtrl) after a 3-core rendezvous;
+		// each core calls OSReleaseForeground as part of finishing its RELEASE callback, so
+		// games trigger this 3+ times per release cycle. Our HLE drives transitions via
+		// external triggers (Android Activity lifecycle, debug UI checkbox) — calling
+		// TriggerReleaseForegroundTransition() from here meant a stale per-core completion
+		// could post a fresh MsgReleaseForeground after the user had already resumed,
+		// leaving the title permanently re-released and stuck. The trigger functions are
+		// the only path that should post messages.
 	}
 
 	void OSSavesDone_ReadyToRelease()

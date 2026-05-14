@@ -75,6 +75,7 @@ fun EmulationScreen(
     gamePath: String,
     setMotionSensorEnabled: (Boolean) -> Unit,
     setInputListeningEnabled: (Boolean) -> Unit,
+    onMinimize: () -> Unit,
     onQuit: () -> Unit,
     viewModel: EmulationViewModel = viewModel(
         factory = EmulationViewModel.Factory, extras = MutableCreationExtras().apply {
@@ -117,9 +118,15 @@ fun EmulationScreen(
         if (drawerState.isAnimationRunning) {
             return@BackHandler
         }
-
-        scope.launch {
-            toggleMenu()
+        // If the user has the back-back-to-minimize setting on and the drawer is already
+        // open, the second back press hides the app to the recents (instead of closing
+        // the drawer). Otherwise back toggles the drawer as usual.
+        if (drawerState.isOpen && sideMenuState.isDoubleBackToMinimizeEnabled) {
+            onMinimize()
+        } else {
+            scope.launch {
+                toggleMenu()
+            }
         }
     }
 
@@ -355,6 +362,12 @@ private fun EmulationSideMenuContent(
         label = tr("Show input overlay"),
         checked = sideMenuState.isInputOverlayVisible,
         onCheckedChange = { updateState(sideMenuState.copy(isInputOverlayVisible = it)) },
+    )
+
+    CheckboxItem(
+        label = tr("Back-back to minimize (when drawer is open)"),
+        checked = sideMenuState.isDoubleBackToMinimizeEnabled,
+        onCheckedChange = { updateState(sideMenuState.copy(isDoubleBackToMinimizeEnabled = it)) },
     )
 
     TextButtonItem(

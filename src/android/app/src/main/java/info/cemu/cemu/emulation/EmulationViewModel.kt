@@ -38,6 +38,10 @@ data class SideMenuState(
     val isTVReplacedWithPad: Boolean = false,
     val isPadVisible: Boolean = false,
     val isInputOverlayVisible: Boolean = false,
+    // When true, pressing Back while the side drawer is already open minimizes the app
+    // (moveTaskToBack) instead of closing the drawer. First Back-press still opens the
+    // drawer as usual. Quick "stash the game" gesture for use in public.
+    val isDoubleBackToMinimizeEnabled: Boolean = false,
 )
 
 class ConditionFlags(

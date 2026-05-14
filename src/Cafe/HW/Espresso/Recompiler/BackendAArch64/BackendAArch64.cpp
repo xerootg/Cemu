@@ -9,6 +9,7 @@
 #include <cstddef>
 
 #include "../PPCRecompiler.h"
+#include "RelocTaxonomy.h"
 #include "Common/precompiled.h"
 #include "Common/cpu_features.h"
 #include "HW/Espresso/Interpreter/PPCInterpreterInternal.h"
@@ -186,6 +187,19 @@ struct AArch64GenContext_t : CodeGenerator
 	explicit AArch64GenContext_t(Allocator* allocator = nullptr);
 	void enterRecompilerCode();
 	void leaveRecompilerCode();
+
+	// Phase 0 reloc-taxonomy hook: every absolute 64-bit pointer that ends up
+	// inside a per-PPC-function host code body must go through this helper.
+	// It records (codeOffset, value, kind) before emitting the standard
+	// xbyak_aarch64 mov(XReg, uint64) which lowers to up to 4 movz/movk insns.
+	// Used by macro() and call_imm(); intentionally NOT used by
+	// enterRecompilerCode/leaveRecompilerCode (those are the one-time
+	// trampolines, not cached). See RelocTaxonomy.h.
+	void emitAbsoluteImm64(const XReg& reg, uint64 value, JitRelocTaxonomy::AbsImm64Kind kind)
+	{
+		JitRelocTaxonomy::recordAbsImm64(getSize(), value, kind);
+		mov(reg, value);
+	}
 
 	void r_name(IMLInstruction* imlInstruction);
 	void name_r(IMLInstruction* imlInstruction);
@@ -1278,7 +1292,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 
 			// ===== bail-out conditions before locking =====
 			cbz(x0, slowCall);                                              // NULL queue
-			mov(x9, (uint64)&coreinit::g_systemMessageQueuePtr);
+			emitAbsoluteImm64(x9, (uint64)&coreinit::g_systemMessageQueuePtr, JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
 			ldr(x9, AdrNoOfs(x9));
 			cmp(x0, x9);
 			beq(slowCall);                                                  // system queue
@@ -1290,10 +1304,10 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// multiplicative hash become the slot index. Mask is implicit: the top
 			// bits of a 64-bit shift-right are guaranteed in range when extracted.
 			lsr(x10, x0, 4);
-			mov(x9, (uint64)0x9E3779B97F4A7C15ULL);
+			emitAbsoluteImm64(x9, (uint64)0x9E3779B97F4A7C15ULL, JitRelocTaxonomy::AbsImm64Kind::LITERAL_CONST);
 			mul(x10, x10, x9);
 			lsr(x10, x10, coreinit::QUEUE_LOCK_POOL_INDEX_SHIFT);            // x10 = slot index
-			mov(x9, (uint64)&coreinit::g_queueLockPool[0]);
+			emitAbsoluteImm64(x9, (uint64)&coreinit::g_queueLockPool[0], JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
 			add(x9, x9, x10, ShMod::LSL, 4);                                // x9 = &slot (size 16)
 
 			// ===== atomic-OR lockState bit 0; prior value also carries waiter bits =====
@@ -1371,7 +1385,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				// If a send-side waiter existed at snapshot time, wake one.
 				// x0 still holds msgQueue.
 				cbz(w16, fastDone);
-				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender);
+				emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneSender, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
 				blr(TEMP_GPR1.XReg);
 				b(fastDone);
 			}
@@ -1423,7 +1437,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 				ldclrl(w11, wzr, AdrNoOfs(x9));
 				// If a receive-side waiter existed at snapshot time, wake one.
 				cbz(w16, fastDone);
-				mov(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver);
+				emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::OSWakeOneReceiver, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
 				blr(TEMP_GPR1.XReg);
 				b(fastDone);
 			}
@@ -1439,7 +1453,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			{
 				uint64 target = isReceive ? (uint64)&coreinit::OSReceiveMessage
 				                          : (uint64)&coreinit::OSSendMessage;
-				mov(TEMP_GPR1.XReg, target);
+				emitAbsoluteImm64(TEMP_GPR1.XReg, target, JitRelocTaxonomy::AbsImm64Kind::HLE_FUNCTION_PTR);
 				blr(TEMP_GPR1.XReg);
 				str(w0, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, gpr) + sizeof(uint32) * 3));
 			}
@@ -1472,7 +1486,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			// owner-check; bypassing the C++ wrapper avoids the host-ptr<->MPTR
 			// conversion overhead in cafeExportCallWrapper.
 			ldr(w10, AdrUimm(HCPU_REG, offsetof(PPCInterpreter_t, spr.UPIR)));
-			mov(TEMP_GPR1.XReg, (uint64)&coreinit::__currentCoreThread[0]);
+			emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)&coreinit::__currentCoreThread[0], JitRelocTaxonomy::AbsImm64Kind::HLE_GLOBAL_PTR);
 			ldr(x11, AdrExt(TEMP_GPR1.XReg, w10, ExtMod::UXTW, 3));        // host ptr (sizeof OSThread_t* == 8)
 			cmp(x11, 0);
 			sub(x12, x11, MEM_BASE_REG);                                    // guest MPTR
@@ -1502,7 +1516,7 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 			mov(w1, funcId);
 			// call HLE function
 
-			mov(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE);
+			emitAbsoluteImm64(TEMP_GPR1.XReg, (uint64)PPCRecompiler_virtualHLE, JitRelocTaxonomy::AbsImm64Kind::RECOMPILER_HELPER_PTR);
 			blr(TEMP_GPR1.XReg);
 
 			mov(HCPU_REG, x0);
@@ -2332,7 +2346,7 @@ void AArch64GenContext_t::fpr_compare(IMLInstruction* imlInstruction)
 void AArch64GenContext_t::call_imm(IMLInstruction* imlInstruction)
 {
 	str(x30, AdrPreImm(sp, -16));
-	mov(TEMP_GPR1.XReg, imlInstruction->op_call_imm.callAddress);
+	emitAbsoluteImm64(TEMP_GPR1.XReg, imlInstruction->op_call_imm.callAddress, JitRelocTaxonomy::AbsImm64Kind::PPC_CALL_IMM_TARGET);
 	blr(TEMP_GPR1.XReg);
 	ldr(x30, AdrPostImm(sp, 16));
 }
@@ -2341,6 +2355,11 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 {
 	AArch64Allocator allocator;
 	AArch64GenContext_t aarch64GenContext{&allocator};
+
+	// Phase 0: open a reloc-taxonomy recording window around the body
+	// codegen. emitAbsoluteImm64 sites will log into the active window;
+	// endFunction closes it. See RelocTaxonomy.h.
+	JitRelocTaxonomy::beginFunction(PPCRecFunction->ppcAddress);
 
 	// generate iml instruction code
 	bool codeGenerationFailed = false;
@@ -2571,12 +2590,14 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// handle failed code generation
 	if (codeGenerationFailed)
 	{
+		JitRelocTaxonomy::endFunction(0);
 		return false;
 	}
 
 	if (!aarch64GenContext.processAllJumps())
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompiler_generateAArch64Code(): some jumps exceeded the +/-128MB offset.");
+		JitRelocTaxonomy::endFunction(0);
 		return false;
 	}
 
@@ -2585,6 +2606,7 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, 
 	// set code
 	PPCRecFunction->x86Code = aarch64GenContext.getCode<void*>();
 	PPCRecFunction->x86Size = aarch64GenContext.getMaxSize();
+	JitRelocTaxonomy::endFunction(PPCRecFunction->x86Size);
 	// set free disabled to skip freeing the code from the CodeGenerator destructor
 	allocator.setFreeDisabled(true);
 	return true;

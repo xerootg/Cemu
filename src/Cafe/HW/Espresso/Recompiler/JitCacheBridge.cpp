@@ -64,7 +64,19 @@ namespace JitCacheBridge
 //       here forces every entry from a phase-A-polluted session to
 //       fingerprint-miss and re-JIT against the corrected (bl-only)
 //       discovery set.
-constexpr uint32_t kCodegenVersion = 5;
+//   6 = recompiler optimization series (commits 897d8782 + 91fe60ea):
+//       reverted the scvtf/ucvtf + round-to-single elision passes,
+//       added ARM64_ADDS/SUBS Rc=1 flag-setting fold. All three change
+//       emitted bytes for matching IML, so any v5-era cached entry must
+//       be invalidated. Reminder for future codegen edits: every commit
+//       that touches an emit site in BackendAArch64.cpp or an IML pass
+//       that affects what gets emitted MUST bump this number, otherwise
+//       a stale cache will execute bytes from a different codegen.
+//   7 = stdlib helper byte-hash substitution: __lldiv (CW signed 64-bit
+//       divide) now generates a ~9-insn host stub instead of translating
+//       its ~80 PPC instructions. Caches from v6 had the full
+//       translation; v7 may install the stub instead, so bytes differ.
+constexpr uint32_t kCodegenVersion = 7;
 
 uint64_t SYM_g_systemMessageQueuePtr = 0;
 uint64_t SYM_g_queueLockPool = 0;

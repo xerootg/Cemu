@@ -9,6 +9,7 @@
 #include <cstddef>
 
 #include "../PPCRecompiler.h"
+#include "../PPCStdlibStubs.h"
 #include "../JitCacheBridge.h"
 #include "Common/precompiled.h"
 #include "Common/cpu_features.h"
@@ -2751,6 +2752,74 @@ void PPCRecompiler_cleanupAArch64Code(void* code, size_t size)
 void* PPCRecompiler_getVirtualHLEHostAddr()
 {
 	return reinterpret_cast<void*>(&PPCRecompiler_virtualHLE);
+}
+
+// Generate a host stub that replaces a CodeWarrior runtime helper with a
+// direct AArch64 implementation. Caller has already identified the helper
+// kind via PPCStdlibStubs_Identify and is responsible for installing the
+// stub into directJumpTable via the normal makeRecompiledFunctionActive
+// path. Returns false if the kind isn't supported.
+bool PPCRecompiler_emitStdlibStub_AArch64(PPCRecFunction_t* ppcRecFunc, PPCStdlibStubKind kind)
+{
+	AArch64Allocator* allocator = new AArch64Allocator();
+	AArch64GenContext_t ctx{allocator};
+
+	if (kind == PPCStdlibStubKind::LongLongDivide_Signed)
+	{
+		// __lldiv(int64 a, int64 b) -> int64
+		//   a = ((int64)gpr[3] << 32) | gpr[4]    [signed]
+		//   b = ((int64)gpr[5] << 32) | gpr[6]    [signed]
+		//   r = a / b
+		//   gpr[3] = (uint32)(r >> 32)
+		//   gpr[4] = (uint32) r
+		//
+		// 4 GPR loads + 2 stores + sdiv + return. ~9 host insns vs the
+		// ~80 PPC instructions of the original __lldiv body. We freely
+		// clobber x0..x7 since they're caller-saved by AArch64 ABI and
+		// the JIT doesn't pin any guest state to them.
+		constexpr uint32 kGprOffset = offsetof(PPCInterpreter_t, gpr);
+
+		// Load both 64-bit operands as W-pairs, then pack into X regs.
+		// AArch64 ldp w0,w1 zero-extends w0 -> x0 and w1 -> x1.
+		// (xbyak_aarch64 has no bare `w0` globals -- construct via WReg(N).)
+		WReg w0_(0), w1_(1), w2_(2), w3_(3), w6_(6), w7_(7);
+		XReg x0_(0), x1_(1), x2_(2), x3_(3), x4_(4), x5_(5), x6_(6), x7_(7);
+		ctx.ldp(w0_, w1_, AdrImm(HCPU_REG, kGprOffset + 3 * sizeof(uint32)));   // w0=gpr[3], w1=gpr[4]
+		ctx.ldp(w2_, w3_, AdrImm(HCPU_REG, kGprOffset + 5 * sizeof(uint32)));   // w2=gpr[5], w3=gpr[6]
+		ctx.orr(x4_, x1_, x0_, ShMod::LSL, 32);  // x4 = ((uint64)gpr[3] << 32) | gpr[4]
+		ctx.orr(x5_, x3_, x2_, ShMod::LSL, 32);  // x5 = ((uint64)gpr[5] << 32) | gpr[6]
+		ctx.sdiv(x6_, x4_, x5_);                 // x6 = signed quotient
+		ctx.lsr(x7_, x6_, 32);                   // x7 = (uint32)(quotient >> 32)
+		// stp w7,w6 writes w7 to [base], w6 to [base+4]; we want gpr[3]
+		// (high half) at [base] and gpr[4] (low) at [base+4].
+		ctx.stp(w7_, w6_, AdrImm(HCPU_REG, kGprOffset + 3 * sizeof(uint32)));
+
+		// Conservative cycle accounting -- the original __lldiv body is
+		// ~80 PPC insns. We don't model the actual conditional branches;
+		// the bookkeeping just keeps the OS scheduler honest.
+		ctx.sub_imm(REMAINING_CYCLES_REG.WReg, REMAINING_CYCLES_REG.WReg, 80, TEMP_GPR1.WReg);
+
+		// Return via PPC_LR_REG using the same sequence MACRO_B_TO_REG
+		// uses (LDR-with-extended-index into directJumpTable + ret).
+		ctx.lsr(TEMP_GPR1.WReg, PPC_LR_REG.WReg, 2);
+		ctx.ldr(TEMP_GPR1.XReg, AdrExt(PPC_REC_INSTANCE_REG, TEMP_GPR1.WReg, ExtMod::UXTW, 3));
+		ctx.mov(LR.WReg, PPC_LR_REG.WReg);
+		ctx.ret(TEMP_GPR1.XReg);
+	}
+	else
+	{
+		delete allocator;
+		return false;
+	}
+
+	ctx.readyRE();
+	ppcRecFunc->x86Code = ctx.getCode<void*>();
+	ppcRecFunc->x86Size = ctx.getMaxSize();
+	ppcRecFunc->x86CodeLen = ctx.getSize();
+	allocator->setFreeDisabled(true);
+	// Allocator owns the JIT page now; intentionally leak it (matches the
+	// pattern in PPCRecompiler_loadAArch64FromCache and the codegen path).
+	return true;
 }
 
 bool PPCRecompiler_loadAArch64FromCache(PPCRecFunction_t* ppcRecFunc, const uint8_t* hostBytes, size_t hostSize)

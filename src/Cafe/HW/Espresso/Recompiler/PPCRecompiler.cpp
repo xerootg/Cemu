@@ -3,6 +3,7 @@
 #include "PPCRecompiler.h"
 #include "PPCRecompilerIml.h"
 #include "JitCacheBridge.h"
+#include "PPCStdlibStubs.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/OS/RPL/rpl_structs.h"
@@ -213,6 +214,34 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
 #endif
 
 #if defined(__aarch64__)
+	// Stdlib helper substitution: if this function's prologue matches a
+	// known CodeWarrior runtime helper (e.g. __lldiv), generate a tiny
+	// host-side stub instead of translating the ~80-150 PPC insns. The
+	// substitute uses host AArch64 sdiv/udiv/etc. and returns via PPC's
+	// blr path, so callers don't need to know.
+	{
+		PPCStdlibStubKind stubKind = PPCStdlibStubs_Identify(range.startAddress, range.length);
+		if (stubKind != PPCStdlibStubKind::None)
+		{
+			if (PPCRecompiler_emitStdlibStub_AArch64(ppcRecFunc, stubKind))
+			{
+				// Single entry point at the function start. Mirror the
+				// list_ranges + entryPoints bookkeeping that the codegen
+				// path would have produced -- without these, invalidation
+				// can't detect a write that overlaps this function.
+				entryPointsOut.clear();
+				entryPointsOut.emplace_back(range.startAddress, 0);
+				ppcRecRange_t recRange{};
+				recRange.ppcAddress = ppcRecFunc->ppcAddress;
+				recRange.ppcSize = ppcRecFunc->ppcSize;
+				ppcRecFunc->list_ranges.push_back(recRange);
+				return ppcRecFunc;
+			}
+			// Stub generation failed (shouldn't happen for known kinds).
+			// Fall through to the full codegen path.
+		}
+	}
+
 	// Phase 3b: ask the JIT cache before doing any work. On a hit with
 	// verify=off, we install the cached host bytes, populate entry
 	// points and list_ranges identical to what the codegen path would

@@ -69,6 +69,8 @@ add_library(CemuCafe
   HW/Espresso/Recompiler/PPCRecompiler.h
   HW/Espresso/Recompiler/JitCacheBridge.cpp
   HW/Espresso/Recompiler/JitCacheBridge.h
+  HW/Espresso/Recompiler/PPCStdlibStubs.cpp
+  HW/Espresso/Recompiler/PPCStdlibStubs.h
   HW/Espresso/Recompiler/JitCacheSeed.cpp
   HW/Espresso/Recompiler/JitCacheSeed.h
   HW/Espresso/Recompiler/IML/IML.h

@@ -118,6 +118,13 @@ class CemuApplication : Application() {
         )
         val userFolderPatterns = arrayOf(
             Pattern.compile("graphicPacks/.*"),
+            // Phase C: shipped JIT cache seeds live under cache_seed/ in the
+            // APK assets. The C++ side reads <userFolder>/cache_seed/catalog.json
+            // and <userFolder>/cache_seed/<titleId>.jseed.zst on first launch.
+            // userFolder placement means once unpacked they survive across
+            // re-installs; hash.txt invalidation re-extracts on every Cemu
+            // upgrade so a kCodegenVersion bump rolls in a fresh seed too.
+            Pattern.compile("cache_seed/.*"),
         )
 
         for (assetFile in traverseAssets()) {

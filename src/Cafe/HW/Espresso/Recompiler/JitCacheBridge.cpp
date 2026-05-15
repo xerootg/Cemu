@@ -12,6 +12,7 @@
 #include "HW/MMU/MMU.h"
 #include "HW/Espresso/Interpreter/PPCInterpreterInternal.h"
 #include "HW/Espresso/Recompiler/PPCRecompiler.h"
+#include "HW/Espresso/Recompiler/JitCacheSeed.h"
 #include "HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.h"
 #include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
 #include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
@@ -161,6 +162,25 @@ void initialize(uint64_t titleId)
 	    fmt::format("cache/jit/{:016x}", titleId));
 	std::error_code ec;
 	fs::create_directories(g_cacheDir, ec);
+
+	// Phase C: if the user has no manifest.bin yet (fresh install or first
+	// time playing this title) AND the APK shipped a seed for this title,
+	// hydrate the cache dir from the seed before loading. Any failure
+	// inside tryBootstrap leaves cacheDir empty -- the normal load() +
+	// phase B precompile below picks up the slack.
+	const fs::path manifestPath = g_cacheDir / "manifest.bin";
+	if (!fs::exists(manifestPath))
+	{
+		const fs::path seedRoot = ActiveSettings::GetUserDataPath("cache_seed");
+		if (JitCacheSeed::tryBootstrap(titleId, g_cacheDir, seedRoot,
+		                               kCodegenVersion,
+		                               jitcache::kCacheFormatVersion))
+		{
+			cemuLog_log(LogType::Force,
+			            "JitCache: hydrated from shipped seed before first run");
+		}
+	}
+
 	g_cache.load(g_cacheDir);
 
 	// Intern the eight singleton symbols phase 0 confirmed as the entire

@@ -1095,6 +1095,137 @@ static void IMLOptimizerArm64_FoldCntlzwIsZero(IMLOptimizerRegIOAnalysis& regIoA
 	}
 }
 
+// Elide ROUND_TO_SINGLE_PRECISION_BOTTOM when its input FPR is already
+// "single-clean" -- i.e., its value is provably representable exactly in
+// IEEE single precision. The op's host lowering is `fcvt s, d ; fcvt d, s`
+// (2 host insns of pure rounding overhead); when the input is single-clean
+// both fcvts are value-preserving and we can drop the whole op.
+//
+// Per-FPR single-clean tracking through the segment:
+//   * SET by: ROUND_TO_SINGLE_PRECISION_BOTTOM, FPR_LOAD mode=SINGLE,
+//             FPR_EXPAND_F32_TO_F64, FPR_LOAD_ONE.
+//   * PROPAGATED by: FPR_ASSIGN (from src), FPR_NEGATE / FPR_ABS /
+//             FPR_NEGATIVE_ABS (preserve from src; sign change exact).
+//   * CLEARED by: every other writer (full-precision arithmetic, double-mode
+//             loads, INT_TO_FLOAT/UINT_TO_FLOAT for large ints, BITCAST,
+//             FCTIWZ, SELECT, paired-single ops we don't model).
+//   * Initial state at segment entry: false (conservative -- cross-segment
+//             liveness isn't tracked here).
+//
+// Common firing pattern: `lfs fA, ...; frsp fA, fA`, redundant frsp on a
+// single-clean FPR carried through a sign change, etc.
+static void IMLOptimizerArm64_ElideRedundantRoundToSingle(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	std::unordered_map<IMLRegID, bool> singleClean;
+	auto isClean = [&](IMLReg fprReg) -> bool {
+		if (!fprReg.IsValid()) return false;
+		auto it = singleClean.find(fprReg.GetRegID());
+		return it != singleClean.end() && it->second;
+	};
+	auto markClean = [&](IMLReg fprReg, bool clean) {
+		if (!fprReg.IsValid()) return;
+		singleClean[fprReg.GetRegID()] = clean;
+	};
+
+	for (sint32 i = 0; i < (sint32)seg.imlList.size(); i++)
+	{
+		IMLInstruction& inst = seg.imlList[i];
+		switch (inst.type)
+		{
+		case PPCREC_IML_TYPE_FPR_R:
+		{
+			IMLReg dst = inst.op_fpr_r.regR;
+			if (inst.operation == PPCREC_IML_OP_FPR_LOAD_ONE)
+			{
+				markClean(dst, true);
+			}
+			else if (inst.operation == PPCREC_IML_OP_FPR_NEGATE ||
+			         inst.operation == PPCREC_IML_OP_FPR_ABS ||
+			         inst.operation == PPCREC_IML_OP_FPR_NEGATIVE_ABS)
+			{
+				// In-place sign manipulation -- preserves precision.
+				// (singleClean[dst] keeps its current value.)
+			}
+			else
+			{
+				markClean(dst, false);
+			}
+			break;
+		}
+		case PPCREC_IML_TYPE_FPR_R_R:
+		{
+			IMLReg dst = inst.op_fpr_r_r.regR;
+			IMLReg src = inst.op_fpr_r_r.regA;
+			if (inst.operation == PPCREC_IML_OP_FPR_ROUND_TO_SINGLE_PRECISION_BOTTOM)
+			{
+				// dst is also the source for this op (rounds in place per
+				// the existing backend lowering).
+				if (isClean(dst))
+				{
+					inst.make_no_op();
+					// FPR is still single-clean (no actual change).
+				}
+				else
+				{
+					markClean(dst, true);
+				}
+			}
+			else if (inst.operation == PPCREC_IML_OP_FPR_ASSIGN)
+			{
+				markClean(dst, isClean(src));
+			}
+			else if (inst.operation == PPCREC_IML_OP_FPR_EXPAND_F32_TO_F64)
+			{
+				// Single -> double widen is exact.
+				markClean(dst, true);
+			}
+			else
+			{
+				// FPR_INT_TO_FLOAT, FPR_UINT_TO_FLOAT, FPR_FLOAT_TO_INT,
+				// FPR_BITCAST_INT_TO_FLOAT, FPR_FCTIWZ all clear.
+				markClean(dst, false);
+			}
+			break;
+		}
+		case PPCREC_IML_TYPE_FPR_R_R_R:
+		case PPCREC_IML_TYPE_FPR_R_R_R_R:
+		{
+			IMLReg dst = (inst.type == PPCREC_IML_TYPE_FPR_R_R_R)
+			             ? inst.op_fpr_r_r_r.regR
+			             : inst.op_fpr_r_r_r_r.regR;
+			markClean(dst, false);
+			break;
+		}
+		case PPCREC_IML_TYPE_FPR_LOAD:
+		case PPCREC_IML_TYPE_FPR_LOAD_INDEXED:
+		{
+			IMLReg dst = inst.op_storeLoad.registerData;
+			// Single-mode loads expand single->double exactly. Double-mode
+			// loads bring in arbitrary doubles (not single-clean).
+			if (inst.op_storeLoad.mode == PPCREC_FPR_LD_MODE_SINGLE)
+				markClean(dst, true);
+			else
+				markClean(dst, false);
+			break;
+		}
+		case PPCREC_IML_TYPE_FPR_STORE:
+		case PPCREC_IML_TYPE_FPR_STORE_INDEXED:
+		case PPCREC_IML_TYPE_FPR_COMPARE:
+			// No FPR write.
+			break;
+		default:
+			// Conservative: any other op type that might touch FPRs we don't
+			// model clears any FPR it writes. For non-FPR ops this is a
+			// no-op (the maps are keyed on FPR IMLRegID; non-FPR writes
+			// just don't appear).
+			//
+			// In practice the FPR-touching IML types are enumerated above;
+			// this default is for ATOMIC, MACRO, etc. that don't touch FPRs.
+			break;
+		}
+	}
+}
+
 // Detect CodeWarrior's int->float magic-constant idiom and replace with a
 // single FPR_INT_TO_FLOAT (signed) or FPR_UINT_TO_FLOAT (unsigned), which
 // the AArch64 backend lowers to one scvtf / ucvtf instruction.
@@ -1402,6 +1533,9 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 	// it eliminates a chain of stores+loads+xor that those passes would
 	// otherwise scan over uselessly.
 	IMLOptimizerArm64_FoldCWIntToFloat(regIoAnalysis, seg);
+	// Drop ROUND_TO_SINGLE_PRECISION_BOTTOM ops whose input FPR is already
+	// single-precision-clean (lfs result, prior frsp result, etc.).
+	IMLOptimizerArm64_ElideRedundantRoundToSingle(regIoAnalysis, seg);
 	// Fold cntlzw+ubfx is_zero idiom before DCE so the eliminated cntlzw can be removed.
 	IMLOptimizerArm64_FoldCntlzwIsZero(regIoAnalysis, seg);
 	// Drop dead carry-out writes (SUBFIC, ADDC, SUBFC, ... whose XER.CA is unread).

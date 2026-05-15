@@ -48,6 +48,44 @@ class CemuApplication : Application() {
         initializeCemu()
 
         saveDataFiles()
+
+        syncCacheSeedAssets()
+    }
+
+    // Phase C: shipped JIT cache seeds live under cache_seed/ in the APK
+    // assets. We can NOT piggy-back on saveDataFiles() above because its
+    // gradle hash.txt only covers bin/ + bundledGraphicPacks/ -- adding a
+    // file under src/main/assets/cache_seed/ doesn't bump the hash, so the
+    // hash-gated extraction silently skips it. Instead we sync the
+    // cache_seed dir unconditionally on every launch. Costs ~ms (catalog
+    // is <1 KB; the only larger files are .jseed.zst seeds, copied with
+    // streaming).
+    private fun syncCacheSeedAssets() {
+        val seedAssetsRoot = "cache_seed"
+        val seedFiles = try {
+            assets.list(seedAssetsRoot) ?: return
+        } catch (_: IOException) {
+            return
+        }
+        if (seedFiles.isEmpty()) return
+
+        val userFolder = File(internalCemuUserFolder)
+        val targetDir = userFolder.resolve(seedAssetsRoot)
+        if (!targetDir.isDirectory && !targetDir.mkdirs()) return
+
+        for (assetFile in seedFiles) {
+            val outFile = targetDir.resolve(assetFile)
+            try {
+                assets.open("$seedAssetsRoot/$assetFile").use { asset ->
+                    outFile.outputStream().use { out -> asset.copyTo(out) }
+                }
+            } catch (_: IOException) {
+                // Leave the previous on-disk copy in place if we can't write
+                // the fresh one; the C++ bootstrap revalidates every seed
+                // anyway (version match + sha-256), so a stale copy is
+                // either still usable or gets rejected cleanly.
+            }
+        }
     }
 
     private fun isBackupProcess(): Boolean {
@@ -118,13 +156,6 @@ class CemuApplication : Application() {
         )
         val userFolderPatterns = arrayOf(
             Pattern.compile("graphicPacks/.*"),
-            // Phase C: shipped JIT cache seeds live under cache_seed/ in the
-            // APK assets. The C++ side reads <userFolder>/cache_seed/catalog.json
-            // and <userFolder>/cache_seed/<titleId>.jseed.zst on first launch.
-            // userFolder placement means once unpacked they survive across
-            // re-installs; hash.txt invalidation re-extracts on every Cemu
-            // upgrade so a kCodegenVersion bump rolls in a fresh seed too.
-            Pattern.compile("cache_seed/.*"),
         )
 
         for (assetFile in traverseAssets()) {

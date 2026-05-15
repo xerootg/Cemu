@@ -176,6 +176,10 @@ fun GamesListScreen(
                     gamesListViewModel.removeShadersForGame(it)
                     snackbarHostState.showMessage(coroutineScope, tr("Shader caches removed"))
                 },
+                deleteJitCache = {
+                    gamesListViewModel.removeJitCacheForGame(it)
+                    snackbarHostState.showMessage(coroutineScope, tr("JIT cache removed"))
+                },
                 startGame = startGame,
                 goToGameDetails = goToGameDetails,
                 goToGameEditProfile = goToGameEditProfile,
@@ -209,6 +213,7 @@ private fun GameList(
     setFavorite: (Game, Boolean) -> Unit,
     createShortcut: (Game) -> Unit,
     deleteShaderCaches: (Game) -> Unit,
+    deleteJitCache: (Game) -> Unit,
 ) {
     LazyVerticalGrid(
         modifier = Modifier
@@ -218,6 +223,7 @@ private fun GameList(
     ) {
         items(items = games, key = { it.path }) { game ->
             var showDeleteShaderConfirmationDialog by remember { mutableStateOf(false) }
+            var showDeleteJitConfirmationDialog by remember { mutableStateOf(false) }
             GameListItem(
                 modifier = Modifier.animateItem(),
                 game = game,
@@ -229,6 +235,7 @@ private fun GameList(
                     goToGameEditProfile(game)
                 },
                 onRemoveShaderCaches = { showDeleteShaderConfirmationDialog = true },
+                onRemoveJitCache = { showDeleteJitConfirmationDialog = true },
                 onAboutTitle = {
                     goToGameDetails(game)
                 },
@@ -244,6 +251,17 @@ private fun GameList(
                     onConfirm = {
                         deleteShaderCaches(game)
                         showDeleteShaderConfirmationDialog = false
+                    },
+                )
+            }
+
+            if (showDeleteJitConfirmationDialog) {
+                JitCacheConfirmationDialog(
+                    gameName = game.name ?: "",
+                    onDismissRequest = { showDeleteJitConfirmationDialog = false },
+                    onConfirm = {
+                        deleteJitCache(game)
+                        showDeleteJitConfirmationDialog = false
                     },
                 )
             }
@@ -267,11 +285,34 @@ private fun ShaderCachesConfirmationDialog(
 }
 
 @Composable
+private fun JitCacheConfirmationDialog(
+    gameName: String,
+    onDismissRequest: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        title = { Text(tr("Remove JIT cache")) },
+        text = {
+            Text(
+                tr(
+                    "Remove the JIT cache for {0}? The next launch will rebuild it from scratch (one-time slow warmup).",
+                    gameName
+                )
+            )
+        },
+        dismissButton = { TextButton(onClick = onDismissRequest) { Text(tr("No")) } },
+        onDismissRequest = onDismissRequest,
+        confirmButton = { TextButton(onClick = onConfirm) { Text(tr("Yes")) } },
+    )
+}
+
+@Composable
 private fun GameListItem(
     onStartGame: (Game) -> Unit,
     onIsFavoriteChanged: (Boolean) -> Unit,
     onEditGameProfile: () -> Unit,
     onRemoveShaderCaches: () -> Unit,
+    onRemoveJitCache: () -> Unit,
     onAboutTitle: () -> Unit,
     onCreateShortcut: () -> Unit,
     game: Game,
@@ -323,6 +364,7 @@ private fun GameListItem(
             onIsFavoriteChanged = onIsFavoriteChanged,
             onEditGameProfile = onEditGameProfile,
             onRemoveShaderCaches = onRemoveShaderCaches,
+            onRemoveJitCache = onRemoveJitCache,
             onAboutTitle = onAboutTitle,
             onCreateShortcut = onCreateShortcut,
         )
@@ -336,6 +378,7 @@ private fun GameContextMenu(
     onIsFavoriteChanged: (Boolean) -> Unit,
     onEditGameProfile: () -> Unit,
     onRemoveShaderCaches: () -> Unit,
+    onRemoveJitCache: () -> Unit,
     onAboutTitle: () -> Unit,
     onCreateShortcut: () -> Unit,
     game: Game,
@@ -363,6 +406,9 @@ private fun GameContextMenu(
         val gameTitleHasCaches = rememberSaveable {
             NativeGameTitles.titleHasShaderCacheFiles(game.titleId)
         }
+        val gameTitleHasJitCache = rememberSaveable {
+            NativeGameTitles.titleHasJitCacheFiles(game.titleId)
+        }
         GameContextMenuItem(
             onClick = { onIsFavoriteChanged(!game.isFavorite) },
             text = tr("Favorite"),
@@ -376,6 +422,11 @@ private fun GameContextMenu(
             enabled = gameTitleHasCaches,
             onClick = onRemoveShaderCaches,
             text = tr("Remove shader caches")
+        )
+        GameContextMenuItem(
+            enabled = gameTitleHasJitCache,
+            onClick = onRemoveJitCache,
+            text = tr("Remove JIT cache")
         )
         GameContextMenuItem(
             onClick = onAboutTitle,

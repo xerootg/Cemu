@@ -162,6 +162,28 @@ Java_info_cemu_cemu_nativeinterface_NativeGameTitles_removeShaderCacheFilesForTi
 		fs::remove(cacheFilePath, ec);
 }
 
+// JIT cache lives at <UserDataPath>/cache/jit/<titleId-hex>/ -- see
+// JitCacheBridge::initialize. The directory contains manifest.bin,
+// code.bin, and pending.bin (depending on flush state). Remove the
+// whole directory atomically; the bridge recreates it on next launch.
+extern "C" [[maybe_unused]] JNIEXPORT jboolean JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeGameTitles_titleHasJitCacheFiles([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jlong game_title_id)
+{
+	const fs::path dir = ActiveSettings::GetUserDataPath(
+	    fmt::format("cache/jit/{:016x}", static_cast<uint64>(game_title_id)));
+	std::error_code ec;
+	return fs::is_directory(dir, ec) && !fs::is_empty(dir, ec);
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeGameTitles_removeJitCacheForTitle([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jlong game_title_id)
+{
+	const fs::path dir = ActiveSettings::GetUserDataPath(
+	    fmt::format("cache/jit/{:016x}", static_cast<uint64>(game_title_id)));
+	std::error_code ec;
+	fs::remove_all(dir, ec);
+}
+
 extern "C" [[maybe_unused]] JNIEXPORT void JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeGameTitles_setGameTitleFavorite([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz, jlong game_title_id, jboolean isFavorite)
 {

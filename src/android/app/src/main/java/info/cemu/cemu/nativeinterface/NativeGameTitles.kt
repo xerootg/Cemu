@@ -83,6 +83,12 @@ object NativeGameTitles {
     external fun removeShaderCacheFilesForTitle(gameTitleId: Long)
 
     @JvmStatic
+    external fun titleHasJitCacheFiles(gameTitleId: Long): Boolean
+
+    @JvmStatic
+    external fun removeJitCacheForTitle(gameTitleId: Long)
+
+    @JvmStatic
     external fun setGameTitleFavorite(gameTitleId: Long, isFavorite: Boolean)
 
     @JvmStatic

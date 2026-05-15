@@ -51,6 +51,10 @@ class GamesListViewModel : ViewModel() {
         NativeGameTitles.removeShaderCacheFilesForTitle(game.titleId)
     }
 
+    fun removeJitCacheForGame(game: Game) {
+        NativeGameTitles.removeJitCacheForTitle(game.titleId)
+    }
+
     fun setGameTitleFavorite(game: Game, isFavorite: Boolean) {
         if (!_games.value.contains(game)) {
             return

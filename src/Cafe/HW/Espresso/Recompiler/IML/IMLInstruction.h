@@ -152,7 +152,6 @@ enum
 	PPCREC_IML_OP_FPR_NEG_MULTIPLY_SUB,    // result = c - a * b   (i.e. -(a * b - c))
 	// Conversion (FPR_R_R)
 	PPCREC_IML_OP_FPR_INT_TO_FLOAT, // convert integer value in gpr to floating point value in fpr
-	PPCREC_IML_OP_FPR_UINT_TO_FLOAT, // convert UNSIGNED integer value in gpr to floating point value in fpr (ucvtf)
 	PPCREC_IML_OP_FPR_FLOAT_TO_INT, // convert floating point value in fpr to integer value in gpr
 
 	// Bitcast (FPR_R_R)

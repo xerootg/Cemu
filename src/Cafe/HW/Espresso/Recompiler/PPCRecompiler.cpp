@@ -67,6 +67,12 @@ bool ppcRecompilerEnabled = false;
 
 void PPCRecompiler_recompileAtAddress(uint32 address);
 
+// Whether `addr` falls inside a jump-table block that has been reserved
+// via PPCRecompiler_reserveLookupTableBlock. Defined late in the file
+// (alongside the bitset) but referenced early by the defensive bounds
+// check in makeRecompiledFunctionActive.
+static bool PPCRecompiler_isAddressInReservedBlock(uint32 addr);
+
 // this function does never block and can fail if the recompiler lock cannot be acquired immediately
 void PPCRecompiler_visitAddressNoBlock(uint32 enterAddress)
 {
@@ -600,7 +606,21 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
 	// update jump table
 	for (auto& itr : entryPoints)
 	{
-		ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[itr.first / 4] = (PPCREC_JUMP_ENTRY)((uint8*)ppcRecFunc->x86Code + itr.second);
+		// Defensive bounds check: an upstream discovery / boundary-tracker
+		// path could plausibly surface an entry-point PPC address that
+		// falls outside any reserved jump-table block (e.g. when a JIT
+		// candidate turned out to be data not code, and the boundary
+		// tracker walked over it producing nonsense entry points). The
+		// jump table is allocated in 4 MB chunks via
+		// PPCRecompiler_reserveLookupTableBlock; an out-of-range index
+		// writes into unmapped memory and segfaults the worker. Drop
+		// such entries; the function as a whole is still valid for the
+		// in-bounds entry points.
+		const uint32 entryAddr = static_cast<uint32>(itr.first);
+		if (!PPCRecompiler_isAddressInReservedBlock(entryAddr))
+			continue;
+		ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[entryAddr / 4]
+		    = (PPCREC_JUMP_ENTRY)((uint8*)ppcRecFunc->x86Code + itr.second);
 	}
 
 
@@ -715,6 +735,16 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
 }
 
 std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
+
+static bool PPCRecompiler_isAddressInReservedBlock(uint32 addr)
+{
+	if (addr >= PPC_REC_CODE_AREA_END)
+		return false;
+	const uint32 blockIdx = addr / PPC_REC_ALLOC_BLOCK_SIZE;
+	if (blockIdx >= ppcRecompiler_reservedBlockMask.size())
+		return false;
+	return ppcRecompiler_reservedBlockMask[blockIdx];
+}
 
 void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
 {
@@ -1061,65 +1091,27 @@ void PPCRecompiler_precompileLoadedModules()
 				entryAddrs.insert(addr);
 		}
 
-		// Per-instruction scan unions four signal sources, chosen for their
-		// precision against Ghidra ground truth (per the offline discovery
-		// tool's report card on cking.rpx + red-pro2.rpx):
-		//   1) bl <imm26> xref targets  -- direct callees, ~99% precision
-		//   2) prologue (mflr; ... stwu r1,...) -- function entry signature
-		//      emitted by every non-leaf CodeWarrior function
-		//   3) longcall trampoline      -- (lis;addi|ori;mtctr;bctrl) packs
-		//      a 32-bit target for any jump >+/-32MB
-		//   4) module exports + entrypoint (already harvested above)
+		// Scan for `bl imm26` xref targets only. The phase A attempt to
+		// also scan for prologue patterns (mflr; ... stwu r1) and longcall
+		// trampolines (lis;addi|ori;mtctr;bctrl) crashed the JIT worker
+		// inside makeRecompiledFunctionActive: those patterns hit data
+		// inside .text on CodeWarrior binaries (vtable RTTI, string
+		// literals, switch dispatch tables), the boundary tracker walked
+		// the data as code, and the resulting "entry points" pointed at
+		// unmapped slots of ppcRecompilerDirectJumpTable.
 		//
-		// We intentionally do NOT walk `b imm26` xrefs: most are intra-
-		// function branch labels (not function starts) and the noise
-		// produced black-screen behavior in the first prototype.
-		const uint32 endOff = (textSize >= 16) ? (textSize - 16) : 0;
+		// `bl` xrefs alone give ~99% precision against Ghidra ground
+		// truth on CodeWarrior titles, and the lazy-JIT fallback picks
+		// up anything we miss during the first minute of gameplay.
 		for (uint32 off = 0; off + 4 <= textSize; off += 4)
 		{
 			const uint32 addr = textBase + off;
-			const uint32 i0 = memory_readU32(addr);
-
-			// Source 1: bl imm26.
-			if ((i0 & kBLOpcodeMask) == kBLOpcodeValue)
+			const uint32 insn = memory_readU32(addr);
+			if ((insn & kBLOpcodeMask) == kBLOpcodeValue)
 			{
-				const uint32 target = PPCRecompiler_branchTargetFromImm26(i0, addr);
+				const uint32 target = PPCRecompiler_branchTargetFromImm26(insn, addr);
 				if (target >= textBase && target < textBase + textSize)
 					entryAddrs.insert(target);
-			}
-
-			// Source 2: prologue. mflr starts a function; if the same
-			// instruction is also the start of .text or a stwu r1 lands
-			// in the next few insns, that's a function entry. We accept
-			// any mflr with a stwu r1,r1 within the next 8 insns (32 B)
-			// since CodeWarrior's prologue may interleave a few register
-			// saves before establishing the frame.
-			if (PPCRecompiler_isMflrR0(i0))
-			{
-				const uint32 windowEnd = std::min<uint32>(off + 8 * 4, textSize);
-				for (uint32 j = off + 4; j + 4 <= windowEnd; j += 4)
-				{
-					if (PPCRecompiler_isStwuR1R1(memory_readU32(textBase + j)))
-					{
-						entryAddrs.insert(addr);
-						break;
-					}
-				}
-			}
-
-			// Source 3: longcall trampoline. Need a 4-insn window.
-			if (off <= endOff)
-			{
-				const uint32 i1 = memory_readU32(addr + 4);
-				const uint32 i2 = memory_readU32(addr + 8);
-				const uint32 i3 = memory_readU32(addr + 12);
-				const uint32 longTarget =
-				    PPCRecompiler_extractLongcallTarget(i0, i1, i2, i3);
-				if (longTarget != 0
-				    && longTarget >= textBase && longTarget < textBase + textSize)
-				{
-					entryAddrs.insert(longTarget);
-				}
 			}
 		}
 	}

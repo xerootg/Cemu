@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "comment": "Shipped JIT cache seeds. Each entry under 'entries' is keyed by 16-hex-char title id. Build seeds with tools/cache_seed/build_seed.py. If 'entries' is empty or a title has no matching entry, the runtime falls through to phase B precompile -- no failure, just slower first launch for that title.",
+  "comment": "Shipped JIT cache seeds. Each entry under 'entries' is keyed by 16-hex-char title id. Seed files (*.jseed.zst) are gitignored -- they're derived from copyrighted RPX content and live alongside this catalog only at build time. tools/cache_seed/build_seed.py produces them; gradle picks up whatever is present in this directory when building the APK. If 'entries' is empty or no matching seed file ships, the runtime falls through to phase B precompile -- no failure, just a slower first launch for that title.",
   "entries": {
   }
 }

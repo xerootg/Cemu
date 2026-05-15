@@ -1,0 +1,4 @@
+# Seeds are derived from copyrighted RPX content and must not be committed.
+# Place them here at build time; gradle bundles whatever is present into
+# the APK. tools/cache_seed/build_seed.py is the canonical builder.
+*.jseed.zst

@@ -146,6 +146,7 @@ void wipeCacheFiles(const fs::path& dir) noexcept
 	std::error_code ec;
 	fs::remove(dir / "manifest.bin", ec);
 	fs::remove(dir / "code.bin", ec);
+	fs::remove(dir / "pending.bin", ec);
 	fs::remove(dir / "manifest.bin.tmp", ec);
 	fs::remove(dir / "code.bin.tmp", ec);
 }
@@ -195,6 +196,40 @@ bool applyRelocs(uint8_t* hostBytes, size_t hostSize,
 
 // --- Cache::Impl ---------------------------------------------------------
 
+// Magic for the append-only pending.bin sidecar. Each record is:
+//   uint32 magic            ('JCPN')
+//   uint32 payloadBytes     (length of everything after this 8-byte header)
+//   Fingerprint fp          (16)
+//   uint32 hostByteCount    (4)
+//   uint32 relocCount       (4)
+//   uint32 entryPointCount  (4)
+//   uint32 _pad             (4)
+//   uint8  hostBytes[hostByteCount]
+//   Reloc  relocs[relocCount]
+//   EntryPoint entryPoints[entryPointCount]
+//
+// On load, we read each record one at a time; a truncated tail (process
+// crashed mid-write) just stops the replay. Recovery is best-effort -- we
+// keep what's intact and discard the rest.
+constexpr uint32_t kPendingRecordMagic = 0x4E50434A; // 'JCPN' little-endian
+
+struct PendingRecordHeader
+{
+	uint32_t magic;
+	uint32_t payloadBytes;
+};
+static_assert(sizeof(PendingRecordHeader) == 8);
+
+struct PendingRecordMeta
+{
+	Fingerprint fp;
+	uint32_t hostByteCount;
+	uint32_t relocCount;
+	uint32_t entryPointCount;
+	uint32_t _pad;
+};
+static_assert(sizeof(PendingRecordMeta) == 32);
+
 struct Cache::Impl
 {
 	std::unordered_map<Fingerprint, EmittedCode, FingerprintHash> entries;
@@ -202,9 +237,130 @@ struct Cache::Impl
 	std::unordered_map<std::string, uint64_t> symbolIds;
 	fs::path cacheDir; // empty -> not attached
 
+	// Open append-only handle to <cacheDir>/pending.bin. Each insert writes
+	// one record here; the file is truncated to zero bytes at the end of a
+	// successful flushToDisk (everything got merged into manifest.bin +
+	// code.bin at that point).
+	FileHandle pendingFile;
+	uint32_t pendingRecordsWritten = 0;
+
 	Impl()
 	{
 		symbolNames.emplace_back(); // id 0 -> ""
+	}
+
+	// Open pending.bin for append. Called at end of load(). Never throws --
+	// on open failure pendingFile stays null and the per-insert path skips
+	// the durable-append step.
+	void openPendingForAppend()
+	{
+		if (cacheDir.empty())
+			return;
+		const fs::path p = cacheDir / "pending.bin";
+		pendingFile.reset(std::fopen(p.string().c_str(), "ab"));
+	}
+
+	// Replay pending.bin records onto the entries map. Tolerates corrupt /
+	// truncated tail (stops at first record with bad magic or short body).
+	void replayPending() noexcept
+	{
+		if (cacheDir.empty())
+			return;
+		const fs::path p = cacheDir / "pending.bin";
+		FileHandle in(std::fopen(p.string().c_str(), "rb"));
+		if (!in)
+			return;
+
+		uint32_t replayed = 0;
+		for (;;)
+		{
+			PendingRecordHeader hdr{};
+			if (!readAll(in.get(), &hdr, sizeof(hdr)))
+				break;
+			if (hdr.magic != kPendingRecordMagic)
+				break;
+			std::vector<uint8_t> payload(hdr.payloadBytes);
+			if (hdr.payloadBytes > 0
+			    && !readAll(in.get(), payload.data(), hdr.payloadBytes))
+				break;
+
+			if (payload.size() < sizeof(PendingRecordMeta))
+				break;
+			PendingRecordMeta meta{};
+			std::memcpy(&meta, payload.data(), sizeof(meta));
+			const size_t expected = sizeof(PendingRecordMeta)
+			                        + meta.hostByteCount
+			                        + meta.relocCount * sizeof(Reloc)
+			                        + meta.entryPointCount * sizeof(EntryPoint);
+			if (expected != payload.size())
+				break;
+
+			EmittedCode ec;
+			const uint8_t* p = payload.data() + sizeof(PendingRecordMeta);
+			ec.hostBytes.assign(p, p + meta.hostByteCount);
+			p += meta.hostByteCount;
+			ec.relocs.resize(meta.relocCount);
+			std::memcpy(ec.relocs.data(), p, meta.relocCount * sizeof(Reloc));
+			p += meta.relocCount * sizeof(Reloc);
+			ec.entryPoints.resize(meta.entryPointCount);
+			std::memcpy(ec.entryPoints.data(), p, meta.entryPointCount * sizeof(EntryPoint));
+
+			entries[meta.fp] = std::move(ec);
+			++replayed;
+		}
+		pendingRecordsWritten = replayed;
+	}
+
+	// Serialize one insert to pending.bin. Cheap: O(payload size) write.
+	// Never blocks across a fsync; durability is established only at the
+	// next flush. Opens pending.bin lazily on the first insert after a
+	// flush or load, so the file is absent on a freshly-flushed cache
+	// directory (no replay work, lets `fs::exists` checks make sense).
+	void appendPending(const Fingerprint& fp, const EmittedCode& ec) noexcept
+	{
+		if (!pendingFile)
+			openPendingForAppend();
+		if (!pendingFile)
+			return;
+		PendingRecordMeta meta{};
+		meta.fp = fp;
+		meta.hostByteCount = static_cast<uint32_t>(ec.hostBytes.size());
+		meta.relocCount = static_cast<uint32_t>(ec.relocs.size());
+		meta.entryPointCount = static_cast<uint32_t>(ec.entryPoints.size());
+
+		PendingRecordHeader hdr{};
+		hdr.magic = kPendingRecordMagic;
+		hdr.payloadBytes = static_cast<uint32_t>(
+		    sizeof(PendingRecordMeta) + meta.hostByteCount
+		    + meta.relocCount * sizeof(Reloc)
+		    + meta.entryPointCount * sizeof(EntryPoint));
+
+		std::fwrite(&hdr, sizeof(hdr), 1, pendingFile.get());
+		std::fwrite(&meta, sizeof(meta), 1, pendingFile.get());
+		if (meta.hostByteCount)
+			std::fwrite(ec.hostBytes.data(), 1, meta.hostByteCount, pendingFile.get());
+		if (meta.relocCount)
+			std::fwrite(ec.relocs.data(), sizeof(Reloc), meta.relocCount, pendingFile.get());
+		if (meta.entryPointCount)
+			std::fwrite(ec.entryPoints.data(), sizeof(EntryPoint), meta.entryPointCount, pendingFile.get());
+		++pendingRecordsWritten;
+	}
+
+	// After a successful flushToDisk, the pending.bin contents are now
+	// duplicated in manifest.bin + code.bin. Close and truncate so the
+	// next launch's load() doesn't replay records that are already in
+	// the main files.
+	void truncatePendingAfterFlush() noexcept
+	{
+		pendingFile.reset();
+		if (!cacheDir.empty())
+		{
+			const fs::path p = cacheDir / "pending.bin";
+			std::error_code ec;
+			fs::remove(p, ec);
+		}
+		pendingRecordsWritten = 0;
+		// Lazily reopened on the next insert.
 	}
 
 	// Load on-disk state from cacheDir into in-memory tables. Returns
@@ -504,16 +660,35 @@ void Cache::load(const fs::path& dir)
 	std::error_code ec;
 	fs::create_directories(dir, ec);
 	(void)m_impl->loadFromDisk(); // best-effort; failure leaves cache empty
+	// Replay any pending.bin records written but not yet flushed into the
+	// main manifest (process crashed since last shutdown). Best-effort.
+	m_impl->replayPending();
+	// pending.bin is opened lazily by the first insert after this load,
+	// not eagerly here. That way a load-only Cache (no inserts) doesn't
+	// touch the file at all.
 }
 
 void Cache::insert(const FunctionKey& key, const EmittedCode& emitted)
 {
-	m_impl->entries[fingerprint(key)] = emitted;
+	const Fingerprint fp = fingerprint(key);
+	m_impl->entries[fp] = emitted;
+	// Cheap durable-append for crash safety. Each call writes one record
+	// to pending.bin (~payload bytes); no fsync per insert -- that
+	// happens implicitly when pending.bin is closed at the end of
+	// flushToDisk or when the OS schedules buffer flushing.
+	m_impl->appendPending(fp, emitted);
 }
 
 bool Cache::flush()
 {
-	return m_impl->flushToDisk();
+	const bool ok = m_impl->flushToDisk();
+	if (ok)
+	{
+		// Everything in pending.bin is now durably in manifest.bin +
+		// code.bin. Truncate so we don't re-replay on next launch.
+		m_impl->truncatePendingAfterFlush();
+	}
+	return ok;
 }
 
 bool Cache::lookup(const FunctionKey& key, const Resolver& resolver, EmittedCode& out) const

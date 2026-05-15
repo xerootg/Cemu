@@ -627,6 +627,83 @@ void test_entry_points_persistence_roundtrip()
 	fs::remove_all(dir);
 }
 
+void test_pending_replays_after_crash_without_flush()
+{
+	// Simulate a crash: Cache populated + entries inserted, NO flush, then
+	// process dies. Next launch: load() should replay pending.bin and
+	// recover the entries even though manifest.bin was never updated.
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc = {0x60, 0x00, 0x00, 0x00};
+	jitcache::FunctionKey k1{}, k2{};
+	k1.codegenVersion = 1; k1.moduleId = 0x4242; k1.ppcEntryAddr = 0x1000;
+	k1.ppcBytes = ppc.data(); k1.ppcLen = ppc.size();
+	k2.codegenVersion = 1; k2.moduleId = 0x4242; k2.ppcEntryAddr = 0x2000;
+	k2.ppcBytes = ppc.data(); k2.ppcLen = ppc.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		c.insert(k1, makeEmbeddedValueEntry(0xCCCC0000DDDD0001ULL));
+		c.insert(k2, makeEmbeddedValueEntry(0xCCCC0000DDDD0002ULL));
+		// NO flush -- destructor runs; pending.bin retains the inserts
+	}
+
+	// Manifest.bin should NOT exist (no flush ever happened).
+	CHECK(!fs::exists(dir / "manifest.bin"));
+	CHECK(fs::exists(dir / "pending.bin"));
+
+	// Recovery: a fresh Cache should still see the two entries.
+	jitcache::Cache c2;
+	c2.load(dir);
+	CHECK(c2.entryCount() == 2);
+
+	NullResolver r;
+	jitcache::EmittedCode out;
+	CHECK(c2.lookup(k1, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0xCCCC0000DDDD0001ULL);
+	CHECK(c2.lookup(k2, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0xCCCC0000DDDD0002ULL);
+
+	fs::remove_all(dir);
+}
+
+void test_pending_cleared_after_successful_flush()
+{
+	// After flush(), pending.bin must be cleared. Otherwise next launch
+	// would re-replay records that are already in manifest.bin (correct
+	// but wasteful + makes the file grow unbounded).
+	fs::path dir = makeTempCacheDir();
+
+	std::vector<uint8_t> ppc = {0x60, 0x00, 0x00, 0x00};
+	jitcache::FunctionKey k{};
+	k.codegenVersion = 1; k.moduleId = 0x9000; k.ppcEntryAddr = 0x4000;
+	k.ppcBytes = ppc.data(); k.ppcLen = ppc.size();
+
+	{
+		jitcache::Cache c;
+		c.load(dir);
+		c.insert(k, makeEmbeddedValueEntry(0xF0F0F0F0F0F0F0F0ULL));
+		CHECK(fs::exists(dir / "pending.bin"));
+		CHECK(c.flush());
+	}
+
+	// After flush(): manifest.bin populated, pending.bin gone.
+	CHECK(fs::exists(dir / "manifest.bin"));
+	CHECK(!fs::exists(dir / "pending.bin"));
+
+	// Fresh Cache should see the entry via manifest.bin, not via pending.
+	jitcache::Cache c2;
+	c2.load(dir);
+	CHECK(c2.entryCount() == 1);
+	NullResolver r;
+	jitcache::EmittedCode out;
+	CHECK(c2.lookup(k, r, out));
+	CHECK(decodeAbs64(out.hostBytes.data()) == 0xF0F0F0F0F0F0F0F0ULL);
+
+	fs::remove_all(dir);
+}
+
 void test_insert_lookup_with_relocs_full_pipeline()
 {
 	jitcache::Cache cache;
@@ -703,6 +780,8 @@ int main()
 
 	test_entry_points_roundtrip_memory_only();
 	test_entry_points_persistence_roundtrip();
+	test_pending_replays_after_crash_without_flush();
+	test_pending_cleared_after_successful_flush();
 
 	std::printf("jitcache_test: %d assertions, %d failures\n",
 	            g_assertions, g_failures);

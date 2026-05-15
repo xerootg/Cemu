@@ -411,6 +411,14 @@ void cemu_initForGame()
 		// replace any known function signatures with our HLE implementations and patch bugs in the games
 		GamePatch_scan();
 	}
+#if defined(__aarch64__)
+	// Phase B precompile: JIT every discoverable function up front, before
+	// the GPU spins up and well before the title's entrypoint runs. This
+	// front-loads the entire JIT cost into title load instead of paying
+	// it as in-gameplay stutter. Skips entirely if the recompiler is
+	// disabled (e.g. force-interpreter command-line override).
+	PPCRecompiler_precompileLoadedModules();
+#endif
 	LatteGPUState.isDRCPrimary = ActiveSettings::DisplayDRCEnabled();
 	InfoLog_PrintActiveSettings();
 	Latte_Start();

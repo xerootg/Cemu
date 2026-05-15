@@ -152,6 +152,16 @@ extern bool ppcRecompilerEnabled;
 void PPCRecompiler_init();
 void PPCRecompiler_Shutdown();
 
+// Phase B precompile: walks every loaded module's .text for bl targets,
+// b-tail-call targets, the module entrypoint, and function exports.
+// JITs each discovered entry synchronously on the calling thread. Called
+// from cemu_initForGame after RPLLoader_Link + GamePatch_scan and before
+// Latte_Start, so all module bytes are final and no game code has run.
+// Eliminates the run-time JIT spikes that would otherwise hit during
+// gameplay. Bounded: ~10-60 seconds added to title load on a Pixel 9
+// per ~30k function payload (per the project-precompile-2026-05-12 memory).
+void PPCRecompiler_precompileLoadedModules();
+
 void PPCRecompiler_allocateRange(uint32 startAddress, uint32 size);
 
 void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr);

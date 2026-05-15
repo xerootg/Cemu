@@ -6,6 +6,22 @@
 bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction, struct ppcImlGenContext_t* ppcImlGenContext);
 void PPCRecompiler_cleanupAArch64Code(void* code, size_t size);
 
+// Phase 3b read path: allocate executable memory through the same xbyak
+// allocator the codegen path uses, copy cached host bytes into it, and
+// mark it Read+Execute. On success, ppcRecFunc->x86Code / x86Size /
+// x86CodeLen are populated; the memory is owned by ppcRecFunc and is
+// freed by the standard PPCRecompiler_cleanupAArch64Code path.
+bool PPCRecompiler_loadAArch64FromCache(struct PPCRecFunction_t* ppcRecFunc, const uint8_t* hostBytes, size_t hostSize);
+
+// Host address of the AArch64 backend's PPCRecompiler_virtualHLE so the
+// JitCacheBridge can map its interned RuntimeSymbol id back to the live
+// function. BackendX64.cpp also defines PPCRecompiler_virtualHLE; taking
+// the function's address directly from JitCacheBridge.cpp pulls BOTH
+// definitions through the static lib and trips the linker. Going through
+// an accessor defined here keeps the bridge's reference scoped to the
+// AArch64 backend's .o file only.
+void* PPCRecompiler_getVirtualHLEHostAddr();
+
 void PPCRecompilerAArch64Gen_generateRecompilerInterfaceFunctions();
 
 // architecture specific constants

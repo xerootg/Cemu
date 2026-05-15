@@ -190,11 +190,20 @@ struct AArch64GenContext_t : CodeGenerator
 
 	// JIT-cache reloc hook: every absolute 64-bit pointer that ends up inside
 	// a per-PPC-function host code body must go through one of these helpers.
-	// They record a reloc into the active JitCacheBridge function buffer
-	// before emitting the standard xbyak_aarch64 mov(XReg, uint64) (which
-	// lowers to up to 4 movz/movk insns). Used by macro() and call_imm();
-	// intentionally NOT used by enterRecompilerCode/leaveRecompilerCode --
-	// those are one-time trampolines, never cached. See JitCacheBridge.h.
+	// They record a reloc into the active JitCacheBridge function buffer and
+	// emit a FIXED-LENGTH 4-instruction movz+movk+movk+movk sequence so the
+	// reloc patcher can rewrite a known 16 bytes at load time.
+	//
+	// Note: xbyak's mov(XReg, uint64) is variable-length -- it skips chunks
+	// whose value is zero. That's wrong for a relocatable emission point
+	// because the patcher would overwrite whatever instructions follow.
+	// We open-code the 4 movz/movk insns instead. The size cost vs
+	// shortform is at most 12 bytes per reloc, ~10KB across an entire WW
+	// HD session; the codegen-vs-cache mismatch cost was catastrophic.
+	//
+	// Used by macro() and call_imm(); intentionally NOT used by
+	// enterRecompilerCode/leaveRecompilerCode -- those are one-time
+	// trampolines, never cached. See JitCacheBridge.h.
 	//
 	// _Symbol variant: target is an interned RuntimeSymbol id. The actual
 	// host pointer is process-specific (ASLR / module load address); the
@@ -206,13 +215,29 @@ struct AArch64GenContext_t : CodeGenerator
 	void emitAbsoluteImm64Symbol(const XReg& reg, uint64 value, uint64 symbolId)
 	{
 		JitCacheBridge::recordRuntimeSymbolReloc(static_cast<uint32_t>(getSize()), symbolId);
-		mov(reg, value);
+		emitMovImm64Fixed(reg, value);
 	}
 	void emitAbsoluteImm64Embedded(const XReg& reg, uint64 value)
 	{
 		JitCacheBridge::recordEmbeddedValueReloc(static_cast<uint32_t>(getSize()), value);
-		mov(reg, value);
+		emitMovImm64Fixed(reg, value);
 	}
+
+private:
+	// Open-coded movz + 3 movk, always 16 bytes regardless of `value`. Do
+	// NOT call this anywhere except the two emitAbsoluteImm64* sites; the
+	// rest of the backend should keep using xbyak's variable-length
+	// mov(reg, value) for non-relocatable immediates so we don't pay the
+	// extra-bytes tax everywhere.
+	void emitMovImm64Fixed(const XReg& reg, uint64 value)
+	{
+		movz(reg, static_cast<uint32_t>(value & 0xFFFF), 0);
+		movk(reg, static_cast<uint32_t>((value >> 16) & 0xFFFF), 16);
+		movk(reg, static_cast<uint32_t>((value >> 32) & 0xFFFF), 32);
+		movk(reg, static_cast<uint32_t>((value >> 48) & 0xFFFF), 48);
+	}
+
+public:
 
 	void r_name(IMLInstruction* imlInstruction);
 	void name_r(IMLInstruction* imlInstruction);
@@ -2361,11 +2386,21 @@ void AArch64GenContext_t::fpr_compare(IMLInstruction* imlInstruction)
 void AArch64GenContext_t::call_imm(IMLInstruction* imlInstruction)
 {
 	str(x30, AdrPreImm(sp, -16));
-	// op_call_imm.callAddress is an IML-time host pointer (see ppcImlGen
-	// callsites that set it). Phase 2 stores it inline as an embedded
-	// value -- when the read path lands we may need to revisit this if
-	// the address proves to be process-specific.
-	emitAbsoluteImm64Embedded(TEMP_GPR1.XReg, imlInstruction->op_call_imm.callAddress);
+	// op_call_imm.callAddress is a process-specific host pointer (ASLR).
+	// IMG-gen sites point at fres_espresso, frsqrte_espresso,
+	// PPCRecompiler_GetTBL, or PPCRecompiler_GetTBU -- all interned in
+	// JitCacheBridge::initialize. Route through the resolver so cache
+	// reads re-resolve to THIS process's address; baking the run-1 ASLR'd
+	// value as EmbeddedValue was the source of all 14 verify mismatches
+	// observed in WW HD.
+	{
+		const uint64 helperAddr = imlInstruction->op_call_imm.callAddress;
+		const uint64 helperSym = JitCacheBridge::symbolIdForHostAddr(helperAddr);
+		if (helperSym != 0)
+			emitAbsoluteImm64Symbol(TEMP_GPR1.XReg, helperAddr, helperSym);
+		else
+			emitAbsoluteImm64Embedded(TEMP_GPR1.XReg, helperAddr);
+	}
 	blr(TEMP_GPR1.XReg);
 	ldr(x30, AdrPostImm(sp, 16));
 }
@@ -2641,6 +2676,41 @@ void PPCRecompiler_cleanupAArch64Code(void* code, size_t size)
 	if (allocator.useProtect())
 		CodeArray::protect(code, size, CodeArray::PROTECT_RW);
 	allocator.free(static_cast<uint32*>(code));
+}
+
+void* PPCRecompiler_getVirtualHLEHostAddr()
+{
+	return reinterpret_cast<void*>(&PPCRecompiler_virtualHLE);
+}
+
+bool PPCRecompiler_loadAArch64FromCache(PPCRecFunction_t* ppcRecFunc, const uint8_t* hostBytes, size_t hostSize)
+{
+	// AArch64 instructions are exactly 4 bytes. A cached blob that isn't a
+	// multiple of 4 was either corrupted on disk or produced by a codegen
+	// that we no longer match -- bail and let the lazy JIT recompile.
+	if (hostSize == 0 || (hostSize % 4) != 0)
+		return false;
+
+	AArch64Allocator allocator;
+	AArch64GenContext_t ctx{&allocator};
+	// Reserve enough room. Reuse xbyak's auto-grow path by emitting one
+	// 32-bit word per AArch64 insn; alternative would be a memcpy + setSize
+	// but the allocator already mmap'd RWE-friendly pages, this is correct
+	// and matches the codegen path's invariants exactly.
+	const size_t insnCount = hostSize / 4;
+	for (size_t i = 0; i < insnCount; ++i)
+	{
+		uint32_t insn;
+		std::memcpy(&insn, hostBytes + i * 4, sizeof(insn));
+		ctx.dd(insn);
+	}
+	ctx.readyRE();
+
+	ppcRecFunc->x86Code = ctx.getCode<void*>();
+	ppcRecFunc->x86Size = ctx.getMaxSize();
+	ppcRecFunc->x86CodeLen = ctx.getSize();
+	allocator.setFreeDisabled(true);
+	return true;
 }
 
 void AArch64GenContext_t::enterRecompilerCode()

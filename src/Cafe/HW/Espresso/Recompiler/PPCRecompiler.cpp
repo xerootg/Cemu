@@ -5,6 +5,8 @@
 #include "JitCacheBridge.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/OS/RPL/rpl.h"
+#include "Cafe/OS/RPL/rpl_structs.h"
+#include "Cafe/HW/MMU/MMU.h"
 #include "Cafe/OS/common/OSCommon.h"
 #include "util/containers/RangeStore.h"
 #include "Cafe/OS/libs/coreinit/coreinit_CodeGen.h"
@@ -203,6 +205,48 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
 	bt.Start();
 #endif
 
+#if defined(__aarch64__)
+	// Phase 3b: ask the JIT cache before doing any work. On a hit with
+	// verify=off, we install the cached host bytes, populate entry
+	// points and list_ranges identical to what the codegen path would
+	// produce, and skip the full IML pipeline entirely.
+	//
+	// On a hit with verify=on we keep the cached bytes in
+	// jitCacheHitHostBytes and fall through to the IML+codegen path so
+	// the next memcmp will compare cached against fresh. The fresh
+	// codegen wins -- the cached entry is informational only in verify
+	// mode.
+	std::vector<uint8_t> jitCacheHitHostBytes;
+	std::vector<JitCacheBridge::EntryPoint> jitCacheHitEntries;
+	const bool jitCacheHit = JitCacheBridge::peekLookup(ppcRecFunc, jitCacheHitHostBytes, jitCacheHitEntries);
+	// consumeVerifyBudget is decremented once per hit; after the budget
+	// runs out, isVerifyEnabled is still true (env var) but this returns
+	// false so the rest of the session takes the fast path.
+	const bool jitCacheVerifyThisHit = jitCacheHit && JitCacheBridge::consumeVerifyBudget();
+	if (jitCacheHit && !jitCacheVerifyThisHit)
+	{
+		if (PPCRecompiler_loadAArch64FromCache(ppcRecFunc, jitCacheHitHostBytes.data(), jitCacheHitHostBytes.size()))
+		{
+			entryPointsOut.clear();
+			entryPointsOut.reserve(jitCacheHitEntries.size());
+			for (const auto& ep : jitCacheHitEntries)
+				entryPointsOut.emplace_back(ep.ppcAddr, ep.hostOffset);
+
+			// Mirror the list_ranges entry that
+			// PPCRecompiler_generateIntermediateCode would have pushed.
+			// Without it the invalidation tracker can't detect overlap
+			// with the cached function on a PPC memory write.
+			ppcRecRange_t recRange{};
+			recRange.ppcAddress = ppcRecFunc->ppcAddress;
+			recRange.ppcSize = ppcRecFunc->ppcSize;
+			ppcRecFunc->list_ranges.push_back(recRange);
+			return ppcRecFunc;
+		}
+		// Install failed (e.g. non-4-aligned cached size). Treat as miss
+		// and proceed with the full codegen path.
+	}
+#endif
+
 	// generate intermediate code
 	ppcImlGenContext_t ppcImlGenContext = { 0 };
 	ppcImlGenContext.debug_entryPPCAddress = range.startAddress;
@@ -270,6 +314,28 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
 	}
 
 #if defined(__aarch64__)
+	// VERIFY mode: phase 3b cache hit landed at the top of this function,
+	// but we ran the full codegen path anyway. Compare cached bytes
+	// against fresh codegen and log any mismatch. The fresh codegen
+	// stays installed; the cache entry is not overwritten (peekLookup
+	// already happened, and endFunction below will replace the entry
+	// with the fresh bytes, so any mismatch resolves itself on the next
+	// launch).
+	if (jitCacheVerifyThisHit)
+	{
+		const size_t cachedSize = jitCacheHitHostBytes.size();
+		const size_t freshSize = ppcRecFunc->x86CodeLen;
+		const uint8_t* freshBytes = static_cast<const uint8_t*>(ppcRecFunc->x86Code);
+		if (cachedSize != freshSize ||
+		    std::memcmp(jitCacheHitHostBytes.data(), freshBytes, cachedSize) != 0)
+		{
+			JitCacheBridge::recordVerifyMismatch(
+			    ppcRecFunc->ppcAddress,
+			    jitCacheHitHostBytes.data(), cachedSize,
+			    freshBytes, freshSize);
+		}
+	}
+
 	// Commit the just-emitted function to the JIT cache. Entry points were
 	// collected just above; the bridge accumulated relocs during codegen.
 	// Has to be after the entry-point collection -- the cache stores entry
@@ -875,6 +941,144 @@ void PPCRecompiler_init()
 	// launch recompilation thread
     s_recompilerThreadStopSignal = false;
     s_threadRecompiler = std::thread(PPCRecompiler_thread);
+}
+
+// Bit pattern for `bl <imm26>` (linked relative branch, AA=0, LK=1):
+//   opcode (bits 0-5) = 010010 (0x12), AA=0, LK=1 -> 0x48000001.
+// Mask 0xFC000003 isolates opcode + AA + LK so we don't match conditional
+// branches or absolute (AA=1) variants.
+static constexpr uint32 kBLOpcodeMask    = 0xFC000003;
+static constexpr uint32 kBLOpcodeValue   = 0x48000001;
+// `b <imm26>` (unconditional relative branch, AA=0, LK=0). Tail calls
+// use this form; PPC compilers often emit `b <other_function>` as the
+// last instruction instead of returning through a different path.
+static constexpr uint32 kBOpcodeValue    = 0x48000000;
+
+// Extracts the sign-extended LI field from a bl/b instruction and returns
+// the absolute PPC target address (current_addr + LI*4).
+static inline uint32 PPCRecompiler_branchTargetFromImm26(uint32 insn, uint32 currentAddr)
+{
+	int32_t li = static_cast<int32_t>(insn & 0x03FFFFFC);
+	if (li & 0x02000000) // sign bit (bit 25) -> sign-extend to int32
+		li |= 0xFC000000;
+	return currentAddr + static_cast<uint32>(li);
+}
+
+void PPCRecompiler_precompileLoadedModules()
+{
+	if (!ppcRecompilerEnabled)
+		return;
+
+	std::set<uint32> entryAddrs;
+
+	RPLModule** moduleList = RPLLoader_GetModuleList();
+	const sint32 moduleCount = RPLLoader_GetModuleCount();
+
+	for (sint32 i = 0; i < moduleCount; ++i)
+	{
+		RPLModule* mod = moduleList[i];
+		if (!mod)
+			continue;
+		const uint32 textBase = mod->regionMappingBase_text.GetMPTR();
+		const uint32 textSize = mod->regionSize_text;
+		if (textBase == 0 || textSize == 0)
+			continue;
+
+		// Module entrypoint -- guaranteed function start by Wii U OS contract.
+		const uint32 entrypoint = RPLLoader_GetModuleEntrypoint(mod);
+		if (entrypoint >= textBase && entrypoint < textBase + textSize)
+			entryAddrs.insert(entrypoint);
+
+		// Function exports -- guaranteed function starts.
+		for (uint32 e = 0; e < mod->exportFCount; ++e)
+		{
+			const uint32 addr = mod->exportFDataPtr[e].virtualOffset;
+			if (addr >= textBase && addr < textBase + textSize)
+				entryAddrs.insert(addr);
+		}
+
+		// bl xref targets. CodeWarrior emits `bl <function>` only at real
+		// function entry points -- the discovery offline tool measured 99%+
+		// precision against Ghidra ground truth on CodeWarrior titles.
+		//
+		// We intentionally do NOT walk `b imm26` xrefs: those mostly point
+		// at intra-function branch labels (not function starts), and the
+		// false-positive rate cascades into garbage compilations whose
+		// dispatch-table slots later confuse the JIT.
+		for (uint32 off = 0; off + 4 <= textSize; off += 4)
+		{
+			const uint32 addr = textBase + off;
+			const uint32 insn = memory_readU32(addr);
+			if ((insn & kBLOpcodeMask) == kBLOpcodeValue)
+			{
+				const uint32 target = PPCRecompiler_branchTargetFromImm26(insn, addr);
+				if (target >= textBase && target < textBase + textSize)
+					entryAddrs.insert(target);
+			}
+		}
+	}
+
+	uint32 queued = 0;
+	for (uint32 addr : entryAddrs)
+	{
+		if (addr >= PPC_REC_CODE_AREA_END || (addr & 3) != 0)
+			continue;
+		// recompileIfUnvisited is the canonical lazy-JIT entry: it locks
+		// the spinlock, flips the dispatch-table slot from unvisited to
+		// visited, and pushes to the worker thread's queue. Anything
+		// we miss here falls through to the regular lazy-JIT path
+		// during gameplay.
+		PPCRecompiler_recompileIfUnvisited(addr);
+		++queued;
+	}
+
+	cemuLog_log(LogType::Force,
+	            "Precompile: {} entries discovered across {} modules. The recompiler will warm in the background; first launch is the only slow one, subsequent launches load from the on-disk cache.",
+	            queued, moduleCount);
+
+	// NON-BLOCKING by design: blocking title load before Latte_Start means
+	// the GPU is never initialized and the screen stays black for the
+	// entire precompile. Instead we let cemu_initForGame proceed straight
+	// to Latte_Start so the title's own splash/intro renders normally
+	// while the worker thread drains the queue. A monitor thread emits
+	// periodic progress lines so the user has feedback in log.txt.
+	//
+	// Power story across launches:
+	//   Run 1 (empty cache): early gameplay JITs ~18k functions over
+	//     ~30-60s. Visible as below-target framerate during early play.
+	//     Disk cache fills as side effect.
+	//   Run N (warm cache): worker thread drains its queue almost
+	//     instantly because every dispatch is a memcpy of cached host
+	//     bytes (no IML, no codegen). Gameplay is JIT-cost-free from
+	//     the very first frame.
+	if (queued > 0)
+	{
+		std::thread([queuedAtStart = queued]() {
+			const auto start = std::chrono::steady_clock::now();
+			for (;;)
+			{
+				std::this_thread::sleep_for(std::chrono::seconds(5));
+				PPCRecompilerState.recompilerSpinlock.lock();
+				const uint32 remaining = static_cast<uint32>(PPCRecompilerState.targetQueue.size());
+				PPCRecompilerState.recompilerSpinlock.unlock();
+				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+				    std::chrono::steady_clock::now() - start)
+				                         .count();
+				if (remaining == 0)
+				{
+					cemuLog_log(LogType::Force,
+					            "Precompile complete: drained {} entries in {}s",
+					            queuedAtStart, static_cast<long long>(elapsed));
+					return;
+				}
+				const uint32 done = (remaining > queuedAtStart) ? 0 : (queuedAtStart - remaining);
+				const double pct = queuedAtStart > 0 ? (100.0 * done / queuedAtStart) : 100.0;
+				cemuLog_log(LogType::Force,
+				            "Precompile progress: {}/{} ({:.0f}%) in {}s",
+				            done, queuedAtStart, pct, static_cast<long long>(elapsed));
+			}
+		}).detach();
+	}
 }
 
 void PPCRecompiler_Shutdown()

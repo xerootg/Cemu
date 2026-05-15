@@ -11,6 +11,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import info.cemu.cemu.common.either.Either
 import info.cemu.cemu.common.either.Error
 import info.cemu.cemu.common.either.Success
+import info.cemu.cemu.common.android.inputdevice.listGameControllers
 import info.cemu.cemu.common.either.attemptWithContext
 import info.cemu.cemu.common.either.bind
 import info.cemu.cemu.common.either.mapError
@@ -41,7 +42,7 @@ data class SideMenuState(
     // When true, pressing Back while the side drawer is already open minimizes the app
     // (moveTaskToBack) instead of closing the drawer. First Back-press still opens the
     // drawer as usual. Quick "stash the game" gesture for use in public.
-    val isDoubleBackToMinimizeEnabled: Boolean = false,
+    val isDoubleBackToMinimizeEnabled: Boolean = true,
 )
 
 class ConditionFlags(
@@ -94,7 +95,11 @@ class EmulationViewModel(
     init {
         viewModelScope.launch {
             val settings = dataStore.data.first()
-            _sideMenuState.update { it.copy(isInputOverlayVisible = settings.inputOverlaySettings.isOverlayEnabled) }
+            // No physical controller attached → force the touch overlay on for this session
+            // even if the persisted preference is off; touch is the only input available.
+            val overlayVisible = settings.inputOverlaySettings.isOverlayEnabled
+                    || listGameControllers().isEmpty()
+            _sideMenuState.update { it.copy(isInputOverlayVisible = overlayVisible) }
         }
     }
 

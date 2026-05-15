@@ -849,6 +849,252 @@ static void IMLOptimizer_FoldLisFollowedByImmediateOp(IMLSegment& seg)
 	}
 }
 
+// Detect a PPC carry chain (`addc + adde [+ adde ...]` and the symmetric
+// subfc/subfe form, all of which lower to R_R_R_CARRY ADD / ADD_WITH_CARRY
+// in IML) and rewrite the ops to the ARM64_CARRY_CHAIN_* family. The
+// chained form lets NZCV.C flow directly between adjacent host adcs ops
+// instead of being saved to a GPR and reloaded -- saves ~3 host insns per
+// link in 64-bit add/sub chains, CRC routines, hash mixers, and the
+// __lldiv inner loop.
+//
+// Chain breaks at any non-ADD_WITH_CARRY op or any consumer that reads the
+// carry GPR before the next link does. The carry-out at the chain end is
+// materialized via cset only if downstream consumers actually read it.
+static void IMLOptimizerArm64_FuseCarryChain(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	sint32 segSize = (sint32)seg.imlList.size();
+	for (sint32 i = 0; i < segSize; i++)
+	{
+		IMLInstruction& head = seg.imlList[i];
+		if (head.type != PPCREC_IML_TYPE_R_R_R_CARRY || head.operation != PPCREC_IML_OP_ADD)
+			continue;
+		IMLReg carryReg = head.op_r_r_r_carry.regCarry;
+		if (!carryReg.IsValid())
+			continue;
+		IMLRegID carryId = carryReg.GetRegID();
+		// Walk forward collecting consecutive ADD_WITH_CARRY consumers that
+		// chain through the same carry GPR. NO_OPs are skipped. Anything
+		// else (including reads of carryId) breaks the chain.
+		boost::container::small_vector<sint32, 4> chainLinkIdx;
+		sint32 j = i + 1;
+		while (j < segSize)
+		{
+			IMLInstruction& cand = seg.imlList[j];
+			if (cand.type == PPCREC_IML_TYPE_NO_OP) { j++; continue; }
+			if (cand.type != PPCREC_IML_TYPE_R_R_R_CARRY ||
+			    cand.operation != PPCREC_IML_OP_ADD_WITH_CARRY)
+				break;
+			if (cand.op_r_r_r_carry.regCarry.GetRegID() != carryId)
+				break;
+			// regR of this link must not alias regA/regB of the head, or
+			// rewriting head to drop its carry-out materialization is fine
+			// but we still need to avoid clobbering inputs.
+			chainLinkIdx.push_back(j);
+			j++;
+		}
+		if (chainLinkIdx.empty())
+			continue;
+		// Decide whether the carry-out at the chain end needs to live in a
+		// GPR (downstream non-chain consumer reads it).
+		bool carryLiveOut = false;
+		if (j <= segSize - 1 &&
+		    IMLUtil_CountRegisterReadsInRange(seg, j, segSize - 1, carryId) > 0)
+			carryLiveOut = true;
+		if (regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, carryId))
+			carryLiveOut = true;
+		// Rewrite. The carry GPR is no longer touched by HEAD or by mid LINKs;
+		// only TAIL_KEEP_CARRY writes it (when carryLiveOut). For ops that
+		// don't touch the carry GPR we must clear the regCarry field too --
+		// CheckRegisterUsage now reports no use, so the register allocator
+		// drops the carry reg ID from its translation table, and RewriteGPR
+		// would assert when it walked the stale reg field.
+		head.operation = PPCREC_IML_OP_ARM64_CARRY_CHAIN_HEAD;
+		head.op_r_r_r_carry.regCarry = IMLREG_INVALID;
+		for (size_t k = 0; k < chainLinkIdx.size(); k++)
+		{
+			sint32 idx = chainLinkIdx[k];
+			bool isLast = (k == chainLinkIdx.size() - 1);
+			if (isLast)
+			{
+				if (carryLiveOut)
+				{
+					seg.imlList[idx].operation = PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL_KEEP_CARRY;
+					// regCarry stays valid -- this op writes it via cset.
+				}
+				else
+				{
+					seg.imlList[idx].operation = PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL;
+					seg.imlList[idx].op_r_r_r_carry.regCarry = IMLREG_INVALID;
+				}
+			}
+			else
+			{
+				seg.imlList[idx].operation = PPCREC_IML_OP_ARM64_CARRY_CHAIN_LINK;
+				seg.imlList[idx].op_r_r_r_carry.regCarry = IMLREG_INVALID;
+			}
+		}
+		i = chainLinkIdx.back(); // skip past the chain
+	}
+}
+
+// Fold a `LEFT_SHIFT rT, rN, K` (K=1..3) immediately followed by a
+// LOAD_INDEXED / STORE_INDEXED that uses rT as the index and doesn't reread
+// rT afterwards. The fused form stores K in op_storeLoad.mode and uses the
+// unshifted source as the index reg; the AArch64 backend then folds the
+// shift into the address computation as `add base, base, idx, lsl #K`.
+// Saves one host insn per array index, vtable dispatch, etc.
+//
+// Only K in 1..3 (the AArch64 ldr/str shifted-index range). Larger shifts
+// fall through to the original SLWI+ADD+LDR path.
+static void IMLOptimizerArm64_FuseIndexedLoadShift(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	for (sint32 i = 0; i + 1 < (sint32)seg.imlList.size(); i++)
+	{
+		IMLInstruction& a = seg.imlList[i];
+		if (a.type != PPCREC_IML_TYPE_R_R_S32 || a.operation != PPCREC_IML_OP_LEFT_SHIFT)
+			continue;
+		sint32 shiftAmt = a.op_r_r_s32.immS32 & 0x1f;
+		if (shiftAmt < 1 || shiftAmt > 3)
+			continue;
+		IMLReg shiftDst = a.op_r_r_s32.regR;
+		IMLReg shiftSrc = a.op_r_r_s32.regA;
+		// Find the next non-noop instruction.
+		sint32 j = i + 1;
+		while (j < (sint32)seg.imlList.size() && seg.imlList[j].type == PPCREC_IML_TYPE_NO_OP)
+			j++;
+		if (j >= (sint32)seg.imlList.size())
+			continue;
+		IMLInstruction& b = seg.imlList[j];
+		if (b.type != PPCREC_IML_TYPE_LOAD_INDEXED && b.type != PPCREC_IML_TYPE_STORE_INDEXED)
+			continue;
+		if (b.op_storeLoad.mode != 0) // already shifted (defensive)
+			continue;
+		// Index reg must be the shift's destination. Bail if shiftDst aliases
+		// data or base — folding would change the load's input meaning.
+		if (b.op_storeLoad.registerMem2.GetRegID() != shiftDst.GetRegID())
+			continue;
+		if (b.op_storeLoad.registerData.GetRegID() == shiftDst.GetRegID() ||
+		    b.op_storeLoad.registerMem.GetRegID() == shiftDst.GetRegID())
+			continue;
+		// shiftDst must be dead after the load (only read = the load itself).
+		sint32 segSize = (sint32)seg.imlList.size();
+		if (j + 1 <= segSize - 1 &&
+		    IMLUtil_CountRegisterReadsInRange(seg, j + 1, segSize - 1, shiftDst.GetRegID()) > 0)
+			continue;
+		if (regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, shiftDst.GetRegID()))
+			continue;
+		b.op_storeLoad.registerMem2 = shiftSrc;
+		b.op_storeLoad.mode = (uint8)shiftAmt;
+		a.make_no_op();
+	}
+}
+
+// Demote ADDS-with-carry-out to plain ADD when the carry-out is never read
+// before being overwritten (and not live across the segment boundary). Saves
+// one cset per SUBFIC / ADDC / SUBFC site whose XER.CA result is dead.
+//
+// PPCRecompilerImlGen_SUBFIC emits NOT + R_R_S32_CARRY(ADD) and the backend
+// lowers the latter as `adds_imm + cset CS` (BackendAArch64.cpp:885). The cset
+// is wasted whenever XER.CA isn't consumed before the next addic/subfc/etc.
+// rewrites it -- the common case.
+static void IMLOptimizerArm64_DropDeadCarryWrite(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	for (sint32 i = 0; i < (sint32)seg.imlList.size(); i++)
+	{
+		IMLInstruction& inst = seg.imlList[i];
+		IMLReg carryReg;
+		if (inst.type == PPCREC_IML_TYPE_R_R_S32_CARRY && inst.operation == PPCREC_IML_OP_ADD)
+			carryReg = inst.op_r_r_s32_carry.regCarry;
+		else if (inst.type == PPCREC_IML_TYPE_R_R_R_CARRY && inst.operation == PPCREC_IML_OP_ADD)
+			carryReg = inst.op_r_r_r_carry.regCarry;
+		else
+			continue;
+		if (!carryReg.IsValid())
+			continue;
+		IMLRegID carryId = carryReg.GetRegID();
+		bool deadInSegment = true;
+		bool overwrittenInSegment = false;
+		for (sint32 j = i + 1; j < (sint32)seg.imlList.size(); j++)
+		{
+			IMLUsedRegisters used;
+			seg.imlList[j].CheckRegisterUsage(&used);
+			bool reads = false;
+			used.ForEachReadGPR([&](IMLReg r) { if (r.GetRegID() == carryId) reads = true; });
+			if (reads) { deadInSegment = false; break; }
+			if (used.IsWrittenByRegId(carryId)) { overwrittenInSegment = true; break; }
+		}
+		if (!deadInSegment)
+			continue;
+		if (!overwrittenInSegment && regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, carryId))
+			continue;
+		if (inst.type == PPCREC_IML_TYPE_R_R_S32_CARRY)
+		{
+			IMLReg regR = inst.op_r_r_s32_carry.regR;
+			IMLReg regA = inst.op_r_r_s32_carry.regA;
+			sint32 imm = inst.op_r_r_s32_carry.immS32;
+			inst.make_r_r_s32(PPCREC_IML_OP_ADD, regR, regA, imm);
+		}
+		else
+		{
+			IMLReg regR = inst.op_r_r_r_carry.regR;
+			IMLReg regA = inst.op_r_r_r_carry.regA;
+			IMLReg regB = inst.op_r_r_r_carry.regB;
+			inst.make_r_r_r(PPCREC_IML_OP_ADD, regR, regA, regB);
+		}
+	}
+}
+
+// Collapse the CodeWarrior `(x == 0) ? 1 : 0` boolean idiom:
+//   cntlzw rT, rS  ;  rlwinm rT, rT, 27, 5, 31
+// The rlwinm half is already lowered to ARM64_UBFX(lsb=5, width=27) by the
+// imlgen path. Naive emit is `clz w, w ; ubfx w, w, #5, #27` (2 host insns,
+// with clz's 3-4c latency on the critical path). Replace with a single
+// `COMPARE_S32 rS, 0, rT, EQ` -- backend lowers to `cmp w, #0 ; cset w, eq`
+// (also 2 insns, but no clz dep chain). When the boolean is consumed by a
+// branch, the downstream NZCV-jump fuser collapses further to `cmp + b.cond`.
+// Static count in WW HD: 250+ adjacent pairs.
+static void IMLOptimizerArm64_FoldCntlzwIsZero(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	for (sint32 i = 0; i + 1 < (sint32)seg.imlList.size(); i++)
+	{
+		IMLInstruction& a = seg.imlList[i];
+		if (a.type != PPCREC_IML_TYPE_R_R || a.operation != PPCREC_IML_OP_CNTLZW)
+			continue;
+		// Find the next non-noop instruction.
+		sint32 j = i + 1;
+		while (j < (sint32)seg.imlList.size() && seg.imlList[j].type == PPCREC_IML_TYPE_NO_OP)
+			j++;
+		if (j >= (sint32)seg.imlList.size())
+			continue;
+		IMLInstruction& b = seg.imlList[j];
+		if (b.type != PPCREC_IML_TYPE_R_R_S32 || b.operation != PPCREC_IML_OP_ARM64_UBFX)
+			continue;
+		if (b.op_r_r_s32.regA.GetRegID() != a.op_r_r.regR.GetRegID())
+			continue;
+		sint32 imm = b.op_r_r_s32.immS32;
+		sint32 lsb = imm & 0x1f;
+		sint32 width = ((imm >> 5) & 0x1f) + 1;
+		if (lsb != 5 || width != 27)
+			continue;
+		// If the cntlzw destination differs from the ubfx destination, the
+		// intermediate count must be dead after the ubfx -- otherwise the count
+		// is consumed elsewhere and we can't elide it.
+		IMLReg cntDst = a.op_r_r.regR;
+		IMLReg ubfxDst = b.op_r_r_s32.regR;
+		if (cntDst.GetRegID() != ubfxDst.GetRegID())
+		{
+			if (j + 1 <= (sint32)seg.imlList.size() - 1 &&
+			    IMLUtil_CountRegisterReadsInRange(seg, j + 1, (sint32)seg.imlList.size() - 1, cntDst.GetRegID()) > 0)
+				continue;
+			if (regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, cntDst.GetRegID()))
+				continue;
+		}
+		IMLReg srcReg = a.op_r_r.regA;
+		a.make_no_op();
+		b.make_compare_s32(srcReg, 0, ubfxDst, IMLCondition::EQ);
+	}
+}
+
 // Collapse a `AND regR, regSrc, #(1<<bit) ; ARM64_CMP regR, #0 ; ARM64_NZCV_JCC EQ/NEQ`
 // chain into a single ARM64_TBZ/TBNZ on regSrc. AArch64's `tbz Rn, #bit, label`
 // is a single instruction that branches on a single bit -- compared to the
@@ -983,6 +1229,19 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 {
 	// Fold lis+addi/ori before DCE so the dead intermediate ADD can be removed.
 	IMLOptimizer_FoldLisFollowedByImmediateOp(seg);
+
+#if defined(__aarch64__)
+	// Fold cntlzw+ubfx is_zero idiom before DCE so the eliminated cntlzw can be removed.
+	IMLOptimizerArm64_FoldCntlzwIsZero(regIoAnalysis, seg);
+	// Drop dead carry-out writes (SUBFIC, ADDC, SUBFC, ... whose XER.CA is unread).
+	IMLOptimizerArm64_DropDeadCarryWrite(regIoAnalysis, seg);
+	// Fuse `addc + adde [+ adde ...]` carry chains so NZCV.C flows directly
+	// between adjacent host adcs ops. Run AFTER DropDeadCarryWrite so any
+	// chain whose carry-out becomes dead doesn't have to materialize it.
+	IMLOptimizerArm64_FuseCarryChain(regIoAnalysis, seg);
+	// Fold scaled-index left shifts into the following indexed load/store.
+	IMLOptimizerArm64_FuseIndexedLoadShift(regIoAnalysis, seg);
+#endif
 
 	IMLOptimizer_RemoveDeadCodeFromSegment(regIoAnalysis, seg);
 

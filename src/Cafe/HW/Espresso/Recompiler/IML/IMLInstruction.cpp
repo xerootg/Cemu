@@ -140,14 +140,27 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 		{
 		case PPCREC_IML_OP_ADD_WITH_CARRY:
 			registersUsed->readGPR3 = op_r_r_r_carry.regCarry;
+			// carry GPR also written via cset.
+			registersUsed->writtenGPR2 = op_r_r_r_carry.regCarry;
 			break;
 		case PPCREC_IML_OP_ADD:
+			// carry GPR written via cset (no read).
+			registersUsed->writtenGPR2 = op_r_r_r_carry.regCarry;
+			break;
+		// CARRY-CHAIN forms thread NZCV between adjacent ops, so the carry GPR
+		// is neither read nor written -- the IML field is preserved only for
+		// debug printing and shouldn't affect register allocation.
+		case PPCREC_IML_OP_ARM64_CARRY_CHAIN_HEAD:
+		case PPCREC_IML_OP_ARM64_CARRY_CHAIN_LINK:
+		case PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL:
+			break;
+		case PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL_KEEP_CARRY:
+			// Final link materializes carry-out into the GPR for downstream use.
+			registersUsed->writtenGPR2 = op_r_r_r_carry.regCarry;
 			break;
 		default:
 			cemu_assert_unimplemented();
 		}
-		// carry is always written
-		registersUsed->writtenGPR2 = op_r_r_r_carry.regCarry;
 	}
 	else if (type == PPCREC_IML_TYPE_CJUMP_CYCLE_CHECK)
 	{

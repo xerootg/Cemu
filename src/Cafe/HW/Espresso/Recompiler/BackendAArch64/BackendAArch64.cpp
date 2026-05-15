@@ -1032,18 +1032,43 @@ bool AArch64GenContext_t::r_r_r_carry(IMLInstruction* imlInstruction)
 	WReg regR = gpReg<WReg>(imlInstruction->op_r_r_r_carry.regR);
 	WReg regA = gpReg<WReg>(imlInstruction->op_r_r_r_carry.regA);
 	WReg regB = gpReg<WReg>(imlInstruction->op_r_r_r_carry.regB);
-	WReg regCarry = gpReg<WReg>(imlInstruction->op_r_r_r_carry.regCarry);
+	// Only materialize the carry GPR for ops that actually use it. Chain
+	// HEAD/LINK/TAIL pass IMLREG_INVALID here; gpReg<>() asserts on invalid
+	// regs in debug builds.
+	auto materializeCarry = [&]() {
+		return gpReg<WReg>(imlInstruction->op_r_r_r_carry.regCarry);
+	};
 
 	if (imlInstruction->operation == PPCREC_IML_OP_ADD)
 	{
 		adds(regR, regA, regB);
-		cset(regCarry, Cond::CS);
+		cset(materializeCarry(), Cond::CS);
 	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_ADD_WITH_CARRY)
 	{
+		WReg regCarry = materializeCarry();
 		cmp(regCarry, 1);
 		adcs(regR, regA, regB);
 		cset(regCarry, Cond::CS);
+	}
+	// Carry-flow chain forms emitted by IMLOptimizerArm64_FuseCarryChain.
+	// HEAD writes NZCV but skips the cset (next link reads NZCV directly);
+	// LINK / TAIL skip the cmp-reload (NZCV is already live from the prior
+	// link); LINK additionally skips the cset; TAIL_KEEP_CARRY emits the
+	// cset because a downstream consumer outside the chain reads regCarry.
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_CARRY_CHAIN_HEAD)
+	{
+		adds(regR, regA, regB);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_CARRY_CHAIN_LINK ||
+	         imlInstruction->operation == PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL)
+	{
+		adcs(regR, regA, regB);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL_KEEP_CARRY)
+	{
+		adcs(regR, regA, regB);
+		cset(materializeCarry(), Cond::CS);
 	}
 	else
 	{
@@ -1615,11 +1640,22 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	// directly as the LDR index register, and for indexed loads we can fold the
 	// (mem + mem2 + 0) chain into a single add. PPC has many `lwz r, 0(rN)`-style
 	// accesses, so this saves an instruction on a hot path.
+	//
+	// op_storeLoad.mode (1..3) folds an SLWI on the index reg into the index
+	// computation as `add ..., ..., idx, lsl #N`. Set by the IML pass
+	// IMLOptimizerArm64_FuseIndexedLoadShift; saves the SLWI insn for every
+	// scaled array index / vtable dispatch.
+	uint8 indexShift = indexed ? imlInstruction->op_storeLoad.mode : 0;
 	WReg adrIdx = TEMP_GPR1.WReg;
 	if (memOffset == 0)
 	{
 		if (indexed)
-			add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		{
+			if (indexShift)
+				add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2), ShMod::LSL, indexShift);
+			else
+				add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		}
 		else
 			adrIdx = memReg;
 	}
@@ -1627,7 +1663,12 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	{
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		{
+			if (indexShift)
+				add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2), ShMod::LSL, indexShift);
+			else
+				add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		}
 	}
 
 	auto adr = AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW);
@@ -1749,11 +1790,19 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	sint32 memOffset = imlInstruction->op_storeLoad.immS32;
 	bool swapEndian = imlInstruction->op_storeLoad.flags2.swapEndian;
 
+	// op_storeLoad.mode (1..3) folds an SLWI on the index reg into the address
+	// computation as `add ..., ..., idx, lsl #N`. See load() for details.
+	uint8 indexShift = indexed ? imlInstruction->op_storeLoad.mode : 0;
 	WReg adrIdx = TEMP_GPR1.WReg;
 	if (memOffset == 0)
 	{
 		if (indexed)
-			add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		{
+			if (indexShift)
+				add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2), ShMod::LSL, indexShift);
+			else
+				add(TEMP_GPR1.WReg, memReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		}
 		else
 			adrIdx = memReg;
 	}
@@ -1761,7 +1810,12 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	{
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
-			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		{
+			if (indexShift)
+				add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2), ShMod::LSL, indexShift);
+			else
+				add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
+		}
 	}
 	AdrExt adr = AdrExt(MEM_BASE_REG, adrIdx, ExtMod::UXTW);
 	if (imlInstruction->op_storeLoad.copyWidth == 32)

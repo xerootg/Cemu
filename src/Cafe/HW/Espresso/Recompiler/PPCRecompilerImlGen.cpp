@@ -525,6 +525,38 @@ bool PPCRecompilerImlGen_MFCR(ppcImlGenContext_t* ppcImlGenContext, uint32 opcod
 	sint32 rD, rA, rB;
 	PPC_OPC_TEMPL_X(opcode, rD, rA, rB);
 	IMLReg regD = _GetRegGPR(ppcImlGenContext, rD);
+
+	// Fast path for the `bool b = (cmp result)` idiom: if the next PPC insn is
+	// `rlwinm rD, rD, SH, MB, MB` (single-bit extract on MFCR's destination),
+	// emit just one CR-bit copy instead of materializing the full CR word.
+	// Naive lowering is 64 chained shift+add ops -- DCE can't prune them
+	// because the dataflow is bit-level. Static count of mfcr+rlwinm pairs in
+	// WW HD is in the hundreds.
+	uint32 nextOpcode = CPU_swapEndianU32(*(ppcImlGenContext->currentInstruction));
+	if ((nextOpcode >> 26) == 21) // primary opcode 21 = rlwinm
+	{
+		sint32 rS_n, rA_n, SH_n, MB_n, ME_n;
+		PPC_OPC_TEMPL_M(nextOpcode, rS_n, rA_n, SH_n, MB_n, ME_n);
+		// In-place on MFCR's destination, single-bit mask, Rc=0.
+		if (rS_n == rD && rA_n == rD && MB_n == ME_n && (nextOpcode & 1) == 0)
+		{
+			// Source bit (in MFCR's assembled CR word, PPC bit numbering) =
+			// (MB + SH) mod 32. That equals the CR bit index because MFCR puts
+			// CR[i] at PPC bit position i. Output bit position = MB; LSB shift
+			// amount = 31 - MB.
+			sint32 crBitIndex = (MB_n + SH_n) & 0x1f;
+			sint32 outShift = 31 - MB_n;
+			IMLReg crBitReg = _GetRegCR(ppcImlGenContext, crBitIndex);
+			cemu_assert_debug(crBitReg.GetRegFormat() == IMLRegFormat::I32);
+			ppcImlGenContext->emitInst().make_r_r(PPCREC_IML_OP_ASSIGN, regD, crBitReg);
+			if (outShift != 0)
+				ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_LEFT_SHIFT, regD, regD, outShift);
+			// Skip the rlwinm in the main decode loop.
+			ppcImlGenContext->currentInstruction += 1;
+			return true;
+		}
+	}
+
 	ppcImlGenContext->emitInst().make_r_s32(PPCREC_IML_OP_ASSIGN, regD, 0);
 	for (sint32 i = 0; i < 32; i++)
 	{

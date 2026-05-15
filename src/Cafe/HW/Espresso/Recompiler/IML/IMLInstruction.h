@@ -192,6 +192,28 @@ enum
 	// SRWI fast path doesn't cover (SH != 32-MB, so plain LSR can't represent it).
 	PPCREC_IML_OP_ARM64_UBFX,
 
+	// Carry-flow chain. PPC `addc/addic + adde + ...` 64-bit add chains (and
+	// the symmetric subtract chains) plumb XER.CA from one op to the next as
+	// a 0/1 GPR. A naive lowering reloads NZCV.C from that GPR before each
+	// adcs and saves it back via cset after -- 4 host insns per step. The
+	// IML pass IMLOptimizerArm64_FuseCarryChain rewrites adjacent
+	// producer/consumer pairs into the ops below, which let NZCV flow
+	// directly between them. Backend uses adds / adcs without the
+	// cmp-reload + cset wrappers.
+	//
+	// CHAIN_HEAD: operation == ADD; emits `adds`, no cset (next op reads NZCV).
+	// CHAIN_TAIL: operation == ADD_WITH_CARRY; emits `adcs`, no cmp/cset (NZCV in,
+	//             carry-out dead -- chain ends here without further consumers).
+	// CHAIN_LINK: operation == ADD_WITH_CARRY; emits `adcs`, no cmp/cset (NZCV
+	//             in and out -- carry continues to the next link).
+	// CHAIN_TAIL_KEEP_CARRY: operation == ADD_WITH_CARRY; emits `adcs` + cset
+	//             (NZCV in, carry-out live and stored to GPR for downstream
+	//             consumer outside the chain).
+	PPCREC_IML_OP_ARM64_CARRY_CHAIN_HEAD,
+	PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL,
+	PPCREC_IML_OP_ARM64_CARRY_CHAIN_LINK,
+	PPCREC_IML_OP_ARM64_CARRY_CHAIN_TAIL_KEEP_CARRY,
+
 	PPCREC_IML_OP_INVALID
 };
 

@@ -7,6 +7,7 @@
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/OS/RPL/rpl_structs.h"
 #include "Cafe/HW/MMU/MMU.h"
+#include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/OS/common/OSCommon.h"
 #include "util/containers/RangeStore.h"
 #include "Cafe/OS/libs/coreinit/coreinit_CodeGen.h"
@@ -1141,12 +1142,19 @@ void PPCRecompiler_precompileLoadedModules()
 	            "Precompile: {} entries discovered across {} modules. The recompiler will warm in the background; first launch is the only slow one, subsequent launches load from the on-disk cache.",
 	            queued, moduleCount);
 
+	// Pre-warm notification so the user sees something immediately on the
+	// overlay, before the first 5s tick of the monitor thread.
+	LatteOverlay_pushNotification(
+	    fmt::format("Warming JIT cache: {} functions queued", queued),
+	    3500);
+
 	// NON-BLOCKING by design: blocking title load before Latte_Start means
 	// the GPU is never initialized and the screen stays black for the
 	// entire precompile. Instead we let cemu_initForGame proceed straight
 	// to Latte_Start so the title's own splash/intro renders normally
 	// while the worker thread drains the queue. A monitor thread emits
-	// periodic progress lines so the user has feedback in log.txt.
+	// periodic progress lines so the user has feedback both in log.txt
+	// and as a transient on-screen notification.
 	//
 	// Power story across launches:
 	//   Run 1 (empty cache): early gameplay JITs ~18k functions over
@@ -1174,6 +1182,10 @@ void PPCRecompiler_precompileLoadedModules()
 					cemuLog_log(LogType::Force,
 					            "Precompile complete: drained {} entries in {}s",
 					            queuedAtStart, static_cast<long long>(elapsed));
+					LatteOverlay_pushNotification(
+					    fmt::format("JIT cache warm: {} functions in {}s",
+					                queuedAtStart, static_cast<long long>(elapsed)),
+					    4000);
 					return;
 				}
 				const uint32 done = (remaining > queuedAtStart) ? 0 : (queuedAtStart - remaining);
@@ -1181,6 +1193,10 @@ void PPCRecompiler_precompileLoadedModules()
 				cemuLog_log(LogType::Force,
 				            "Precompile progress: {}/{} ({:.0f}%) in {}s",
 				            done, queuedAtStart, pct, static_cast<long long>(elapsed));
+				LatteOverlay_pushNotification(
+				    fmt::format("JIT cache warmup: {:.0f}% ({}/{})",
+				                pct, done, queuedAtStart),
+				    4500);
 			}
 		}).detach();
 	}

@@ -1,6 +1,50 @@
 #include "GameTitleLoader.h"
 
+#include <zlib.h>
+
 #include "config/ActiveSettings.h"
+
+namespace
+{
+	// In-memory gzip inflate. WUHB icons (and many other devkitPro/wut assets)
+	// are TGA payloads gzipped in the bundle. Returns nullopt on any error.
+	std::optional<std::vector<uint8>> gunzip(const std::vector<uint8>& gz)
+	{
+		if (gz.size() < 2 || gz[0] != 0x1F || gz[1] != 0x8B)
+			return std::nullopt;
+		z_stream strm{};
+		// 15 = max window, +32 = auto-detect gzip vs zlib header.
+		if (inflateInit2(&strm, 15 + 32) != Z_OK)
+			return std::nullopt;
+		std::vector<uint8> out;
+		out.resize(gz.size() * 4 + 256);
+		strm.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(gz.data()));
+		strm.avail_in = static_cast<uInt>(gz.size());
+		strm.next_out = out.data();
+		strm.avail_out = static_cast<uInt>(out.size());
+		while (true)
+		{
+			int r = inflate(&strm, Z_NO_FLUSH);
+			if (r == Z_STREAM_END)
+				break;
+			if (r != Z_OK)
+			{
+				inflateEnd(&strm);
+				return std::nullopt;
+			}
+			if (strm.avail_out == 0)
+			{
+				size_t produced = out.size();
+				out.resize(produced * 2);
+				strm.next_out = out.data() + produced;
+				strm.avail_out = static_cast<uInt>(out.size() - produced);
+			}
+		}
+		out.resize(strm.total_out);
+		inflateEnd(&strm);
+		return out;
+	}
+}
 
 std::optional<TitleInfo> getFirstTitleInfoByTitleId(TitleId titleId)
 {
@@ -146,14 +190,26 @@ std::shared_ptr<Image> GameTitleLoader::LoadIcon(TitleId titleId, const std::opt
 	auto titleInfoValue = titleInfo.value();
 	if (!titleInfoValue.Mount(tempMountPath, "", FSC_PRIORITY_BASE))
 		return {};
-	auto tgaData = fsc_extractFile((tempMountPath + "/meta/iconTex.tga").c_str());
-	if (!tgaData || tgaData->size() <= 16)
+	// Retail discs / eShop titles ship meta/iconTex.tga raw. wuhbtool-built
+	// homebrew ships meta/iconTex.tga.gz (gzipped TGA -- saves a few KB in the
+	// bundle). A handful of homebrew uses meta/icon.png. Try in that order;
+	// inflate the .gz form before handing it to the TGA decoder.
+	auto iconData = fsc_extractFile((tempMountPath + "/meta/iconTex.tga").c_str());
+	if (!iconData || iconData->size() <= 16)
 	{
-		cemuLog_log(LogType::Force, "Failed to load icon for title {:016x}", titleId);
+		auto gz = fsc_extractFile((tempMountPath + "/meta/iconTex.tga.gz").c_str());
+		if (gz && gz->size() > 16)
+			iconData = gunzip(*gz);
+	}
+	if (!iconData || iconData->size() <= 16)
+		iconData = fsc_extractFile((tempMountPath + "/meta/icon.png").c_str());
+	if (!iconData || iconData->size() <= 16)
+	{
+		cemuLog_log(LogType::CoreinitFile, "Failed to load icon for title {:016x}", titleId);
 		titleInfoValue.Unmount(tempMountPath);
 		return {};
 	}
-	auto image = std::make_shared<Image>(tgaData.value());
+	auto image = std::make_shared<Image>(iconData.value());
 	titleInfoValue.Unmount(tempMountPath);
 	if (!image->IsOk())
 		return {};

@@ -18,6 +18,10 @@
 
 using namespace coreinit;
 
+// Defined in LatteCommandProcessor.cpp. One-directional bridge so we don't pull
+// renderer headers into proc_ui.cpp.
+void _LatteCP_NotifyReleaseFlowComplete();
+
 namespace proc_ui
 {
 	enum class ProcUICoreThreadCommand
@@ -533,6 +537,13 @@ namespace proc_ui
 	void ProcUIDrawDoneRelease()
 	{
 		s_drawDoneReleaseCalled = true;
+		// Game has flushed its final frame and is about to enter the
+		// background-message-wait state. Signal the Latte CP to drop into deep
+		// park (stops ticking vsync). Without this, any game thread still
+		// looping on GX2WaitForVsync after the release callback returns keeps
+		// burning a full CPU core for the entire backgrounded duration.
+		// Defined at global scope in LatteCommandProcessor.cpp.
+		::_LatteCP_NotifyReleaseFlowComplete();
 	}
 
 	OSMessage g_lastMsg;

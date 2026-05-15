@@ -55,29 +55,58 @@ inline void LatteCP_lowPowerSpin()
 }
 
 // Foreground-release park. Set by GX2's OSDriver onReleaseForeground after the
-// GPU pipeline is drained; cleared by onAcquireForeground. The Latte CP wait
-// loop blocks on the condvar instead of WFE-spinning while this is set, so the
-// thread stops burning a full A720 core for the entire backgrounded duration.
-// 100ms timeout backstops in case a stray submit lands during the game's RELEASE
-// callback after the flag was set -- those commands still get picked up promptly.
+// GPU pipeline is drained; cleared by onAcquireForeground. Two stages:
+//
+//   Stage 1: foregroundReleased=1, releaseFlowComplete=0
+//     The game's CB_RELEASE callback chain is still running on the ProcUI core
+//     threads. That callback typically issues GX2WaitForVsync(s) to flush the
+//     final frame. The Latte CP keeps ticking LatteTiming_HandleTimedVsync at
+//     ~60Hz so those waits return. CPU during this stage: bounded by the
+//     callback duration (typically <100ms).
+//
+//   Stage 2: foregroundReleased=1, releaseFlowComplete=1
+//     The game has called ProcUIDrawDoneRelease, meaning it's done with its
+//     final frame and is about to enter the background-message-wait state. No
+//     more GX2WaitForVsync calls are expected until acquire. Vsync ticking
+//     STOPS -- any game thread still spinning a render loop blocks on
+//     GX2WaitForVsync indefinitely, which is what we want. CPU during this
+//     stage: ~0% on Latte plus residual housekeeping on other threads.
+//
+// onAcquireForeground clears both flags and notifies.
 std::atomic<bool> s_foregroundReleased{false};
+std::atomic<bool> s_releaseFlowComplete{false};
 std::mutex s_foregroundMutex;
 std::condition_variable s_foregroundCv;
 }
+
+// Global bridge for proc_ui.cpp. One-directional callable so proc_ui doesn't
+// need to pull renderer headers.
+void _LatteCP_NotifyReleaseFlowComplete();
 
 namespace LatteCP
 {
 	void NotifyForegroundReleased()
 	{
+		s_releaseFlowComplete.store(false, std::memory_order_release);
 		s_foregroundReleased.store(true, std::memory_order_release);
 		// no wake -- producer side (Latte CP) checks the flag on every empty-ring
 		// poll and self-parks
+	}
+
+	void NotifyReleaseFlowComplete()
+	{
+		// ProcUIDrawDoneRelease was called -- game is done with its final frame.
+		// Latte CP picks this up on its next wait_for timeout and stops ticking
+		// vsync; no notify needed (the 16ms shallow-park timeout is the worst-case
+		// transition latency).
+		s_releaseFlowComplete.store(true, std::memory_order_release);
 	}
 
 	void NotifyForegroundAcquired()
 	{
 		{
 			std::lock_guard lock(s_foregroundMutex);
+			s_releaseFlowComplete.store(false, std::memory_order_release);
 			s_foregroundReleased.store(false, std::memory_order_release);
 		}
 		s_foregroundCv.notify_all();
@@ -86,9 +115,14 @@ namespace LatteCP
 	void WakeForShutdown()
 	{
 		// stop signal is checked by the parker; this just kicks the cv so it
-		// re-evaluates without waiting out the 100ms backstop
+		// re-evaluates without waiting out the timeout
 		s_foregroundCv.notify_all();
 	}
+}
+
+void _LatteCP_NotifyReleaseFlowComplete()
+{
+	LatteCP::NotifyReleaseFlowComplete();
 }
 
 class DrawPassContext
@@ -212,27 +246,30 @@ uint32 LatteCP_readU32Deprc()
 
 		// When the title is in the foreground-released state (GX2's OSDriver
 		// onReleaseForeground has fired after draining), block on a condvar
-		// instead of WFE-spinning. WFE wakes on every Android scheduler tick
-		// (~5ms) which still costs ~100% of a core. The 16ms wake cadence
-		// here is ~3x slower than WFE and is dominated by sleep -- saves
-		// nearly all the CPU the wait loop was burning.
+		// instead of WFE-spinning. Two stages controlled by NotifyReleaseFlowComplete:
 		//
-		// Why we still wake every frame instead of just sleeping until
-		// onAcquireForeground: this thread is the ONLY tick source for
-		// LatteTiming_HandleTimedVsync. The game's CB_RELEASE callback
-		// typically waits on GX2WaitForVsync to confirm draw-complete before
-		// it returns. If vsync stops ticking, that wait hangs forever, the
-		// release flow never completes, ProcUI never starts the background
-		// thread that receives MsgAcquireForeground -- and you can't resume.
+		// Stage 1 (shallow park, 16ms): game's CB_RELEASE callback is still running
+		// and may call GX2WaitForVsync. Tick vsync at ~60Hz so it can return.
+		//
+		// Stage 2 (deep park, 1000ms, no vsync tick): game called
+		// ProcUIDrawDoneRelease -- final frame is flushed, game's main loop is
+		// about to block on the system message queue. No more GX2WaitForVsync
+		// expected. Stop ticking vsync so any game thread still running its
+		// render loop (in WW HD, several texture/JIT-driven threads) blocks on
+		// the next GX2WaitForVsync call and stops burning CPU.
 		if (s_foregroundReleased.load(std::memory_order_acquire))
 		{
+			bool deepPark = s_releaseFlowComplete.load(std::memory_order_acquire);
+			auto timeout = deepPark ? std::chrono::milliseconds(1000)
+			                        : std::chrono::milliseconds(16);
 			std::unique_lock lock(s_foregroundMutex);
-			s_foregroundCv.wait_for(lock, std::chrono::milliseconds(16), [] {
+			s_foregroundCv.wait_for(lock, timeout, [] {
 				return !s_foregroundReleased.load(std::memory_order_acquire) ||
 				       Latte_GetStopSignal();
 			});
 			lock.unlock();
-			LatteTiming_HandleTimedVsync();
+			if (!deepPark)
+				LatteTiming_HandleTimedVsync();
 			performanceMonitor.gpuTime_idleTime.endMeasuring();
 			continue; // re-check ring at top of while(true)
 		}

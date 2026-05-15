@@ -97,7 +97,10 @@ fun GamesListScreen(
     val state = rememberPullToRefreshState()
 
     LaunchedEffect(lifecycleState) {
-        if (lifecycleState == Lifecycle.State.RESUMED && gamesListViewModel.gamePathsHaveChanged())
+        // Always refresh on resume so titles installed by a child activity (e.g.
+        // hb-appstore writing into sd:/wiiu/apps while the EmulationActivity was
+        // foreground) appear without forcing the user to pull-to-refresh.
+        if (lifecycleState == Lifecycle.State.RESUMED)
             gamesListViewModel.refreshGames()
     }
 

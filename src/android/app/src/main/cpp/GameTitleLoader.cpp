@@ -1,5 +1,7 @@
 #include "GameTitleLoader.h"
 
+#include "config/ActiveSettings.h"
+
 std::optional<TitleInfo> getFirstTitleInfoByTitleId(TitleId titleId)
 {
 	TitleInfo titleInfo;
@@ -41,6 +43,11 @@ void GameTitleLoader::ReloadGameTitles()
 	CafeTitleList::ClearScanPaths();
 	for (auto&& gamePath : GetConfig().game_paths)
 		CafeTitleList::AddScanPath(gamePath);
+	// hb-appstore writes downloaded WUHB/RPX bundles into the emulated sd:/wiiu/apps
+	// tree, which lives at <UserDataPath>/sdcard on host. Always scan it so freshly
+	// installed homebrew shows up in the title list without the user having to add
+	// the hidden Cemu data path to GamePaths by hand.
+	CafeTitleList::AddScanPath(ActiveSettings::GetUserDataPath("sdcard/wiiu/apps"));
 	CafeTitleList::Refresh();
 	m_callbackIdTitleList = CafeTitleList::RegisterCallback([](CafeTitleListCallbackEvent* evt, void* ctx) { static_cast<GameTitleLoader*>(ctx)->HandleTitleListCallback(evt); }, this);
 }

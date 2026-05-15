@@ -557,6 +557,13 @@ void nsysnetExport_setsockopt(PPCInterpreter_t* hCPU)
 				if (setsockopt(vs->s, SOL_SOCKET, SO_SNDBUF, (const char*)&mode, sizeof(u_long)) != 0)
 					assert_dbg();
 			}
+			else if (optname == WU_SO_HOPCNT)
+			{
+				// Wii U BSD-flavor alias for IP TTL. Accepted as a no-op — we don't
+				// forward to host IP_TTL because the matching getsockopt path always
+				// reports the Wii U default (0x7f) regardless.
+				cemuLog_log(LogType::Socket, "setsockopt(WU_SO_HOPCNT) ignored (value=0x{:08x})", optlen == 4 ? _swapEndianU32(*(uint32*)optval) : 0);
+			}
 			else
 			{
 				cemuLog_logDebug(LogType::Force, "setsockopt(WU_SOL_SOCKET): Unsupported optname 0x{:08x}", optname);
@@ -590,7 +597,8 @@ void nsysnetExport_setsockopt(PPCInterpreter_t* hCPU)
 			}
 			else if(optname == WU_IP_TTL || optname == WU_IP_TOS)
 			{
-				cemuLog_logDebug(LogType::Force, "setsockopt(WU_IPPROTO_IP): Unsupported optname 0x{:08x}", optname);
+				// No-op: matching getsockopt path always reports Wii U defaults.
+				cemuLog_log(LogType::Socket, "setsockopt(WU_IPPROTO_IP): TTL/TOS ignored (optname=0x{:08x})", optname);
 			}
 			else
 				assert_dbg();
@@ -684,9 +692,45 @@ void nsysnetExport_getsockopt(PPCInterpreter_t* hCPU)
             *(uint32*)optval = _swapEndianU32(vs->isNonBlocking ? 1 : 0);
             r = WU_SO_SUCCESS;
         }
+		else if (optname == WU_SO_HOPCNT)
+		{
+			// Wii U BSD-flavor alias for IP TTL. libcurl's verifyconnect() polls
+			// this and only treats the connection as healthy when the value is 0
+			// or 0x7f. Translating to host IP_TTL would return Linux's default 64
+			// and cause libcurl to declare every connection broken, so just hand
+			// back the Wii U default of 127.
+			if (memory_readU32(optlenMPTR) != 4)
+				assert_dbg();
+			memory_writeU32(optlenMPTR, 4);
+			*(uint32*)optval = _swapEndianU32(0x7f);
+			r = WU_SO_SUCCESS;
+		}
 		else
 		{
 			cemuLog_logDebug(LogType::Force, "getsockopt(WU_SOL_SOCKET): Unsupported optname 0x{:08x}", optname);
+		}
+	}
+	else if (level == WU_IPPROTO_IP)
+	{
+		if (optname == WU_IP_TTL)
+		{
+			if (memory_readU32(optlenMPTR) != 4)
+				assert_dbg();
+			memory_writeU32(optlenMPTR, 4);
+			*(uint32*)optval = _swapEndianU32(0x7f);
+			r = WU_SO_SUCCESS;
+		}
+		else if (optname == WU_IP_TOS)
+		{
+			if (memory_readU32(optlenMPTR) != 4)
+				assert_dbg();
+			memory_writeU32(optlenMPTR, 4);
+			*(uint32*)optval = 0;
+			r = WU_SO_SUCCESS;
+		}
+		else
+		{
+			cemuLog_logDebug(LogType::Force, "getsockopt(WU_IPPROTO_IP): Unsupported optname 0x{:08x}", optname);
 		}
 	}
 	else

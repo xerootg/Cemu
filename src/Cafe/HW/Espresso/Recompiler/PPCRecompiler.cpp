@@ -964,6 +964,69 @@ static inline uint32 PPCRecompiler_branchTargetFromImm26(uint32 insn, uint32 cur
 	return currentAddr + static_cast<uint32>(li);
 }
 
+// PPC primary opcode (top 6 bits).
+static inline uint32 PPCRecompiler_primaryOpcode(uint32 insn)
+{
+	return (insn >> 26) & 0x3F;
+}
+
+// CodeWarrior prologue: every non-leaf function begins with one of
+//   mflr r0; ...; stwu r1, -N(r1)
+// OR (less common, big stack frames):
+//   mflr r0; stwu r1, ...; ...
+// We accept any 4-insn window starting with mflr where stwu r1 also appears.
+//
+//   mflr rD encoding: 31|D|0x0008|0xA6  -> primary=0x1F (31), special bits
+//     full pattern: 0x7C0802A6 for mflr r0 (D=0). Mask on rD digit so any
+//     destination matches: 0x7C0002A6 with mask 0xFC1FFFFF.
+//   stwu r1, N(r1): primary=0x25 (37), rS=1, rA=1. Encoding base 0x9421xxxx.
+//     full mask on the opcode + rS + rA fields: 0xFFFF0000 == 0x94210000.
+static inline bool PPCRecompiler_isMflrR0(uint32 insn)
+{
+	return (insn & 0xFC1FFFFF) == 0x7C0002A6;
+}
+static inline bool PPCRecompiler_isStwuR1R1(uint32 insn)
+{
+	return (insn & 0xFFFF0000) == 0x94210000;
+}
+
+// Longcall trampoline pattern -- used by the linker for `bl` targets out of
+// the +/-32MB reach of imm26:
+//     lis  rN, hi16          ; primary=15 (0x0F)
+//     addi rN, rN, lo16      ; primary=14 (0x0E), or `ori` (0x18)
+//     mtctr rN               ; encoding 0x7C0903A6 with mask on rS
+//     bctrl                  ; 0x4E800421
+// The composed 32-bit target is (hi16 << 16) + (sign-extended lo16). Returns
+// 0 if the 4-insn window doesn't match the pattern. The same register must
+// be used across all three preceding ops.
+static inline uint32 PPCRecompiler_extractLongcallTarget(uint32 i0, uint32 i1, uint32 i2, uint32 i3)
+{
+	// bctrl is fixed.
+	if (i3 != 0x4E800421)
+		return 0;
+	// lis rN, hi16
+	if (PPCRecompiler_primaryOpcode(i0) != 15)
+		return 0;
+	uint32 rN_lis = (i0 >> 21) & 0x1F;
+	uint32 hi16 = i0 & 0xFFFF;
+	// addi rN, rN, lo16 (or ori with extension)
+	const uint32 op1 = PPCRecompiler_primaryOpcode(i1);
+	uint32 rN_addi = (i1 >> 21) & 0x1F;
+	uint32 rA_addi = (i1 >> 16) & 0x1F;
+	if ((op1 != 14 && op1 != 24) || rN_addi != rN_lis || rA_addi != rN_lis)
+		return 0;
+	int32_t lo16 = static_cast<int16_t>(i1 & 0xFFFF); // sign-extended for addi
+	if (op1 == 24)
+		lo16 = static_cast<uint16_t>(i1 & 0xFFFF); // zero-extended for ori
+	// mtctr rN -> mtspr CTR. Encoding 0x7C0903A6 with rS in bits 21..25.
+	if ((i2 & 0xFC1FFFFF) != 0x7C0903A6)
+		return 0;
+	uint32 rS_mtctr = (i2 >> 21) & 0x1F;
+	if (rS_mtctr != rN_lis)
+		return 0;
+	return (hi16 << 16) + static_cast<uint32>(lo16);
+}
+
 void PPCRecompiler_precompileLoadedModules()
 {
 	if (!ppcRecompilerEnabled)
@@ -997,23 +1060,65 @@ void PPCRecompiler_precompileLoadedModules()
 				entryAddrs.insert(addr);
 		}
 
-		// bl xref targets. CodeWarrior emits `bl <function>` only at real
-		// function entry points -- the discovery offline tool measured 99%+
-		// precision against Ghidra ground truth on CodeWarrior titles.
+		// Per-instruction scan unions four signal sources, chosen for their
+		// precision against Ghidra ground truth (per the offline discovery
+		// tool's report card on cking.rpx + red-pro2.rpx):
+		//   1) bl <imm26> xref targets  -- direct callees, ~99% precision
+		//   2) prologue (mflr; ... stwu r1,...) -- function entry signature
+		//      emitted by every non-leaf CodeWarrior function
+		//   3) longcall trampoline      -- (lis;addi|ori;mtctr;bctrl) packs
+		//      a 32-bit target for any jump >+/-32MB
+		//   4) module exports + entrypoint (already harvested above)
 		//
-		// We intentionally do NOT walk `b imm26` xrefs: those mostly point
-		// at intra-function branch labels (not function starts), and the
-		// false-positive rate cascades into garbage compilations whose
-		// dispatch-table slots later confuse the JIT.
+		// We intentionally do NOT walk `b imm26` xrefs: most are intra-
+		// function branch labels (not function starts) and the noise
+		// produced black-screen behavior in the first prototype.
+		const uint32 endOff = (textSize >= 16) ? (textSize - 16) : 0;
 		for (uint32 off = 0; off + 4 <= textSize; off += 4)
 		{
 			const uint32 addr = textBase + off;
-			const uint32 insn = memory_readU32(addr);
-			if ((insn & kBLOpcodeMask) == kBLOpcodeValue)
+			const uint32 i0 = memory_readU32(addr);
+
+			// Source 1: bl imm26.
+			if ((i0 & kBLOpcodeMask) == kBLOpcodeValue)
 			{
-				const uint32 target = PPCRecompiler_branchTargetFromImm26(insn, addr);
+				const uint32 target = PPCRecompiler_branchTargetFromImm26(i0, addr);
 				if (target >= textBase && target < textBase + textSize)
 					entryAddrs.insert(target);
+			}
+
+			// Source 2: prologue. mflr starts a function; if the same
+			// instruction is also the start of .text or a stwu r1 lands
+			// in the next few insns, that's a function entry. We accept
+			// any mflr with a stwu r1,r1 within the next 8 insns (32 B)
+			// since CodeWarrior's prologue may interleave a few register
+			// saves before establishing the frame.
+			if (PPCRecompiler_isMflrR0(i0))
+			{
+				const uint32 windowEnd = std::min<uint32>(off + 8 * 4, textSize);
+				for (uint32 j = off + 4; j + 4 <= windowEnd; j += 4)
+				{
+					if (PPCRecompiler_isStwuR1R1(memory_readU32(textBase + j)))
+					{
+						entryAddrs.insert(addr);
+						break;
+					}
+				}
+			}
+
+			// Source 3: longcall trampoline. Need a 4-insn window.
+			if (off <= endOff)
+			{
+				const uint32 i1 = memory_readU32(addr + 4);
+				const uint32 i2 = memory_readU32(addr + 8);
+				const uint32 i3 = memory_readU32(addr + 12);
+				const uint32 longTarget =
+				    PPCRecompiler_extractLongcallTarget(i0, i1, i2, i3);
+				if (longTarget != 0
+				    && longTarget >= textBase && longTarget < textBase + textSize)
+				{
+					entryAddrs.insert(longTarget);
+				}
 			}
 		}
 	}

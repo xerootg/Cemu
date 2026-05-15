@@ -52,7 +52,19 @@ namespace JitCacheBridge
 //       reads in subsequent runs returned the stale addresses and the
 //       JIT body called into random host memory. Fixed the 14 verify
 //       mismatches in WW HD per session.
-constexpr uint32_t kCodegenVersion = 4;
+//   5 = invalidation bump. Phase A's discovery experiment (commit
+//       8b62cfd9, later rolled back in faffaa87) queued prologue +
+//       longcall candidates that hit false positives in CodeWarrior's
+//       intermixed-data-in-text -- the boundary tracker walked the data
+//       as code and the JIT cached AArch64 bytes for what looked like a
+//       function but wasn't. Those garbage entries survived the rollback
+//       because the codegen ITSELF didn't change (so kCodegenVersion=4
+//       fingerprints still matched). On run 2 the cache hit returned the
+//       garbage, the runtime installed and executed it -> SIGILL. Bumping
+//       here forces every entry from a phase-A-polluted session to
+//       fingerprint-miss and re-JIT against the corrected (bl-only)
+//       discovery set.
+constexpr uint32_t kCodegenVersion = 5;
 
 uint64_t SYM_g_systemMessageQueuePtr = 0;
 uint64_t SYM_g_queueLockPool = 0;

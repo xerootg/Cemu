@@ -1087,10 +1087,31 @@ static inline uint32 PPCRecompiler_extractLongcallTarget(uint32 i0, uint32 i1, u
 	return (hi16 << 16) + static_cast<uint32>(lo16);
 }
 
+namespace PPCRecompilerPrecompile
+{
+	static std::atomic<uint32_t> s_phase{static_cast<uint32_t>(Phase::Idle)};
+	static std::atomic<uint32_t> s_total{0};
+	static std::atomic<uint32_t> s_remaining{0};
+
+	Phase getPhase() { return static_cast<Phase>(s_phase.load(std::memory_order_relaxed)); }
+	uint32_t getTotal() { return s_total.load(std::memory_order_relaxed); }
+	uint32_t getRemaining() { return s_remaining.load(std::memory_order_relaxed); }
+
+	static void setPhase(Phase p) { s_phase.store(static_cast<uint32_t>(p), std::memory_order_relaxed); }
+	static void setTotal(uint32_t v) { s_total.store(v, std::memory_order_relaxed); }
+	static void setRemaining(uint32_t v) { s_remaining.store(v, std::memory_order_relaxed); }
+}
+
 void PPCRecompiler_precompileLoadedModules()
 {
+	// Mark Done immediately when there's nothing to do. The Android loader
+	// UI polls phase==Done to dismiss its progress dialog; without this the
+	// dialog would hang forever on interpreter-only builds.
 	if (!ppcRecompilerEnabled)
+	{
+		PPCRecompilerPrecompile::setPhase(PPCRecompilerPrecompile::Phase::Done);
 		return;
+	}
 
 	std::set<uint32> entryAddrs;
 
@@ -1160,67 +1181,56 @@ void PPCRecompiler_precompileLoadedModules()
 	}
 
 	cemuLog_log(LogType::Force,
-	            "Precompile: {} entries discovered across {} modules. The recompiler will warm in the background; first launch is the only slow one, subsequent launches load from the on-disk cache.",
+	            "Precompile: {} entries discovered across {} modules. Draining queue before title entrypoint runs.",
 	            queued, moduleCount);
 
-	// Pre-warm notification so the user sees something immediately on the
-	// overlay, before the first 5s tick of the monitor thread.
-	LatteOverlay_pushNotification(
-	    fmt::format("Warming JIT cache: {} functions queued", queued),
-	    3500);
+	// Publish discovery result and flip to Running so the Android title-load
+	// dialog can switch from "Initializing" to a determinate "Warming JIT
+	// cache N / M" progress bar.
+	PPCRecompilerPrecompile::setTotal(queued);
+	PPCRecompilerPrecompile::setRemaining(queued);
+	PPCRecompilerPrecompile::setPhase(PPCRecompilerPrecompile::Phase::Running);
 
-	// NON-BLOCKING by design: blocking title load before Latte_Start means
-	// the GPU is never initialized and the screen stays black for the
-	// entire precompile. Instead we let cemu_initForGame proceed straight
-	// to Latte_Start so the title's own splash/intro renders normally
-	// while the worker thread drains the queue. A monitor thread emits
-	// periodic progress lines so the user has feedback both in log.txt
-	// and as a transient on-screen notification.
-	//
-	// Power story across launches:
-	//   Run 1 (empty cache): early gameplay JITs ~18k functions over
-	//     ~30-60s. Visible as below-target framerate during early play.
-	//     Disk cache fills as side effect.
-	//   Run N (warm cache): worker thread drains its queue almost
-	//     instantly because every dispatch is a memcpy of cached host
-	//     bytes (no IML, no codegen). Gameplay is JIT-cost-free from
-	//     the very first frame.
+	// BLOCK title load until the recompiler worker has drained the queue.
+	// The trade-off vs. the original non-blocking design:
+	//   - Cost: title screen render is delayed by the precompile window
+	//     (~10-60s cold cache on Pixel 9 for WW HD, ~instant on warm
+	//     cache where every dispatch is a memcpy of cached host bytes).
+	//   - Win: zero JIT/CPU contention during the title's own intro
+	//     render. Previously the recompiler worker was hot at the same
+	//     time as Latte_Start, which manifested as a chuggy/stuttering
+	//     title screen on lower-end devices.
+	// While we block here the Android loader UI polls the Phase B
+	// progress atomics (PPCRecompilerPrecompile::getTotal/getRemaining)
+	// and shows a determinate progress bar. No on-overlay toasts: the
+	// game isn't rendering anything yet, the user is staring at a Compose
+	// dialog.
 	if (queued > 0)
 	{
-		std::thread([queuedAtStart = queued]() {
-			const auto start = std::chrono::steady_clock::now();
-			for (;;)
-			{
-				std::this_thread::sleep_for(std::chrono::seconds(5));
-				PPCRecompilerState.recompilerSpinlock.lock();
-				const uint32 remaining = static_cast<uint32>(PPCRecompilerState.targetQueue.size());
-				PPCRecompilerState.recompilerSpinlock.unlock();
-				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-				    std::chrono::steady_clock::now() - start)
-				                         .count();
-				if (remaining == 0)
-				{
-					cemuLog_log(LogType::Force,
-					            "Precompile complete: drained {} entries in {}s",
-					            queuedAtStart, static_cast<long long>(elapsed));
-					LatteOverlay_pushNotification(
-					    fmt::format("JIT cache warm: {} functions in {}s",
-					                queuedAtStart, static_cast<long long>(elapsed)),
-					    4000);
-					return;
-				}
-				const uint32 done = (remaining > queuedAtStart) ? 0 : (queuedAtStart - remaining);
-				const double pct = queuedAtStart > 0 ? (100.0 * done / queuedAtStart) : 100.0;
-				cemuLog_log(LogType::Force,
-				            "Precompile progress: {}/{} ({:.0f}%) in {}s",
-				            done, queuedAtStart, pct, static_cast<long long>(elapsed));
-				LatteOverlay_pushNotification(
-				    fmt::format("JIT cache warmup: {:.0f}% ({}/{})",
-				                pct, done, queuedAtStart),
-				    4500);
-			}
-		}).detach();
+		const auto start = std::chrono::steady_clock::now();
+		// 50ms polling cadence balances UI latency vs. spinlock contention.
+		// Worker thread holds the lock during each dispatch, so we don't
+		// want to be hammering the same lock 100x/sec.
+		while (true)
+		{
+			PPCRecompilerState.recompilerSpinlock.lock();
+			const uint32 remaining = static_cast<uint32>(PPCRecompilerState.targetQueue.size());
+			PPCRecompilerState.recompilerSpinlock.unlock();
+			PPCRecompilerPrecompile::setRemaining(remaining);
+			if (remaining == 0)
+				break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+		const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		                         std::chrono::steady_clock::now() - start)
+		                         .count();
+		cemuLog_log(LogType::Force,
+		            "Precompile drained {} entries in {}s",
+		            queued, static_cast<long long>(elapsed));
 	}
+
+	PPCRecompilerPrecompile::setRemaining(0);
+	PPCRecompilerPrecompile::setPhase(PPCRecompilerPrecompile::Phase::Done);
 }
 
 void PPCRecompiler_Shutdown()

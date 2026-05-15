@@ -92,6 +92,7 @@ fun EmulationScreen(
 
     val emulationError by viewModel.emulationError.collectAsState()
     val isEmulationInitialized by viewModel.isEmulationInitialized.collectAsState()
+    val loadingPhase by viewModel.loadingPhase.collectAsState()
     val sideMenuState by viewModel.sideMenuState.collectAsState()
     val gamePadPosition by viewModel.gamePadPosition.collectAsState()
     val isInputOverlayVisible by viewModel.isInputOverlayVisible.collectAsState()
@@ -242,7 +243,7 @@ fun EmulationScreen(
     }
 
     if (!isEmulationInitialized) {
-        EmulationLoadingDialog()
+        EmulationLoadingDialog(loadingPhase)
     }
 
     if (showQuitConfirmationDialog) {
@@ -556,11 +557,65 @@ private fun EmulationQuitConfirmationDialog(onQuit: () -> Unit, onDismiss: () ->
     )
 }
 
+// "5s" / "1m 20s" / "2m" — coarse buckets keep the UI calm. Sub-minute ETAs
+// rounded to the nearest 5s, otherwise minutes are rounded down and seconds
+// rounded to nearest 5s.
+private fun formatEta(seconds: Int): String {
+    if (seconds < 60) {
+        val rounded = ((seconds + 2) / 5) * 5
+        return "${rounded.coerceAtLeast(5)}s"
+    }
+    val minutes = seconds / 60
+    val secs = ((seconds % 60 + 2) / 5) * 5
+    return if (secs == 0) "${minutes}m" else "${minutes}m ${secs}s"
+}
+
 @Composable
-private fun EmulationLoadingDialog() {
+private fun EmulationLoadingDialog(loadingPhase: LoadingPhase) {
+    val title = when (loadingPhase) {
+        LoadingPhase.PreparingTitle -> tr("Preparing title")
+        LoadingPhase.InitializingSystems -> tr("Initializing systems")
+        LoadingPhase.InitializingRenderer -> tr("Initializing renderer")
+        LoadingPhase.StartingTitle -> tr("Starting title")
+        is LoadingPhase.WarmingJitCache -> tr("Warming JIT cache")
+    }
+
+    // Determinate bar only for WarmingJitCache when we have a non-zero total.
+    // Every other phase is short and bounded by I/O — an indeterminate bar
+    // is more honest than faking progress.
+    val progress: Float? = (loadingPhase as? LoadingPhase.WarmingJitCache)?.let {
+        if (it.total > 0) (it.done.toFloat() / it.total.toFloat()).coerceIn(0f, 1f) else null
+    }
+
+    val detail = (loadingPhase as? LoadingPhase.WarmingJitCache)?.let {
+        if (it.total <= 0) return@let null
+        val counts = tr("{0} / {1} functions", it.done.toString(), it.total.toString())
+        val eta = it.etaSeconds
+        if (eta == null) counts
+        else tr("{0} — about {1} left", counts, formatEta(eta))
+    }
+
     AlertDialog(
-        title = { Text(tr("Initializing emulation")) },
-        text = { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) },
+        title = { Text(title) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (progress != null) {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                if (detail != null) {
+                    Text(
+                        text = detail,
+                        modifier = Modifier.padding(top = 8.dp),
+                        fontSize = 14.sp,
+                    )
+                }
+            }
+        },
         confirmButton = {},
         onDismissRequest = {},
     )

@@ -70,4 +70,22 @@ object NativeEmulation {
 
     @JvmStatic
     external fun supportsLoadingCustomDriver(): Boolean
+
+    // JIT precompile progress polling. The title-load screen reads these
+    // while launchTitle() runs to render a determinate "Warming JIT cache"
+    // progress bar instead of an indeterminate spinner.
+    object JitPrecompilePhase {
+        const val IDLE: Int = 0
+        const val RUNNING: Int = 1
+        const val DONE: Int = 2
+    }
+
+    @JvmStatic
+    external fun getJitPrecompilePhase(): Int
+
+    @JvmStatic
+    external fun getJitPrecompileTotal(): Int
+
+    @JvmStatic
+    external fun getJitPrecompileRemaining(): Int
 }

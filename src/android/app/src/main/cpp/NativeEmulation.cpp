@@ -1,6 +1,7 @@
 #include "AndroidFilesystemCallbacks.h"
 #include "AndroidInputHelpers.h"
 #include "Cafe/CafeSystem.h"
+#include "Cafe/HW/Espresso/Recompiler/PPCRecompiler.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
@@ -426,6 +427,30 @@ extern "C" [[maybe_unused]] JNIEXPORT jboolean JNICALL
 Java_info_cemu_cemu_nativeinterface_NativeEmulation_isForegroundReleased([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
 {
 	return coreinit::IsForegroundReleased() ? JNI_TRUE : JNI_FALSE;
+}
+
+// JIT precompile progress accessors. The Android title-load screen polls
+// these to render a determinate "Warming JIT cache" progress bar while the
+// Phase B precompile drains. Phase enum:
+//   0 = Idle    (default; precompile has not been invoked yet)
+//   1 = Running (queue is draining)
+//   2 = Done    (queue drained or recompiler disabled — safe to dismiss UI)
+extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_getJitPrecompilePhase([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return static_cast<jint>(PPCRecompilerPrecompile::getPhase());
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_getJitPrecompileTotal([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return static_cast<jint>(PPCRecompilerPrecompile::getTotal());
+}
+
+extern "C" [[maybe_unused]] JNIEXPORT jint JNICALL
+Java_info_cemu_cemu_nativeinterface_NativeEmulation_getJitPrecompileRemaining([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jclass clazz)
+{
+	return static_cast<jint>(PPCRecompilerPrecompile::getRemaining());
 }
 
 // Returns the current TV/main canvas dimensions packed as (width << 32) | (height & 0xFFFFFFFF).

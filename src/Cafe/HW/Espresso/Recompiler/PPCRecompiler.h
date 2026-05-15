@@ -162,6 +162,25 @@ void PPCRecompiler_Shutdown();
 // per ~30k function payload (per the project-precompile-2026-05-12 memory).
 void PPCRecompiler_precompileLoadedModules();
 
+// Precompile progress publication. The Phase B path publishes its
+// queue depth via these atomics so the Android title-load UI can show a
+// determinate progress bar instead of a black screen + toast pulses.
+// Phase transitions Idle -> Running -> Done. Done is sticky for the
+// lifetime of the process — readers can poll on a coarse cadence
+// (~100-250ms) without missing the terminal edge.
+namespace PPCRecompilerPrecompile
+{
+	enum class Phase : uint32_t
+	{
+		Idle = 0,    // precompile has not been invoked yet for this session
+		Running = 1, // discovery done, queue is draining
+		Done = 2,    // queue drained (or recompiler disabled) — safe to dismiss loader
+	};
+	Phase getPhase();
+	uint32_t getTotal();
+	uint32_t getRemaining();
+}
+
 void PPCRecompiler_allocateRange(uint32 startAddress, uint32 size);
 
 void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr);

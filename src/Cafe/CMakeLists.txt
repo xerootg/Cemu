@@ -360,6 +360,8 @@ add_library(CemuCafe
   OS/libs/gx2/GX2_Command.h
   OS/libs/gx2/GX2_ContextState.cpp
   OS/libs/gx2/GX2.cpp
+  OS/libs/gx2/GX2_Driver.cpp
+  OS/libs/gx2/GX2_Driver.h
   OS/libs/gx2/GX2_Draw.cpp
   OS/libs/gx2/GX2_Draw.h
   OS/libs/gx2/GX2_Event.cpp

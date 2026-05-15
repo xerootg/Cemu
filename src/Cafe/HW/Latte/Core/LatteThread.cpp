@@ -241,6 +241,8 @@ void Latte_Start()
 	}
 }
 
+namespace LatteCP { void WakeForShutdown(); }
+
 void Latte_Stop()
 {
 	std::unique_lock _lock(sLatteThreadStateMutex);
@@ -248,6 +250,7 @@ void Latte_Stop()
 		return;
 	sLatteThreadRunning = false;
 	_lock.unlock();
+	LatteCP::WakeForShutdown(); // unblock if parked in the foreground-released wait
 	sLatteThread.join();
 }
 

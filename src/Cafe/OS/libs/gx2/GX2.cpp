@@ -303,6 +303,8 @@ void gx2Export_GX2SetSemaphore(PPCInterpreter_t* hCPU)
 	osLib_returnFromFunction(hCPU, 0);
 }
 
+#include "Cafe/OS/libs/gx2/GX2_Driver.h"
+
 namespace GX2
 {
 	class : public COSModule
@@ -316,6 +318,24 @@ namespace GX2
 		std::string_view GetName() override
 		{
 			return "gx2";
+		}
+
+		void rpl_entry(uint32 moduleHandle, coreinit::RplEntryReason reason) override
+		{
+			if (reason == coreinit::RplEntryReason::Loaded)
+			{
+				// Register a coreinit OSDriver so MsgReleaseForeground/MsgAcquireForeground
+				// dispatch reaches GX2. Without this, the Latte command processor keeps
+				// spinning at ~100% CPU while the title is backgrounded -- the game stops
+				// submitting, the ring goes empty, but the WFE wait loop wakes on every
+				// scheduler tick. Driver onReleaseForeground drains the pipeline then
+				// flips a flag that puts the Latte thread on a real condvar.
+				GX2Driver_Register(moduleHandle);
+			}
+			else if (reason == coreinit::RplEntryReason::Unloaded)
+			{
+				GX2Driver_Deregister(moduleHandle);
+			}
 		}
 
 		void RPLMapped() override

@@ -18,6 +18,9 @@
 #include "Cafe/CafeSystem.h"
 
 #include <boost/container/small_vector.hpp>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 void LatteCP_DebugPrintCmdBuffer(uint32be* bufferPtr, uint32 size);
 
@@ -50,6 +53,42 @@ inline void LatteCP_lowPowerSpin()
 	_mm_pause();
 #endif
 }
+
+// Foreground-release park. Set by GX2's OSDriver onReleaseForeground after the
+// GPU pipeline is drained; cleared by onAcquireForeground. The Latte CP wait
+// loop blocks on the condvar instead of WFE-spinning while this is set, so the
+// thread stops burning a full A720 core for the entire backgrounded duration.
+// 100ms timeout backstops in case a stray submit lands during the game's RELEASE
+// callback after the flag was set -- those commands still get picked up promptly.
+std::atomic<bool> s_foregroundReleased{false};
+std::mutex s_foregroundMutex;
+std::condition_variable s_foregroundCv;
+}
+
+namespace LatteCP
+{
+	void NotifyForegroundReleased()
+	{
+		s_foregroundReleased.store(true, std::memory_order_release);
+		// no wake -- producer side (Latte CP) checks the flag on every empty-ring
+		// poll and self-parks
+	}
+
+	void NotifyForegroundAcquired()
+	{
+		{
+			std::lock_guard lock(s_foregroundMutex);
+			s_foregroundReleased.store(false, std::memory_order_release);
+		}
+		s_foregroundCv.notify_all();
+	}
+
+	void WakeForShutdown()
+	{
+		// stop signal is checked by the parker; this just kicks the cv so it
+		// re-evaluates without waiting out the 100ms backstop
+		s_foregroundCv.notify_all();
+	}
 }
 
 class DrawPassContext
@@ -170,6 +209,34 @@ uint32 LatteCP_readU32Deprc()
 
 		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
 		performanceMonitor.gpuTime_idleTime.beginMeasuring();
+
+		// When the title is in the foreground-released state (GX2's OSDriver
+		// onReleaseForeground has fired after draining), block on a condvar
+		// instead of WFE-spinning. WFE wakes on every Android scheduler tick
+		// (~5ms) which still costs ~100% of a core. The 16ms wake cadence
+		// here is ~3x slower than WFE and is dominated by sleep -- saves
+		// nearly all the CPU the wait loop was burning.
+		//
+		// Why we still wake every frame instead of just sleeping until
+		// onAcquireForeground: this thread is the ONLY tick source for
+		// LatteTiming_HandleTimedVsync. The game's CB_RELEASE callback
+		// typically waits on GX2WaitForVsync to confirm draw-complete before
+		// it returns. If vsync stops ticking, that wait hangs forever, the
+		// release flow never completes, ProcUI never starts the background
+		// thread that receives MsgAcquireForeground -- and you can't resume.
+		if (s_foregroundReleased.load(std::memory_order_acquire))
+		{
+			std::unique_lock lock(s_foregroundMutex);
+			s_foregroundCv.wait_for(lock, std::chrono::milliseconds(16), [] {
+				return !s_foregroundReleased.load(std::memory_order_acquire) ||
+				       Latte_GetStopSignal();
+			});
+			lock.unlock();
+			LatteTiming_HandleTimedVsync();
+			performanceMonitor.gpuTime_idleTime.endMeasuring();
+			continue; // re-check ring at top of while(true)
+		}
+
 		// no command data available, low-power wait then re-check. WFE on
 		// AArch64 halts the core until an event/IRQ (typically a few ms on
 		// Android), which is fine under the 33 ms frame budget and saves

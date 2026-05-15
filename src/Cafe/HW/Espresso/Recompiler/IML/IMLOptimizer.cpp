@@ -1095,6 +1095,172 @@ static void IMLOptimizerArm64_FoldCntlzwIsZero(IMLOptimizerRegIOAnalysis& regIoA
 	}
 }
 
+// Detect CodeWarrior's int->float magic-constant idiom and replace with a
+// single FPR_INT_TO_FLOAT (signed) or FPR_UINT_TO_FLOAT (unsigned), which
+// the AArch64 backend lowers to one scvtf / ucvtf instruction.
+//
+// PPC32 has no native int->float conversion, so CW emits a spill-fill round
+// trip through a magic double constant:
+//
+//   lis     rT,  0x4330
+//   stw     rT,  ofs(r1)            ; magic high half
+//   xoris   rE, rE, 0x8000          ; SIGNED variant only -- bias bit 31
+//   stw     rE,  ofs+4(r1)          ; biased integer (low half)
+//   lfd     fX,  ofs(r1)            ; reload as IEEE754 double
+//   fsub    fY,  fX, fMagic         ; subtract magic -> integer as double
+//
+// 800+ sites in WW HD by static count (see project_jit_idiom_audit memo).
+// This collapses the entire 6-7 PPC instruction blob to a single host insn.
+//
+// Detection trigger: a FPR_R_R_R FSUB whose regA is the result of an FPR_LOAD
+// reading a stack double whose two halves were just written by STOREs of
+// (a) the assigned constant 0x43300000 and (b) an integer (optionally
+// XOR'd with 0x80000000 to mark the signed variant).
+//
+// fMagic (FSUB.regB) is trusted without verifying its memory contents -- the
+// surrounding structural match is so specific that false positives outside
+// of CW idiom emission are vanishingly unlikely.
+static void IMLOptimizerArm64_FoldCWIntToFloat(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
+{
+	constexpr sint32 LOOKBACK_WINDOW = 16;
+	sint32 segSize = (sint32)seg.imlList.size();
+
+	auto findPrev = [&](sint32 fromIdx, auto&& predicate) -> sint32 {
+		sint32 limit = std::max<sint32>(0, fromIdx - LOOKBACK_WINDOW);
+		for (sint32 i = fromIdx; i >= limit; --i)
+			if (predicate(seg.imlList[i])) return i;
+		return -1;
+	};
+
+	auto isWrittenBetween = [&](sint32 startIdx, sint32 endIdx, IMLRegID regId) -> bool {
+		// startIdx exclusive, endIdx exclusive
+		for (sint32 i = startIdx + 1; i < endIdx; i++)
+		{
+			IMLUsedRegisters used;
+			seg.imlList[i].CheckRegisterUsage(&used);
+			bool w = false;
+			used.ForEachWrittenGPR([&](IMLReg r) { if (r.GetRegID() == regId) w = true; });
+			if (w) return true;
+		}
+		return false;
+	};
+
+	for (sint32 fsubIdx = 0; fsubIdx < segSize; fsubIdx++)
+	{
+		IMLInstruction& fsub = seg.imlList[fsubIdx];
+		if (fsub.type != PPCREC_IML_TYPE_FPR_R_R_R || fsub.operation != PPCREC_IML_OP_FPR_SUB)
+			continue;
+		IMLReg fprResult = fsub.op_fpr_r_r_r.regR;
+		IMLReg fprConstructed = fsub.op_fpr_r_r_r.regA;
+		IMLRegID fprConstructedId = fprConstructed.GetRegID();
+
+		// 1. Find the FPR_LOAD producing fprConstructed -- must be DOUBLE+swap.
+		sint32 lfdIdx = findPrev(fsubIdx - 1, [&](const IMLInstruction& inst) {
+			if (inst.type == PPCREC_IML_TYPE_NO_OP) return false;
+			IMLUsedRegisters used;
+			inst.CheckRegisterUsage(&used);
+			bool writesTarget = false;
+			used.ForEachWrittenGPR([&](IMLReg r) {
+				if (r.GetRegID() == fprConstructedId) writesTarget = true;
+			});
+			return writesTarget;
+		});
+		if (lfdIdx < 0) continue;
+		IMLInstruction& lfd = seg.imlList[lfdIdx];
+		if (lfd.type != PPCREC_IML_TYPE_FPR_LOAD) continue;
+		if (lfd.op_storeLoad.mode != PPCREC_FPR_LD_MODE_DOUBLE) continue;
+		if (!lfd.op_storeLoad.flags2.swapEndian) continue;
+		IMLReg stackBase = lfd.op_storeLoad.registerMem;
+		IMLRegID stackBaseId = stackBase.GetRegID();
+		sint32 stackOfs = lfd.op_storeLoad.immS32;
+
+		// 2. Find STORE [stackBase+ofs+4] (32, swap) before lfd.
+		sint32 storeBiasIdx = findPrev(lfdIdx - 1, [&](const IMLInstruction& inst) {
+			return inst.type == PPCREC_IML_TYPE_STORE &&
+			       inst.op_storeLoad.copyWidth == 32 &&
+			       inst.op_storeLoad.flags2.swapEndian &&
+			       inst.op_storeLoad.registerMem.IsValid() &&
+			       inst.op_storeLoad.registerMem.GetRegID() == stackBaseId &&
+			       inst.op_storeLoad.immS32 == stackOfs + 4;
+		});
+		if (storeBiasIdx < 0) continue;
+		IMLReg biasReg = seg.imlList[storeBiasIdx].op_storeLoad.registerData;
+		IMLRegID biasId = biasReg.GetRegID();
+
+		// 3. Optional XOR biasReg = intReg ^ 0x80000000 (signed bias) before storeBias.
+		IMLReg intReg = biasReg;
+		bool isSigned = false;
+		sint32 xorIdx = findPrev(storeBiasIdx - 1, [&](const IMLInstruction& inst) {
+			return inst.type == PPCREC_IML_TYPE_R_R_S32 &&
+			       inst.operation == PPCREC_IML_OP_XOR &&
+			       (uint32)inst.op_r_r_s32.immS32 == 0x80000000u &&
+			       inst.op_r_r_s32.regR.GetRegID() == biasId;
+		});
+		if (xorIdx >= 0)
+		{
+			isSigned = true;
+			intReg = seg.imlList[xorIdx].op_r_r_s32.regA;
+		}
+
+		sint32 searchAnchor = (xorIdx >= 0) ? xorIdx : storeBiasIdx;
+
+		// 4. STORE [stackBase+ofs] (32, swap) before searchAnchor.
+		sint32 storeMagicIdx = findPrev(searchAnchor - 1, [&](const IMLInstruction& inst) {
+			return inst.type == PPCREC_IML_TYPE_STORE &&
+			       inst.op_storeLoad.copyWidth == 32 &&
+			       inst.op_storeLoad.flags2.swapEndian &&
+			       inst.op_storeLoad.registerMem.IsValid() &&
+			       inst.op_storeLoad.registerMem.GetRegID() == stackBaseId &&
+			       inst.op_storeLoad.immS32 == stackOfs;
+		});
+		if (storeMagicIdx < 0) continue;
+		IMLReg magicHiReg = seg.imlList[storeMagicIdx].op_storeLoad.registerData;
+		IMLRegID magicHiId = magicHiReg.GetRegID();
+
+		// 5. ASSIGN magicHiReg = 0x43300000 before storeMagic.
+		sint32 assignMagicIdx = findPrev(storeMagicIdx - 1, [&](const IMLInstruction& inst) {
+			return inst.type == PPCREC_IML_TYPE_R_S32 &&
+			       inst.operation == PPCREC_IML_OP_ASSIGN &&
+			       (uint32)inst.op_r_immS32.immS32 == 0x43300000u &&
+			       inst.op_r_immS32.regR.GetRegID() == magicHiId;
+		});
+		if (assignMagicIdx < 0) continue;
+
+		// Verify nothing clobbers the bridge values between the relevant points.
+		// magicHiReg unchanged from assignMagic to storeMagic.
+		if (isWrittenBetween(assignMagicIdx, storeMagicIdx, magicHiId))
+			continue;
+		// stackBase unchanged from storeMagic to lfd.
+		if (isWrittenBetween(storeMagicIdx, lfdIdx, stackBaseId))
+			continue;
+		// biasReg unchanged from storeBias to lfd (otherwise the lfd reads
+		// a value not consistent with what we just stored).
+		if (isWrittenBetween(storeBiasIdx, lfdIdx, biasId))
+			continue;
+		// intReg unchanged from where it became "the integer input" (xor or
+		// storeBias for unsigned) to the fsub.
+		if (isWrittenBetween(searchAnchor, fsubIdx, intReg.GetRegID()))
+			continue;
+		// fprConstructed only used by the fsub.
+		if (fsubIdx + 1 <= segSize - 1 &&
+		    IMLUtil_CountRegisterReadsInRange(seg, fsubIdx + 1, segSize - 1, fprConstructedId) > 0)
+			continue;
+		if (regIoAnalysis.IsRegisterNeededAtEndOfSegment(seg, fprConstructedId))
+			continue;
+
+		// Replace the entire chain with a single int->float / uint->float.
+		fsub.make_fpr_r_r(isSigned ? PPCREC_IML_OP_FPR_INT_TO_FLOAT
+		                           : PPCREC_IML_OP_FPR_UINT_TO_FLOAT,
+		                  fprResult, intReg);
+		seg.imlList[lfdIdx].make_no_op();
+		seg.imlList[storeBiasIdx].make_no_op();
+		if (xorIdx >= 0)
+			seg.imlList[xorIdx].make_no_op();
+		seg.imlList[storeMagicIdx].make_no_op();
+		seg.imlList[assignMagicIdx].make_no_op();
+	}
+}
+
 // Collapse a `AND regR, regSrc, #(1<<bit) ; ARM64_CMP regR, #0 ; ARM64_NZCV_JCC EQ/NEQ`
 // chain into a single ARM64_TBZ/TBNZ on regSrc. AArch64's `tbz Rn, #bit, label`
 // is a single instruction that branches on a single bit -- compared to the
@@ -1231,6 +1397,11 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 	IMLOptimizer_FoldLisFollowedByImmediateOp(seg);
 
 #if defined(__aarch64__)
+	// Collapse the CodeWarrior int->float magic-constant idiom to a single
+	// scvtf/ucvtf. Run BEFORE the carry / cntlzw / scale-shift folds since
+	// it eliminates a chain of stores+loads+xor that those passes would
+	// otherwise scan over uselessly.
+	IMLOptimizerArm64_FoldCWIntToFloat(regIoAnalysis, seg);
 	// Fold cntlzw+ubfx is_zero idiom before DCE so the eliminated cntlzw can be removed.
 	IMLOptimizerArm64_FoldCntlzwIsZero(regIoAnalysis, seg);
 	// Drop dead carry-out writes (SUBFIC, ADDC, SUBFC, ... whose XER.CA is unread).

@@ -2239,6 +2239,15 @@ void AArch64GenContext_t::fpr_r_r(IMLInstruction* imlInstruction)
 		scvtf(fpReg<DReg>(imlRegR), gpReg<WReg>(imlRegA));
 		return;
 	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_UINT_TO_FLOAT)
+	{
+		// Emitted by IMLOptimizerArm64_FoldCWIntToFloat for the unsigned
+		// variant of CodeWarrior's int->float magic-constant idiom. ucvtf
+		// is the unsigned counterpart to scvtf -- one host insn vs the 7+
+		// PPC instructions of the spill-fill round-trip.
+		ucvtf(fpReg<DReg>(imlRegR), gpReg<WReg>(imlRegA));
+		return;
+	}
 	else if (imlInstruction->operation == PPCREC_IML_OP_FPR_BITCAST_INT_TO_FLOAT)
 	{
 		cemu_assert_debug(imlRegR.GetRegFormat() == IMLRegFormat::F64); // assuming target is always F64 for now

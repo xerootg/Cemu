@@ -76,18 +76,7 @@ namespace JitCacheBridge
 //       divide) now generates a ~9-insn host stub instead of translating
 //       its ~80 PPC instructions. Caches from v6 had the full
 //       translation; v7 may install the stub instead, so bytes differ.
-//   8 = revert of 91fe60ea (ADD/SUB+cmp -> ARM64_ADDS/SUBS Rc=1 fold).
-//       The fold conflated `cmp r, #0`'s NZCV (V always 0) with `adds`'s
-//       NZCV (V tracks signed overflow). PPC `add.` only consults the
-//       32-bit result for CR0 -- it does NOT propagate overflow into
-//       CR0 -- so when the consumer was a signed branch / cset (bge,
-//       blt, bgt, ble, which read N==V or N!=V), an overflowing add
-//       produced the opposite control-flow decision from the original.
-//       Manifested in WW HD as intermittent input loss + multi-second
-//       game-logic lag (signed arithmetic in input polling / scheduler).
-//       Any v7 cached entry that hit a folded site has wrong bytes;
-//       v8 invalidates them all.
-constexpr uint32_t kCodegenVersion = 8;
+constexpr uint32_t kCodegenVersion = 7;
 
 uint64_t SYM_g_systemMessageQueuePtr = 0;
 uint64_t SYM_g_queueLockPool = 0;

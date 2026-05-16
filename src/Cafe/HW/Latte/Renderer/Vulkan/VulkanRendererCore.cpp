@@ -1485,8 +1485,17 @@ void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
 
 	if (m_useHostMemoryForCache)
 	{
-		// direct memory access (Wii U memory space imported as a Vulkan buffer), update buffer bindings
-		draw_updateVertexBuffersDirectAccess();
+		// direct memory access (Wii U memory space imported as a Vulkan buffer), update buffer bindings.
+		// Cap the per-binding snapshot copy at the upper bound of vertex indices the GPU will actually
+		// fetch — the game's declared SQ_VTX_ATTRIBUTE_BLOCK bufferSize is often the entire mesh pool,
+		// while a single draw touches only a small window. 8% of process CPU was sitting in memmove
+		// (cutscene profile 2026-05-15) because of this over-copy.
+		uint32 maxVertexExclusive;
+		if (hostIndexType != INDEX_TYPE::NONE)
+			maxVertexExclusive = (uint32)((sint32)indexMax + baseVertex) + 1;
+		else
+			maxVertexExclusive = (uint32)((sint32)count + baseVertex);
+		draw_updateVertexBuffersDirectAccess(maxVertexExclusive);
 		LatteDecompilerShader* vertexShader = LatteSHRC_GetActiveVertexShader();
 		if (vertexShader)
 			draw_updateUniformBuffersDirectAccess(vertexShader, mmSQ_VTX_UNIFORM_BLOCK_START, LatteConst::ShaderType::Vertex);
@@ -1704,7 +1713,7 @@ uint32 VulkanRenderer::hostMemSnapshot_allocateAndCopy(MPTR srcAddress, uint32 s
 	return snapshotOffset;
 }
 
-void VulkanRenderer::draw_updateVertexBuffersDirectAccess()
+void VulkanRenderer::draw_updateVertexBuffersDirectAccess(uint32 maxVertexExclusive)
 {
 	LatteFetchShader* parsedFetchShader = LatteSHRC_GetActiveFetchShader();
 	if (!parsedFetchShader)
@@ -1722,6 +1731,22 @@ void VulkanRenderer::draw_updateVertexBuffersDirectAccess()
 			bufferAddress = 0x10000000;
 		}
 		cemu_assert_debug(bufferAddress < 0x50000000);
+
+		// Per-vertex bindings: GPU reads at most up through vertex (maxVertexExclusive-1).
+		// Last byte read for vertex N at this binding = N*stride + maxOffset + (attribute size at maxOffset),
+		// bounded above by N*stride + maxOffset + 16 (RGBA32, the largest GX2 vertex attribute). Capping
+		// at that ceiling lets us skip the trailing portion of the game's declared mesh pool which is
+		// often 5-50x larger than any single draw. The lower-bound trim is not done here because
+		// vkCmdBindVertexBuffers takes an unsigned offset and shifting the slice would require adjusting
+		// vkCmdDrawIndexed::vertexOffset, which is shared across all bindings.
+		// Skip the trim when the binding has per-instance attributes (instanceCount is bounded too but
+		// requires baseInstance + (instanceCount-1)/divisor reasoning — not worth it for the common case).
+		if (bufferStride != 0 && bufferGroup.hasVtxIndexAccess && !bufferGroup.hasInstanceIndexAccess)
+		{
+			uint64 usedSize = (uint64)maxVertexExclusive * bufferStride + bufferGroup.maxOffset + 16u;
+			if (usedSize < bufferSize)
+				bufferSize = (uint32)usedSize;
+		}
 
 		uint32 snapshotOffset = hostMemSnapshot_allocateAndCopy(bufferAddress, bufferSize);
 		VkDeviceSize attrOffset = snapshotOffset;

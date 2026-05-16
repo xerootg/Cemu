@@ -656,6 +656,15 @@ namespace coreinit
 	void OSSchedulerBegin(sint32 numCPUEmulationThreads);
 	void OSSchedulerEnd();
 
+	// Title-deprioritize equivalent (real sc 0x2800 ProcCtrl). When suspended,
+	// __OSGetNextRunableThread returns null and the per-core idle fibers block
+	// on a cv. PPC threads currently mid-fiber yield within their quantum and
+	// then block. Resume wakes the cv and the scheduler picks up runnable
+	// threads normally.
+	void SuspendPPCScheduler();
+	void ResumePPCScheduler();
+	bool IsPPCSchedulerSuspended();
+
 	// internal
 	void __OSAddReadyThreadToRunQueue(OSThread_t* thread);
 	bool __OSCoreShouldSwitchToThread(OSThread_t* currentThread, OSThread_t* newThread, bool sharedPriorityAndAffinityWorkaround);

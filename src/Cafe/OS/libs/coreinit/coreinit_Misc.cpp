@@ -16,6 +16,8 @@
 void AudioPauseForForegroundRelease();
 void AudioResumeForForegroundAcquire();
 
+#include "Cafe/OS/libs/coreinit/coreinit_Thread.h" // for ResumePPCScheduler
+
 namespace coreinit
 {
 	sint32 ppc_vcprintf_pad(char* strOut, sint32 maxLength, sint32 padLength, char padChar)
@@ -897,7 +899,12 @@ namespace coreinit
 		msg.data0 = stdx::to_underlying(SysMessageId::MsgAcquireForeground);
 		msg.data1 = 1;
 		msg.data2 = 1;
+		// Order matters: post the message first so the ProcUI background thread
+		// is marked STATE_READY before we wake the scheduler. Then wake -- the
+		// scheduler picks up the now-runnable background thread on the very
+		// first __OSGetNextRunableThread call after resume.
 		OSSendMessage(coreinit::OSGetSystemMessageQueue(), &msg, 0);
+		ResumePPCScheduler();
 	}
 
 	void StartBackgroundForegroundTransition()

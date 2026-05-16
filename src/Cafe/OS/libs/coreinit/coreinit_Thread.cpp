@@ -68,6 +68,30 @@ namespace coreinit
 	std::vector<std::thread> sSchedulerThreads;
 	std::mutex sSchedulerStateMtx;
 
+	// PPC scheduler suspension. Set when the title is in the foreground-released
+	// state and its release flow has fully completed (game's RELEASE callback
+	// returned, ProcUIDrawDoneRelease called, background thread blocked on the
+	// system message queue). In that state we are the OS that real Wii U's
+	// sc 0x2800 ProcCtrl would be -- deprioritize the title to zero CPU.
+	//
+	// Mechanism: __OSGetNextRunableThread returns null while suspended (so
+	// __OSThreadSwitchToNext always falls through to the idle fiber), and the
+	// idle fiber blocks on s_suspendCv at the top of its loop. Currently-running
+	// PPC fibers run until their quantum (~50k cycles) expires, then yield via
+	// __OSThreadSwitchToNext -> idle fiber -> blocks. Worst-case latency for
+	// the suspend to take effect is one quantum, well under a millisecond.
+	//
+	// Wake path: TriggerAcquireForegroundTransition (called from JNI on the
+	// Android UI thread) posts MsgAcquireForeground to the system message queue
+	// AND calls ResumePPCScheduler. The OSSendMessage path marks the ProcUI
+	// background thread STATE_READY; ResumePPCScheduler clears the flag and
+	// notifies the cv. Idle fibers wake, pick up the now-runnable background
+	// thread, it dequeues the message, HandleReceivedSystemMessage dispatches
+	// onAcquireForeground to GX2 (unparks Latte) and ProcUI (state -> Foreground).
+	std::atomic<bool> s_schedulerSuspended{false};
+	std::mutex s_suspendMutex;
+	std::condition_variable s_suspendCv;
+
 	SysAllocator<OSThreadQueue> g_activeThreadQueue; // list of all threads (can include non-detached inactive threads)
 
 	SysAllocator<OSThreadQueue, 3> g_coreRunQueue;
@@ -1268,9 +1292,33 @@ namespace coreinit
 		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
 	}
 
+	void SuspendPPCScheduler()
+	{
+		s_schedulerSuspended.store(true, std::memory_order_release);
+	}
+
+	void ResumePPCScheduler()
+	{
+		{
+			std::lock_guard lock(s_suspendMutex);
+			s_schedulerSuspended.store(false, std::memory_order_release);
+		}
+		s_suspendCv.notify_all();
+	}
+
+	bool IsPPCSchedulerSuspended()
+	{
+		return s_schedulerSuspended.load(std::memory_order_acquire);
+	}
+
 	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
 	{
 		cemu_assert_debug(__OSHasSchedulerLock());
+		// PPC scheduler suspended -> behave as if no thread is runnable. Caller
+		// falls through to the idle fiber, which blocks on s_suspendCv. Real
+		// hardware's sc 0x2800 deprioritizes the title; this is our equivalent.
+		if (s_schedulerSuspended.load(std::memory_order_acquire))
+			return nullptr;
 		// pick thread, then remove from run queue
 		OSThreadQueue* runQueue = g_coreRunQueue.GetPtr() + coreIndex;
 
@@ -1328,6 +1376,18 @@ namespace coreinit
 		__OSUnlockScheduler();
 		while (true)
 		{
+			// PPC scheduler suspended -> deep block until ResumePPCScheduler
+			// fires. This is the kernel-level "title deprioritized" state that
+			// real Wii U enters during the sc 0x2800 release transition.
+			// Spurious wakes are fine (the wait predicate re-checks).
+			if (s_schedulerSuspended.load(std::memory_order_acquire))
+			{
+				std::unique_lock lock(s_suspendMutex);
+				s_suspendCv.wait(lock, [] {
+					return !s_schedulerSuspended.load(std::memory_order_acquire) ||
+					       !sSchedulerActive.load(std::memory_order_relaxed);
+				});
+			}
 			if (!g_coreRunQueueThreadCount[coreIndex].isZero()) // avoid hammering the lock on the main core if there is no runable thread
 			{
 				__OSLockScheduler();
@@ -1558,6 +1618,7 @@ namespace coreinit
 		sSchedulerActive.store(false);
 		for (size_t i = 0; i < Espresso::CORE_COUNT; i++)
 			g_coreRunQueueThreadCount[i].increment(); // make sure to wake up cores if they are paused and waiting for runnable threads
+		s_suspendCv.notify_all(); // also wake any cores parked in the foreground-released suspend
 		// wait for threads to stop execution
 		for (auto& threadItr : sSchedulerThreads)
 			threadItr.join();

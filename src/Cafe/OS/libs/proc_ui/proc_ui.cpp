@@ -16,6 +16,8 @@
 // proc_ui is a utility wrapper to help apps with the transition between foreground and background
 // some games (like Xenoblades Chronicles X) bypass proc_ui.rpl and listen to OSGetSystemMessageQueue() directly
 
+#include "Cafe/OS/libs/coreinit/coreinit_Thread.h" // for SuspendPPCScheduler
+
 using namespace coreinit;
 
 // Defined in LatteCommandProcessor.cpp. One-directional bridge so we don't pull
@@ -539,11 +541,14 @@ namespace proc_ui
 		s_drawDoneReleaseCalled = true;
 		// Game has flushed its final frame and is about to enter the
 		// background-message-wait state. Signal the Latte CP to drop into deep
-		// park (stops ticking vsync). Without this, any game thread still
-		// looping on GX2WaitForVsync after the release callback returns keeps
-		// burning a full CPU core for the entire backgrounded duration.
-		// Defined at global scope in LatteCommandProcessor.cpp.
+		// park (stops ticking vsync) AND suspend the PPC scheduler entirely --
+		// we're the kernel that real sc 0x2800 would be, so deprioritize the
+		// title to zero CPU. The ProcUI background thread is blocked in
+		// OSReceiveMessage so it doesn't get scheduled either; when the user
+		// resumes, TriggerAcquireForegroundTransition posts the message AND
+		// calls ResumePPCScheduler to wake everything back up.
 		::_LatteCP_NotifyReleaseFlowComplete();
+		SuspendPPCScheduler();
 	}
 
 	OSMessage g_lastMsg;

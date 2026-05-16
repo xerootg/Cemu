@@ -1020,6 +1020,17 @@ bool AArch64GenContext_t::r_r_r(IMLInstruction* imlInstruction)
 		umull(reg64Result, regOperand1, regOperand2);
 		lsr(reg64Result, reg64Result, 32);
 	}
+	// Flag-setting forms emitted by IMLOptimizerArm64_FuseAluCmpForFlags.
+	// Identical to ADD/SUB except they also write NZCV, so the downstream
+	// cmp #0 (which would otherwise feed b.cond / cset) can be elided.
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_ADDS)
+	{
+		adds(regResult, regOperand1, regOperand2);
+	}
+	else if (imlInstruction->operation == PPCREC_IML_OP_ARM64_SUBS)
+	{
+		subs(regResult, regOperand1, regOperand2);
+	}
 	else
 	{
 		cemuLog_log(LogType::Recompiler, "PPCRecompilerAArch64Gen_imlInstruction_r_r_r(): Unsupported operation {:x}", imlInstruction->operation);
@@ -1122,7 +1133,12 @@ void AArch64GenContext_t::compare_s32(IMLInstruction* imlInstruction)
 	WReg regA = gpReg<WReg>(imlInstruction->op_compare.regA);
 	sint32 imm = imlInstruction->op_compare_s32.immS32;
 	auto cond = ImlCondToArm64Cond(imlInstruction->op_compare.cond);
-	cmp_imm(regA, imm, TEMP_GPR1.WReg);
+	// CSET_FROM_NZCV: NZCV is already set by a preceding ARM64_ADDS/SUBS
+	// (rewritten by IMLOptimizerArm64_FuseAluCmpForFlags). Skip the cmp half
+	// and emit just the cset -- saves one host insn per Rc=1 ALU op whose
+	// CR0 bit gets materialized to a GPR.
+	if (imlInstruction->operation != PPCREC_IML_OP_ARM64_CSET_FROM_NZCV)
+		cmp_imm(regA, imm, TEMP_GPR1.WReg);
 	cset(regR, cond);
 }
 

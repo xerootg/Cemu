@@ -192,7 +192,11 @@ void IMLInstruction::CheckRegisterUsage(IMLUsedRegisters* registersUsed) const
 	}
 	else if (type == PPCREC_IML_TYPE_COMPARE_S32)
 	{
-		registersUsed->readGPR1 = op_compare_s32.regA;
+		// CSET_FROM_NZCV skips the cmp half (NZCV already live from a
+		// preceding ARM64_ADDS/SUBS) so it doesn't read regA -- still
+		// writes regR via cset.
+		if (operation != PPCREC_IML_OP_ARM64_CSET_FROM_NZCV)
+			registersUsed->readGPR1 = op_compare_s32.regA;
 		registersUsed->writtenGPR1 = op_compare_s32.regR;
 	}
 	else if (type == PPCREC_IML_TYPE_CONDITIONAL_JUMP)

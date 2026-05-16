@@ -192,21 +192,6 @@ enum
 	// SRWI fast path doesn't cover (SH != 32-MB, so plain LSR can't represent it).
 	PPCREC_IML_OP_ARM64_UBFX,
 
-	// Flag-setting ALU forms. PPC `add. r, a, b` lowers to plain ADD plus a
-	// CR0 update (compare-against-zero into LT/GT/EQ CR bits). The default
-	// IML lowering needs a separate `cmp r, #0` to produce NZCV before the
-	// jump or cset can consume it -- 3 host insns total.
-	//
-	// IMLOptimizerArm64_FuseAluCmpForFlags rewrites the ADD/SUB to ARM64_ADDS
-	// / ARM64_SUBS (R_R_R), which the backend lowers to host adds/subs --
-	// computes regR AND sets NZCV. The downstream cmp #0 is then NOOP'd.
-	// Companion op ARM64_CSET_FROM_NZCV (operation marker for COMPARE_S32)
-	// tells the backend to skip the cmp half and emit just the cset, since
-	// NZCV is already live from the preceding ADDS/SUBS.
-	PPCREC_IML_OP_ARM64_ADDS,
-	PPCREC_IML_OP_ARM64_SUBS,
-	PPCREC_IML_OP_ARM64_CSET_FROM_NZCV,
-
 	// Carry-flow chain. PPC `addc/addic + adde + ...` 64-bit add chains (and
 	// the symmetric subtract chains) plumb XER.CA from one op to the next as
 	// a 0/1 GPR. A naive lowering reloads NZCV.C from that GPR before each

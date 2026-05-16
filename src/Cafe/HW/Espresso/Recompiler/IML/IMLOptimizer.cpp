@@ -1095,68 +1095,6 @@ static void IMLOptimizerArm64_FoldCntlzwIsZero(IMLOptimizerRegIOAnalysis& regIoA
 	}
 }
 
-// Fuse `ADD/SUB r, ... ; (cmp r, #0)` into `ARM64_ADDS/SUBS r, ...` so the
-// host adds/subs writes both regR and NZCV in one instruction. Saves the
-// trailing cmp.
-//
-// Two consumer shapes:
-//   Case A: ADD r ; ARM64_CMP r, #0 ; (consumer reads NZCV)
-//           -> ADDS ; (NOOP) ; consumer
-//           Common when the Rc=1 form's CR0 bit is consumed by a
-//           non-EQ/NEQ branch (LT/GT/etc., where the CBZ fold doesn't
-//           apply) or when CBZ folding bailed for some other reason.
-//   Case B: ADD r ; COMPARE_S32 r, #0, crBit, cond
-//           -> ADDS ; ARM64_CSET_FROM_NZCV crBit, cond
-//           This is the typical Rc=1 ALU + materialize-CR-bit-to-GPR
-//           shape (`add. r, a, b ; mfcr r4 ; rlwinm r4, r4, 1, 31, 31`,
-//           or any other CR0-bit-to-bool extraction).
-//
-// Run AFTER NZCV-jump and CBZ folds: when CBZ already fired, the ARM64_CMP
-// is gone and our case-A pattern can't match; case B still applies.
-static void IMLOptimizerArm64_FuseAluCmpForFlags(IMLOptimizerRegIOAnalysis& regIoAnalysis, IMLSegment& seg)
-{
-	sint32 segSize = (sint32)seg.imlList.size();
-	for (sint32 i = 0; i + 1 < segSize; i++)
-	{
-		IMLInstruction& addInst = seg.imlList[i];
-		if (addInst.type != PPCREC_IML_TYPE_R_R_R)
-			continue;
-		if (addInst.operation != PPCREC_IML_OP_ADD &&
-		    addInst.operation != PPCREC_IML_OP_SUB)
-			continue;
-		IMLReg addResult = addInst.op_r_r_r.regR;
-		IMLRegID addResultId = addResult.GetRegID();
-		// Find the next non-noop instruction.
-		sint32 j = i + 1;
-		while (j < segSize && seg.imlList[j].type == PPCREC_IML_TYPE_NO_OP)
-			j++;
-		if (j >= segSize) continue;
-		IMLInstruction& cand = seg.imlList[j];
-		bool isCaseA = (cand.type == PPCREC_IML_TYPE_R_S32 &&
-		                cand.operation == PPCREC_IML_OP_ARM64_CMP &&
-		                cand.op_r_immS32.immS32 == 0 &&
-		                cand.op_r_immS32.regR.GetRegID() == addResultId);
-		bool isCaseB = (cand.type == PPCREC_IML_TYPE_COMPARE_S32 &&
-		                cand.operation != PPCREC_IML_OP_ARM64_CSET_FROM_NZCV &&
-		                cand.op_compare_s32.immS32 == 0 &&
-		                cand.op_compare_s32.regA.GetRegID() == addResultId);
-		if (!isCaseA && !isCaseB)
-			continue;
-		// addResult is unmodified between i and j (only NO_OPs sit there
-		// per the j scan). After our rewrite, addResult is still written
-		// by ARM64_ADDS/SUBS with the same value, so any downstream
-		// readers stay correct.
-		if (addInst.operation == PPCREC_IML_OP_ADD)
-			addInst.operation = PPCREC_IML_OP_ARM64_ADDS;
-		else
-			addInst.operation = PPCREC_IML_OP_ARM64_SUBS;
-		if (isCaseA)
-			cand.make_no_op();
-		else
-			cand.operation = PPCREC_IML_OP_ARM64_CSET_FROM_NZCV;
-	}
-}
-
 // Collapse a `AND regR, regSrc, #(1<<bit) ; ARM64_CMP regR, #0 ; ARM64_NZCV_JCC EQ/NEQ`
 // chain into a single ARM64_TBZ/TBNZ on regSrc. AArch64's `tbz Rn, #bit, label`
 // is a single instruction that branches on a single bit -- compared to the
@@ -1316,7 +1254,6 @@ void IMLOptimizer_StandardOptimizationPassForSegment(IMLOptimizerRegIOAnalysis& 
 	IMLOptimizerArm64_SubstituteCJumpForNZCVJump(regIoAnalysis, seg); // late pass: creates invisible NZCV dependency between cmp and branch
 	IMLOptimizerArm64_SubstituteSingleBitCmpForTBZ(regIoAnalysis, seg); // even later: collapse rlwinm.+branch into a single tbz
 	IMLOptimizerArm64_SubstituteCmpZeroForCBZ(seg); // last: collapse cmpwi reg,0+beq/bne into a single cbz/cbnz
-	IMLOptimizerArm64_FuseAluCmpForFlags(regIoAnalysis, seg); // very-last: fold ADD/SUB+cmp into ADDS/SUBS (skips cases CBZ/TBZ already won)
 #endif
 }
 
